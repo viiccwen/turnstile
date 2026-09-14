@@ -4,6 +4,13 @@ param location string
 param postgresLocation string
 param resourcePrefix string
 param suffix string
+param telemetryStorageName string
+param telemetryBlobEndpoint string
+param telemetryQueueEndpoint string
+param telemetryTableEndpoint string
+param telemetryDeploymentContainerName string
+param ledgerStorageName string
+param ledgerTableEndpoint string
 param postgresAdministratorLogin string
 @secure()
 param postgresAdministratorPassword string
@@ -39,8 +46,6 @@ param bootstrapOwnerEmail string
 @secure()
 param bootstrapOwnerPasswordHash string
 
-var storageName = 'st${resourcePrefix}${take(suffix, 10)}'
-var ledgerStorageName = 'st${resourcePrefix}ledger${take(suffix, 4)}'
 var postgresServerName = 'pg-${resourcePrefix}-${suffix}'
 var databaseName = 'turnstile'
 var eventHubNamespaceName = 'eh-${resourcePrefix}-${suffix}'
@@ -57,18 +62,10 @@ var telemetryFunctionSubnetName = 'snet-flex-telemetry'
 var controlFunctionSubnetName = 'snet-flex-control'
 var privateEndpointSubnetName = 'snet-private-endpoints'
 var apiSubnetName = 'snet-api'
-var telemetryDeploymentContainerName = 'deploy-telemetry'
-var blobPrivateDnsZoneName = 'privatelink.blob.${environment().suffixes.storage}'
-var queuePrivateDnsZoneName = 'privatelink.queue.${environment().suffixes.storage}'
-var tablePrivateDnsZoneName = 'privatelink.table.${environment().suffixes.storage}'
 var postgresConnectionString = 'postgresql://${postgresAdministratorLogin}:${postgresAdministratorPassword}@${postgresServerName}.postgres.database.azure.com:5432/${databaseName}?sslmode=require'
 var logAnalyticsReaderRoleDefinitionId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   '73c42c96-874c-492b-b04d-ab87d138a893'
-)
-var tableDataContributorRoleDefinitionId = subscriptionResourceId(
-  'Microsoft.Authorization/roleDefinitions',
-  '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 )
 
 resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
@@ -76,6 +73,8 @@ resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   location: location
   properties: {
     retentionInDays: 30
+    publicNetworkAccessForIngestion: 'Enabled'
+    publicNetworkAccessForQuery: 'Enabled'
     features: {
       enableLogAccessUsingOnlyResourcePermissions: true
     }
@@ -91,6 +90,8 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
     WorkspaceResourceId: workspace.id
     RetentionInDays: 30
     DisableIpMasking: false
+    publicNetworkAccessForIngestion: 'Enabled'
+    publicNetworkAccessForQuery: 'Enabled'
   }
 }
 
@@ -232,76 +233,6 @@ resource usageEventHub 'Microsoft.EventHub/namespaces/eventhubs@2024-01-01' = {
   }
 }
 
-resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
-  name: storageName
-  location: location
-  sku: {
-    name: 'Standard_LRS'
-  }
-  kind: 'StorageV2'
-  properties: {
-    allowSharedKeyAccess: false
-    allowBlobPublicAccess: false
-    minimumTlsVersion: 'TLS1_2'
-    supportsHttpsTrafficOnly: true
-    publicNetworkAccess: 'Disabled'
-    networkAcls: {
-      bypass: 'None'
-      defaultAction: 'Deny'
-    }
-  }
-}
-
-resource functionDeploymentBlobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
-  parent: storage
-  name: 'default'
-}
-
-resource functionDeploymentContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
-  parent: functionDeploymentBlobService
-  name: telemetryDeploymentContainerName
-  properties: {
-    publicAccess: 'None'
-  }
-}
-
-resource ledgerStorage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
-  name: ledgerStorageName
-  location: location
-  tags: {
-    SecurityControl: 'Ignore'
-  }
-  sku: {
-    name: 'Standard_LRS'
-  }
-  kind: 'StorageV2'
-  properties: {
-    allowSharedKeyAccess: false
-    allowBlobPublicAccess: false
-    minimumTlsVersion: 'TLS1_2'
-    supportsHttpsTrafficOnly: true
-    publicNetworkAccess: 'Enabled'
-    networkAcls: {
-      bypass: 'AzureServices'
-      defaultAction: 'Deny'
-      ipRules: []
-      virtualNetworkRules: []
-    }
-  }
-}
-
-resource ledgerTableService 'Microsoft.Storage/storageAccounts/tableServices@2023-05-01' = {
-  parent: ledgerStorage
-  name: 'default'
-}
-
-resource ledgerTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' = {
-  parent: ledgerTableService
-  name: ledgerTableName
-}
-
-var ledgerTableEndpoint = ledgerStorage.properties.primaryEndpoints.table
-
 resource virtualNetwork 'Microsoft.Network/virtualNetworks@2024-05-01' = {
   name: virtualNetworkName
   location: location
@@ -382,202 +313,6 @@ resource apiSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = {
     privateEndpointSubnet
   ]
 }
-
-resource blobPrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = {
-  name: blobPrivateDnsZoneName
-  location: 'global'
-}
-
-resource blobPrivateDnsLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01' = {
-  parent: blobPrivateDnsZone
-  name: 'finops-vnet'
-  location: 'global'
-  properties: {
-    registrationEnabled: false
-    virtualNetwork: {
-      id: virtualNetwork.id
-    }
-  }
-}
-
-resource queuePrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = {
-  name: queuePrivateDnsZoneName
-  location: 'global'
-}
-
-resource queuePrivateDnsLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01' = {
-  parent: queuePrivateDnsZone
-  name: 'finops-vnet'
-  location: 'global'
-  properties: {
-    registrationEnabled: false
-    virtualNetwork: {
-      id: virtualNetwork.id
-    }
-  }
-}
-
-resource tablePrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = {
-  name: tablePrivateDnsZoneName
-  location: 'global'
-}
-
-resource tablePrivateDnsLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01' = {
-  parent: tablePrivateDnsZone
-  name: 'finops-vnet'
-  location: 'global'
-  properties: {
-    registrationEnabled: false
-    virtualNetwork: {
-      id: virtualNetwork.id
-    }
-  }
-}
-
-resource storageBlobPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' = {
-  name: 'pe-${storageName}-blob'
-  location: location
-  properties: {
-    subnet: {
-      id: privateEndpointSubnet.id
-    }
-    privateLinkServiceConnections: [
-      {
-        name: 'storage-blob'
-        properties: {
-          privateLinkServiceId: storage.id
-          groupIds: [
-            'blob'
-          ]
-        }
-      }
-    ]
-  }
-}
-
-resource storageBlobPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-05-01' = {
-  parent: storageBlobPrivateEndpoint
-  name: 'default'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'blob'
-        properties: {
-          privateDnsZoneId: blobPrivateDnsZone.id
-        }
-      }
-    ]
-  }
-}
-
-resource storageQueuePrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' = {
-  name: 'pe-${storageName}-queue'
-  location: location
-  properties: {
-    subnet: {
-      id: privateEndpointSubnet.id
-    }
-    privateLinkServiceConnections: [
-      {
-        name: 'storage-queue'
-        properties: {
-          privateLinkServiceId: storage.id
-          groupIds: [
-            'queue'
-          ]
-        }
-      }
-    ]
-  }
-}
-
-resource storageQueuePrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-05-01' = {
-  parent: storageQueuePrivateEndpoint
-  name: 'default'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'queue'
-        properties: {
-          privateDnsZoneId: queuePrivateDnsZone.id
-        }
-      }
-    ]
-  }
-}
-
-resource storageTablePrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' = {
-  name: 'pe-${storageName}-table'
-  location: location
-  properties: {
-    subnet: {
-      id: privateEndpointSubnet.id
-    }
-    privateLinkServiceConnections: [
-      {
-        name: 'storage-table'
-        properties: {
-          privateLinkServiceId: storage.id
-          groupIds: [
-            'table'
-          ]
-        }
-      }
-    ]
-  }
-}
-
-resource storageTablePrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-05-01' = {
-  parent: storageTablePrivateEndpoint
-  name: 'default'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'table'
-        properties: {
-          privateDnsZoneId: tablePrivateDnsZone.id
-        }
-      }
-    ]
-  }
-}
-
-resource ledgerTablePrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' = {
-  name: 'pe-${ledgerStorageName}-table'
-  location: location
-  properties: {
-    subnet: {
-      id: privateEndpointSubnet.id
-    }
-    privateLinkServiceConnections: [
-      {
-        name: 'ledger-table'
-        properties: {
-          privateLinkServiceId: ledgerStorage.id
-          groupIds: [
-            'table'
-          ]
-        }
-      }
-    ]
-  }
-}
-
-resource ledgerTablePrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-05-01' = {
-  parent: ledgerTablePrivateEndpoint
-  name: 'default'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'table'
-        properties: {
-          privateDnsZoneId: tablePrivateDnsZone.id
-        }
-      }
-    ]
-  }
-}
-
 module keyVaultPrivateEndpoint 'key-vault-private-endpoint.bicep' = {
   name: 'finops-key-vault-private-endpoint'
   params: {
@@ -706,7 +441,7 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
       deployment: {
         storage: {
           type: 'blobContainer'
-          value: '${storage.properties.primaryEndpoints.blob}${functionDeploymentContainer.name}'
+          value: '${telemetryBlobEndpoint}${telemetryDeploymentContainerName}'
           authentication: {
             type: 'SystemAssignedIdentity'
           }
@@ -725,10 +460,10 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
       minTlsVersion: '1.2'
       appSettings: [
         { name: 'AzureWebJobsFeatureFlags', value: 'EnableWorkerIndexing' }
-        { name: 'AzureWebJobsStorage__accountName', value: storage.name }
-        { name: 'AzureWebJobsStorage__blobServiceUri', value: storage.properties.primaryEndpoints.blob }
-        { name: 'AzureWebJobsStorage__queueServiceUri', value: storage.properties.primaryEndpoints.queue }
-        { name: 'AzureWebJobsStorage__tableServiceUri', value: storage.properties.primaryEndpoints.table }
+        { name: 'AzureWebJobsStorage__accountName', value: telemetryStorageName }
+        { name: 'AzureWebJobsStorage__blobServiceUri', value: telemetryBlobEndpoint }
+        { name: 'AzureWebJobsStorage__queueServiceUri', value: telemetryQueueEndpoint }
+        { name: 'AzureWebJobsStorage__tableServiceUri', value: telemetryTableEndpoint }
         { name: 'AzureWebJobsStorage__credential', value: 'managedidentity' }
         { name: 'EVENT_HUB_NAME', value: eventHubName }
         { name: 'EVENT_HUB_CONNECTION__fullyQualifiedNamespace', value: '${eventHubNamespace.name}.servicebus.windows.net' }
@@ -755,36 +490,6 @@ resource functionVnetIntegration 'Microsoft.Web/sites/networkConfig@2024-11-01' 
   properties: {
     subnetResourceId: telemetryFunctionSubnet.id
     swiftSupported: true
-  }
-}
-
-resource functionStorageBlobOwner 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, functionApp.id, 'storage-blob-data-owner')
-  scope: storage
-  properties: {
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b')
-  }
-}
-
-resource functionStorageQueueContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, functionApp.id, 'storage-queue-data-contributor')
-  scope: storage
-  properties: {
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '974c5e8b-45b9-4653-ba55-5f855dd0fb88')
-  }
-}
-
-resource functionStorageTableContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, functionApp.id, 'storage-table-data-contributor')
-  scope: storage
-  properties: {
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')
   }
 }
 
@@ -828,36 +533,6 @@ resource functionLogAnalyticsReader 'Microsoft.Authorization/roleAssignments@202
   }
 }
 
-resource apiLedgerContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(ledgerTable.id, api.id, 'table-data-contributor')
-  scope: ledgerTable
-  properties: {
-    principalId: api.identity.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: tableDataContributorRoleDefinitionId
-  }
-}
-
-resource telemetryLedgerContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(ledgerTable.id, functionApp.id, 'table-data-contributor')
-  scope: ledgerTable
-  properties: {
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: tableDataContributorRoleDefinitionId
-  }
-}
-
-resource apimLedgerContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(ledgerTable.id, apimPrincipalId, 'table-data-contributor')
-  scope: ledgerTable
-  properties: {
-    principalId: apimPrincipalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: tableDataContributorRoleDefinitionId
-  }
-}
-
 resource apimEventHubSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(usageEventHub.id, apimPrincipalId, 'event-hubs-data-sender')
   scope: usageEventHub
@@ -876,7 +551,8 @@ output eventHubNamespaceName string = eventHubNamespace.name
 output eventHubName string = usageEventHub.name
 output applicationInsightsName string = appInsights.name
 output applicationInsightsConnectionString string = appInsights.properties.ConnectionString
-output ledgerStorageName string = ledgerStorage.name
+output telemetryStorageName string = telemetryStorageName
+output ledgerStorageName string = ledgerStorageName
 output ledgerTableEndpoint string = ledgerTableEndpoint
 output keyVaultName string = keyVault.name
 output databaseUrlSecretUri string = databaseUrlSecret.properties.secretUri
@@ -885,8 +561,9 @@ output apimProbeSubscriptionKeySecretUri string = apimProbeKeySecret.properties.
 output credentialEncryptionKeySecretUri string = credentialKeySecret.properties.secretUri
 output appServicePlanName string = apiPlan.name
 output telemetryFunctionPlanName string = telemetryPlan.name
-output telemetryDeploymentContainerName string = functionDeploymentContainer.name
+output telemetryDeploymentContainerName string = telemetryDeploymentContainerName
 output apiName string = api.name
 output apiUrl string = 'https://${api.properties.defaultHostName}'
 output apiPrincipalId string = api.identity.principalId
+output telemetryPrincipalId string = functionApp.identity.principalId
 output functionName string = functionApp.name

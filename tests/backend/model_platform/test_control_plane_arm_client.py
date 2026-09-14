@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, cast
 from uuid import UUID
+from xml.etree import ElementTree
 
 import httpx
 import pytest
@@ -1219,6 +1220,7 @@ def _active_bedrock_release() -> tuple[GatewayPublication, FakeApimClient]:
     ("failure", "expected_status"),
     [
         (None, "healthy"),
+        ("normalized_policy", "healthy"),
         ("missing_backend", "missing"),
         ("mismatched_named_value", "mismatched"),
     ],
@@ -1306,6 +1308,13 @@ def test_arm_client_inspects_recorded_release_dependencies(
                 if operation
                 else fake.api_policies[revision]
             )
+            if failure == "normalized_policy":
+                parser = ElementTree.XMLParser(
+                    target=ElementTree.TreeBuilder(insert_comments=True)
+                )
+                root = ElementTree.fromstring(value, parser=parser)
+                ElementTree.indent(root)
+                value = ElementTree.tostring(root, encoding="unicode")
             return httpx.Response(
                 200,
                 headers={"content-type": "application/json"},

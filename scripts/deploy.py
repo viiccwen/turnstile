@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import getpass
 import hashlib
 import json
@@ -78,6 +79,9 @@ OBSERVER_ORCHESTRATOR_PARAMETERS = {
     "observerPlanSkuName",
     "observerPlanWorkerCount",
 }
+DEFAULT_TELEMETRY_DEPLOYMENT_CONTAINER = "turnstile-telemetry-deploy"
+DEFAULT_CONTROL_PLANE_DEPLOYMENT_CONTAINER = "turnstile-control-deploy"
+DEFAULT_LEDGER_TABLE_NAME = "TurnstileLedger"
 
 
 class DeploymentError(RuntimeError):
@@ -235,14 +239,25 @@ class CommandRunner:
         capture: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         print("$ " + " ".join(command))
-        return subprocess.run(
-            list(command),
-            cwd=cwd,
-            env=dict(env) if env is not None else None,
-            check=True,
-            capture_output=capture,
-            text=True,
-        )
+        executable = shutil.which(command[0])
+        if executable is None:
+            raise DeploymentError(f"Command is unavailable: {command[0]}")
+        resolved_command = [executable, *command[1:]]
+        try:
+            return subprocess.run(
+                resolved_command,
+                cwd=cwd,
+                env=dict(env) if env is not None else None,
+                check=True,
+                capture_output=capture,
+                text=True,
+                encoding="mbcs" if os.name == "nt" else "utf-8",
+            )
+        except subprocess.CalledProcessError as error:
+            diagnostic = (error.stderr or error.stdout or "").strip()
+            if capture and diagnostic:
+                raise DeploymentError(diagnostic) from error
+            raise
 
     def run_json(
         self,
@@ -294,18 +309,59 @@ def _integer_parameter(
 
 
 def _read_owner_password(read_password: PasswordReader) -> str:
-    password = read_password("Initial Owner password: ")
-    if password != read_password("Repeat Initial Owner password: "):
+    password = read_password("Initial Owner password (minimum 12 characters): ")
+    if password != read_password("Repeat Initial Owner password (minimum 12 characters): "):
         raise DeploymentError("Initial Owner passwords do not match")
     if len(password) < 12:
         raise DeploymentError("Initial Owner password must be at least 12 characters")
     return password
 
 
-def owner_credentials_password(path: Path, expected_email: str) -> str:
+def _secure_private_file(path: Path) -> None:
+    if os.name != "nt":
+        path.chmod(0o600)
+        return
+    whoami = shutil.which("whoami")
+    icacls = shutil.which("icacls")
+    if whoami is None or icacls is None:
+        raise DeploymentError("Windows private-file ACL tools are unavailable")
+    identity = subprocess.run(
+        [whoami, "/user", "/fo", "csv", "/nh"],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="mbcs",
+    ).stdout.strip()
+    rows = list(csv.reader([identity]))
+    if len(rows) != 1 or len(rows[0]) < 2 or not rows[0][1].startswith("S-"):
+        raise DeploymentError("Could not resolve the current Windows user SID")
+    subprocess.run(
+        [
+            icacls,
+            str(path),
+            "/inheritance:r",
+            "/grant:r",
+            f"*{rows[0][1]}:(F)",
+            "*S-1-5-18:(F)",
+            "*S-1-5-32-544:(F)",
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _assert_private_file(path: Path, label: str) -> None:
+    if os.name == "nt":
+        _secure_private_file(path)
+        return
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & 0o077:
-        raise DeploymentError(f"Owner credentials permissions must be 0600: {path}")
+        raise DeploymentError(f"{label} permissions must be 0600: {path}")
+
+
+def owner_credentials_password(path: Path, expected_email: str) -> str:
+    _assert_private_file(path, "Owner credentials")
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -330,9 +386,7 @@ def load_or_create_secret_material(
     state_path = inputs.state_path
     owner_password: str | None = None
     if state_path.exists():
-        mode = stat.S_IMODE(state_path.stat().st_mode)
-        if mode & 0o077:
-            raise DeploymentError(f"Secret state permissions must be 0600: {state_path}")
+        _assert_private_file(state_path, "Secret state")
         try:
             document = json.loads(state_path.read_text(encoding="utf-8"))
             values = document["parameters"]
@@ -344,7 +398,13 @@ def load_or_create_secret_material(
         ):
             raise DeploymentError(f"Secret state is incomplete: {state_path}")
         if require_owner_password:
-            owner_password = read_password("Initial Owner password for verification: ")
+            owner_password = read_password(
+                "Initial Owner password for verification (minimum 12 characters): "
+            )
+            if len(owner_password) < 12:
+                raise DeploymentError(
+                    "Initial Owner password must be at least 12 characters"
+                )
         return SecretMaterial(dict(values), owner_password)
 
     owner_password = _read_owner_password(read_password)
@@ -362,6 +422,7 @@ def load_or_create_secret_material(
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         json.dump({"version": 1, "parameters": values}, handle, indent=2)
         handle.write("\n")
+    _secure_private_file(state_path)
     print(f"Created secret state: {state_path}")
     return SecretMaterial(values, owner_password if require_owner_password else None)
 
@@ -375,6 +436,9 @@ def deployment_parameters(
     resume_existing_environment: bool = False,
 ) -> JsonObject:
     values = dict(inputs.parameters)
+    # The deployment target is selected by `az deployment group`; it is not a template
+    # parameter now that the root template runs inside an existing resource group.
+    values.pop("resourceGroupName", None)
     for name in OBSERVER_ORCHESTRATOR_PARAMETERS:
         values.pop(name, None)
     if existing_core is not None and not resume_existing_environment:
@@ -451,10 +515,10 @@ def temporary_parameter_file(document: Mapping[str, Any], directory: Path) -> It
     descriptor, raw_path = tempfile.mkstemp(prefix="parameters-", suffix=".json", dir=directory)
     path = Path(raw_path)
     try:
-        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
             handle.write("\n")
+        _secure_private_file(path)
         yield path
     finally:
         path.unlink(missing_ok=True)
@@ -573,6 +637,213 @@ def validate_postgres_capabilities(
         )
 
 
+def shared_storage_configuration(inputs: DeploymentInputs) -> tuple[str, str, str, str, str]:
+    parameters = inputs.parameters
+    resource_group = _required_string(parameters, "storageResourceGroupName")
+    account = _required_string(parameters, "storageAccountName")
+    telemetry_container = _string_parameter(
+        parameters,
+        "telemetryDeploymentContainerName",
+        DEFAULT_TELEMETRY_DEPLOYMENT_CONTAINER,
+    )
+    control_container = _string_parameter(
+        parameters,
+        "controlPlaneDeploymentContainerName",
+        DEFAULT_CONTROL_PLANE_DEPLOYMENT_CONTAINER,
+    )
+    ledger_table = _string_parameter(
+        parameters, "ledgerTableName", DEFAULT_LEDGER_TABLE_NAME
+    )
+    for container in (telemetry_container, control_container):
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9]|-(?!-)){1,61}[a-z0-9]", container):
+            raise DeploymentError(
+                "Blob container name must be 3-63 lowercase letters, numbers, "
+                f"or hyphens: {container}"
+            )
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{2,62}", ledger_table):
+        raise DeploymentError(
+            "ledgerTableName must be 3-63 alphanumeric characters and start with a letter"
+        )
+    return resource_group, account, telemetry_container, control_container, ledger_table
+
+
+def validate_shared_storage_account(runner: CommandRunner, inputs: DeploymentInputs) -> None:
+    resource_group, account, _, _, _ = shared_storage_configuration(inputs)
+    details = runner.run_json(
+        [
+            "az",
+            "storage",
+            "account",
+            "show",
+            "--subscription",
+            inputs.subscription,
+            "--resource-group",
+            resource_group,
+            "--name",
+            account,
+            "--query",
+            "{kind:kind,publicNetworkAccess:publicNetworkAccess,blob:primaryEndpoints.blob,queue:primaryEndpoints.queue,table:primaryEndpoints.table}",
+            "--output",
+            "json",
+        ]
+    )
+    if details.get("kind") not in {"Storage", "StorageV2"}:
+        raise DeploymentError(
+            "The shared Function storage account must support Blob, Queue, and Table"
+        )
+    if details.get("publicNetworkAccess") != "Enabled":
+        raise DeploymentError(
+            "The shared Function storage account must allow public network access"
+        )
+    if any(
+        not isinstance(details.get(service), str) or not details[service]
+        for service in ("blob", "queue", "table")
+    ):
+        raise DeploymentError(
+            "The shared Function storage account must expose Blob, Queue, and Table endpoints"
+        )
+
+
+def ensure_shared_storage_resources(runner: CommandRunner, inputs: DeploymentInputs) -> None:
+    _, account, telemetry_container, control_container, ledger_table = (
+        shared_storage_configuration(inputs)
+    )
+    for container in (telemetry_container, control_container):
+        runner.run(
+            [
+                "az",
+                "storage",
+                "container",
+                "create",
+                "--subscription",
+                inputs.subscription,
+                "--account-name",
+                account,
+                "--name",
+                container,
+                "--auth-mode",
+                "login",
+                "--only-show-errors",
+                "--output",
+                "none",
+            ]
+        )
+    runner.run(
+        [
+            "az",
+            "storage",
+            "table",
+            "create",
+            "--subscription",
+            inputs.subscription,
+            "--account-name",
+            account,
+            "--name",
+            ledger_table,
+            "--auth-mode",
+            "login",
+            "--only-show-errors",
+            "--output",
+            "none",
+        ]
+    )
+
+
+def verify_shared_storage_roles(
+    runner: CommandRunner,
+    inputs: DeploymentInputs,
+    outputs: Mapping[str, Any],
+) -> None:
+    resource_group, account, _, _, ledger_table = shared_storage_configuration(inputs)
+    account_id = _output_string(outputs, "storageAccountId")
+    ledger_table_id = _output_string(outputs, "ledgerTableId")
+    required = (
+        (
+            _output_string(outputs, "telemetryPrincipalId"),
+            "Storage Blob Data Owner",
+            account_id,
+        ),
+        (
+            _output_string(outputs, "controlPlanePrincipalId"),
+            "Storage Blob Data Owner",
+            account_id,
+        ),
+        (
+            _output_string(outputs, "telemetryPrincipalId"),
+            "Storage Table Data Contributor",
+            ledger_table_id,
+        ),
+        (
+            _output_string(outputs, "apiPrincipalId"),
+            "Storage Table Data Contributor",
+            ledger_table_id,
+        ),
+        (
+            _output_string(outputs, "controlPlanePrincipalId"),
+            "Storage Table Data Contributor",
+            ledger_table_id,
+        ),
+        (
+            _output_string(outputs, "apimPrincipalId"),
+            "Storage Table Data Contributor",
+            ledger_table_id,
+        ),
+    )
+    missing: list[tuple[str, str, str]] = []
+    assignments_by_principal: dict[str, list[Mapping[str, Any]]] = {}
+    for principal_id, role, scope in required:
+        assignments = assignments_by_principal.get(principal_id)
+        if assignments is None:
+            result = runner.run(
+                [
+                    "az",
+                    "role",
+                    "assignment",
+                    "list",
+                    "--subscription",
+                    inputs.subscription,
+                    "--assignee-object-id",
+                    principal_id,
+                    "--all",
+                    "--output",
+                    "json",
+                ],
+                capture=True,
+            )
+            raw = json.loads(result.stdout)
+            assignments = raw if isinstance(raw, list) else []
+            assignments_by_principal[principal_id] = assignments
+        covered = any(
+            assignment.get("roleDefinitionName") == role
+            and (
+                scope.casefold() == str(assignment.get("scope", "")).casefold()
+                or scope.casefold().startswith(
+                    str(assignment.get("scope", "")).rstrip("/").casefold() + "/"
+                )
+            )
+            for assignment in assignments
+        )
+        if not covered:
+            missing.append((principal_id, role, scope))
+    if not missing:
+        return
+
+    print(
+        f"Shared storage {resource_group}/{account} needs these managed-identity grants:"
+    )
+    for principal_id, role, scope in missing:
+        print(
+            "az role assignment create "
+            f"--assignee-object-id {principal_id} "
+            "--assignee-principal-type ServicePrincipal "
+            f"--role \"{role}\" --scope \"{scope}\""
+        )
+    raise DeploymentError(
+        "Shared storage role assignments are incomplete. Ask a storage administrator "
+        "to run the commands above, wait for RBAC propagation, and rerun deployment."
+    )
+
+
 def _deployment_command(
     action: str,
     inputs: DeploymentInputs,
@@ -609,6 +880,7 @@ def _resource_group_deployment_command(
     template: Path,
     parameter_file: Path,
     deployment_name: str,
+    resource_group_name: str | None = None,
 ) -> list[str]:
     command = [
         "az",
@@ -618,7 +890,7 @@ def _resource_group_deployment_command(
         "--subscription",
         inputs.subscription,
         "--resource-group",
-        inputs.resource_group_name,
+        resource_group_name or inputs.resource_group_name,
         "--name",
         deployment_name,
         "--template-file",
@@ -907,9 +1179,17 @@ def deploy_webapp_package(
         ]
     )
     access_token = _output_string(token_result, "accessToken")
+    deployment_url = f"https://{app_name}.scm.azurewebsites.net/api/deployments/latest"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    previous = json.loads(
+        _open_without_proxy(
+            urllib.request.Request(deployment_url, headers=headers), 30
+        )
+    )
+    previous_id = previous.get("id") if isinstance(previous, dict) else None
     publish_url = (
         f"https://{app_name}.scm.azurewebsites.net/api/publish"
-        "?type=zip&clean=true&restart=true"
+        "?type=zip&clean=true&restart=true&isAsync=true"
     )
     try:
         payload = package.read_bytes()
@@ -917,14 +1197,68 @@ def deploy_webapp_package(
             publish_url,
             data=payload,
             headers={
-                "Authorization": f"Bearer {access_token}",
+                **headers,
                 "Content-Type": "application/zip",
             },
             method="POST",
         )
         print(f"$ POST {publish_url} (Microsoft Entra authentication)")
-        _open_without_proxy(request, 1800)
-    except (OSError, urllib.error.URLError) as error:
+        _open_without_proxy(request, 120)
+        deadline = time.monotonic() + 1800
+        last_status = "deployment did not appear"
+        while time.monotonic() < deadline:
+            raw = _open_without_proxy(
+                urllib.request.Request(deployment_url, headers=headers), 30
+            )
+            deployment = json.loads(raw)
+            if not isinstance(deployment, dict):
+                raise DeploymentError("Kudu returned an invalid deployment status")
+            deployment_id = deployment.get("id")
+            status = deployment.get("status")
+            complete = deployment.get("complete") is True
+            last_status = f"id={deployment_id}, status={status}, complete={complete}"
+            if deployment_id != previous_id and complete:
+                if status != 4:
+                    raise DeploymentError(
+                        f"Kudu package deployment failed for {app_name}: {last_status}"
+                    )
+                print(f"Kudu package deployment completed: {app_name}")
+                return
+            if deployment_id != previous_id and isinstance(deployment_id, str):
+                log_url = (
+                    f"https://{app_name}.scm.azurewebsites.net/api/deployments/"
+                    f"{deployment_id}/log"
+                )
+                log_raw = _open_without_proxy(
+                    urllib.request.Request(log_url, headers=headers), 30
+                )
+                log_entries = json.loads(log_raw)
+                if isinstance(log_entries, list):
+                    messages = [
+                        str(entry.get("message", ""))
+                        for entry in log_entries
+                        if isinstance(entry, dict)
+                    ]
+                    if any(
+                        int(entry.get("type", 0)) > 0
+                        for entry in log_entries
+                        if isinstance(entry, dict)
+                    ):
+                        raise DeploymentError(
+                            f"Kudu package deployment failed for {app_name}: "
+                            + "; ".join(messages[-5:])
+                        )
+                    if (
+                        "Finished deployment pipeline." in messages
+                        and "[Kudu-SyncTriggerStep] completed." in messages
+                    ):
+                        print(f"Kudu package deployment completed: {app_name}")
+                        return
+            time.sleep(3)
+        raise DeploymentError(
+            f"Kudu package deployment timed out for {app_name}: {last_status}"
+        )
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
         raise DeploymentError(
             f"Microsoft Entra package deployment failed for {app_name}: {error}"
         ) from error
@@ -1066,7 +1400,7 @@ def observer_parameters(
     elif "acrResourceGroupName" in existing_observer:
         acr_resource_group_name = _output_string(existing_observer, "acrResourceGroupName")
     else:
-        acr_resource_group_name = apim_resource_group_name
+        acr_resource_group_name = _output_string(platform_outputs, "resourceGroupName")
     adapter_key_named_value_name = platform_outputs.get(
         "observerAdapterKeyNamedValueName"
     )
@@ -1074,7 +1408,6 @@ def observer_parameters(
         adapter_key_named_value_name = "turnstile-envoy-adapter-key"
     return _arm_parameter_document(
         {
-            "resourceGroupName": _output_string(platform_outputs, "resourceGroupName"),
             "apimResourceGroupName": apim_resource_group_name,
             "location": inputs.location,
             "appServicePlanName": observer_plan_name(inputs),
@@ -1180,8 +1513,12 @@ def build_and_start_observer(
             ],
             capture=True,
         )
-    except subprocess.CalledProcessError:
-        pass
+    except (DeploymentError, subprocess.CalledProcessError) as error:
+        diagnostic = str(error)
+        if isinstance(error, subprocess.CalledProcessError):
+            diagnostic = error.stderr or error.stdout or diagnostic
+        if "specified tag does not exist" not in diagnostic.casefold():
+            raise
     else:
         print(f"Observer image already exists: {image_repository_and_tag} ({version})")
         return
@@ -1371,7 +1708,7 @@ def load_existing_core(inputs: DeploymentInputs) -> ExistingCore | None:
 def _write_outputs(inputs: DeploymentInputs, outputs: Mapping[str, Any]) -> None:
     destination = _outputs_path(inputs)
     destination.write_text(json.dumps(outputs, indent=2) + "\n", encoding="utf-8")
-    destination.chmod(0o600)
+    _secure_private_file(destination)
     print(f"Deployment outputs: {destination}")
 
 
@@ -1385,27 +1722,43 @@ def _write_private_json(path: Path, value: Mapping[str, Any]) -> None:
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, path)
+        _secure_private_file(path)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
 
 @contextmanager
 def _upgrade_lock(directory: Path) -> Iterator[None]:
-    try:
-        import fcntl
-    except ImportError as error:
-        raise DeploymentError("APIM upgrades require a POSIX deployment host") from error
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with (directory / ".lock").open("a+") as lock:
+    with (directory / ".lock").open("a+b") as lock:
         os.chmod(lock.name, 0o600)
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise DeploymentError("Another process owns this APIM upgrade") from error
+        if os.name == "nt":
+            import msvcrt
+
+            lock.seek(0, os.SEEK_END)
+            if lock.tell() == 0:
+                lock.write(b"\0")
+                lock.flush()
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as error:
+                raise DeploymentError("Another process owns this APIM upgrade") from error
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise DeploymentError("Another process owns this APIM upgrade") from error
         try:
             yield
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def gateway_upgrade(
@@ -1462,14 +1815,25 @@ def gateway_upgrade(
         def preview(
             plan: ImageUpgradePlan, stage: str, revision: str, create_revision: bool,
         ) -> tuple[JsonObject, str]:
-            parameters = _arm_parameter_document(upgrade_parameters(
+            raw_parameters = upgrade_parameters(
                 plan, stage, revision, create_revision=create_revision
-            ))
+            )
+            upgrade_resource_group = str(raw_parameters.pop("apimResourceGroupName"))
+            if upgrade_resource_group.casefold() != core.apim_resource_group_name.casefold():
+                raise ApimUpgradeError("The upgrade plan targets an unexpected resource group")
+            parameters = _arm_parameter_document(raw_parameters)
             name = f"apim-{document_digest(plan.document())[:24]}-{stage}"
             with temporary_parameter_file(parameters, directory) as parameter_file:
-                result = runner.run_json(_deployment_command(
-                    "what-if", inputs, template, parameter_file, name
-                ))
+                result = runner.run_json(
+                    _resource_group_deployment_command(
+                        "what-if",
+                        inputs,
+                        template,
+                        parameter_file,
+                        name,
+                        upgrade_resource_group,
+                    )
+                )
             validate_upgrade_what_if(result, plan, stage, revision)
             _what_if_counts(result)
             _write_private_json(directory / f"what-if-{stage}.json", result)
@@ -1494,9 +1858,16 @@ def gateway_upgrade(
                 raise ApimUpgradeError("The previous ARM upgrade status could not be verified")
             parameters, name = preview(plan, stage, revision, create_revision)
             with temporary_parameter_file(parameters, directory) as parameter_file:
-                result = runner.run_json(_deployment_command(
-                    "create", inputs, template, parameter_file, name
-                ))
+                result = runner.run_json(
+                    _resource_group_deployment_command(
+                        "create",
+                        inputs,
+                        template,
+                        parameter_file,
+                        name,
+                        core.apim_resource_group_name,
+                    )
+                )
             if result.get("properties", {}).get("provisioningState") != "Succeeded":
                 raise ApimUpgradeError("ARM upgrade has not completed successfully")
 
@@ -1563,6 +1934,18 @@ def gateway_upgrade(
         print("API and Control-plane remain stopped; resume through the reviewed package rollout")
 
 
+def observer_outputs_complete(outputs: Mapping[str, Any]) -> bool:
+    return all(
+        isinstance(outputs.get(name), str) and bool(outputs[name])
+        for name in (
+            "acrName",
+            "webAppName",
+            "webAppUrl",
+            "adapterKeyNamedValueName",
+        )
+    )
+
+
 def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     inputs = DeploymentInputs.load(
         args.subscription,
@@ -1580,6 +1963,7 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         return
     if saved_outputs is not None:
         gateway_upgrade(runner, inputs, saved_outputs, "check")
+    validate_shared_storage_account(runner, inputs)
     if saved_outputs is None:
         validate_flex_consumption_capabilities(runner, inputs)
         validate_postgres_capabilities(runner, inputs)
@@ -1611,8 +1995,12 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     )
     main_template = REPOSITORY_ROOT / "infra" / "main.bicep"
     release_template = REPOSITORY_ROOT / "infra" / "runtime-release.bicep"
+    observer_template = REPOSITORY_ROOT / "infra" / "envoy-cache-adapter" / "main.bicep"
+    observer_deployed = saved_outputs is not None and observer_outputs_complete(
+        saved_outputs
+    )
     if saved_outputs is None:
-        what_if(
+        what_if_resource_group(
             runner,
             inputs,
             main_template,
@@ -1622,7 +2010,8 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         if args.action == "plan":
             return
         _confirm_deployment(args.yes)
-        base_result = deploy_template(
+        ensure_shared_storage_resources(runner, inputs)
+        base_result = deploy_resource_group_template(
             runner,
             inputs,
             main_template,
@@ -1630,33 +2019,70 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
             f"{inputs.resource_prefix}-platform",
         )
         platform_outputs = deployment_outputs(base_result)
+        _write_outputs(inputs, platform_outputs)
     else:
         platform_outputs = saved_outputs
-        api_settings = current_app_settings(
-            runner, inputs, _output_string(platform_outputs, "apiName")
-        )
-        control_plane_settings = current_app_settings(
-            runner,
-            inputs,
-            _output_string(platform_outputs, "controlPlaneFunctionName"),
-        )
-        release_parameters = runtime_release_parameters(
-            secrets_,
-            platform_outputs,
-            platform_outputs,
-            api_settings,
-            control_plane_settings,
-        )
         what_if_resource_group(
             runner,
             inputs,
-            release_template,
-            release_parameters,
-            f"{inputs.resource_prefix}-runtime-release",
+            main_template,
+            base_parameters,
+            f"{inputs.resource_prefix}-platform",
         )
+        if observer_deployed:
+            api_settings = current_app_settings(
+                runner, inputs, _output_string(platform_outputs, "apiName")
+            )
+            control_plane_settings = current_app_settings(
+                runner,
+                inputs,
+                _output_string(platform_outputs, "controlPlaneFunctionName"),
+            )
+            release_parameters = runtime_release_parameters(
+                secrets_,
+                platform_outputs,
+                platform_outputs,
+                api_settings,
+                control_plane_settings,
+            )
+            what_if_resource_group(
+                runner,
+                inputs,
+                release_template,
+                release_parameters,
+                f"{inputs.resource_prefix}-runtime-release",
+            )
+        else:
+            observer_document = observer_parameters(
+                inputs,
+                platform_outputs,
+                secrets_,
+                observer_source_version(runner),
+            )
+            what_if_resource_group(
+                runner,
+                inputs,
+                observer_template,
+                observer_document,
+                f"{inputs.resource_prefix}-observer",
+            )
         if args.action == "plan":
             return
         _confirm_deployment(args.yes)
+        ensure_shared_storage_resources(runner, inputs)
+        base_result = deploy_resource_group_template(
+            runner,
+            inputs,
+            main_template,
+            base_parameters,
+            f"{inputs.resource_prefix}-platform",
+        )
+        platform_outputs = {
+            **saved_outputs,
+            **deployment_outputs(base_result),
+        }
+        _write_outputs(inputs, platform_outputs)
+    verify_shared_storage_roles(runner, inputs, platform_outputs)
     version = source_version(runner)
     observer_version = observer_source_version(runner)
     packages = build_packages(runner, inputs, version)
@@ -1668,17 +2094,16 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         platform_outputs,
         secrets_,
         observer_version,
-        existing_observer=platform_outputs if saved_outputs is not None else None,
+        existing_observer=platform_outputs if observer_deployed else None,
     )
-    observer_template = REPOSITORY_ROOT / "infra" / "envoy-cache-adapter" / "main.bicep"
-    what_if(
+    what_if_resource_group(
         runner,
         inputs,
         observer_template,
         observer_document,
         f"{inputs.resource_prefix}-observer",
     )
-    observer_result = deploy_template(
+    observer_result = deploy_resource_group_template(
         runner,
         inputs,
         observer_template,

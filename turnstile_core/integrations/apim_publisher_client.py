@@ -53,7 +53,7 @@ from .apim_control_plane_contract import (
     ReleaseGcPlanEvidence,
     RetryablePublicationError,
 )
-from .apim_policy_compiler import ApimPolicyCompiler
+from .apim_policy_compiler import ApimPolicyCompiler, policy_sha256
 from .apim_policy_components import parent_readback_matches
 
 
@@ -1534,9 +1534,7 @@ class AzureApimPublisherClient:
                     else:
                         operation_policies.append(policy)
                 if len(operation_policies) == len(managed_operations):
-                    observed_policy_hash = hashlib.sha256(
-                        "\n".join(operation_policies).encode("utf-8")
-                    ).hexdigest()
+                    observed_policy_hash = policy_sha256(*operation_policies)
                     if (
                         publication.policy_sha256 is not None
                         and observed_policy_hash != publication.policy_sha256

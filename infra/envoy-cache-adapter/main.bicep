@@ -1,7 +1,6 @@
-targetScope = 'subscription'
+targetScope = 'resourceGroup'
 
-param resourceGroupName string
-param apimResourceGroupName string = resourceGroupName
+param apimResourceGroupName string = resourceGroup().name
 param location string
 param appServicePlanName string
 @allowed([
@@ -17,7 +16,7 @@ param appServicePlanWorkerCount int = 1
 param webAppName string
 param acrName string
 param provisionAcr bool = true
-param acrResourceGroupName string = provisionAcr ? resourceGroupName : apimResourceGroupName
+param acrResourceGroupName string = provisionAcr ? resourceGroup().name : apimResourceGroupName
 param imageRepository string = 'turnstile/envoy-cache-adapter'
 param imageTag string
 param eventHubNamespaceName string
@@ -31,32 +30,21 @@ param adapterSharedKey string
 var acrLoginServer = '${acrName}.azurecr.io'
 var image = '${acrLoginServer}/${imageRepository}:${imageTag}'
 
-resource platformResourceGroup 'Microsoft.Resources/resourceGroups@2024-03-01' existing = {
-  name: resourceGroupName
-}
-
-resource apimResourceGroup 'Microsoft.Resources/resourceGroups@2024-03-01' existing = {
-  name: apimResourceGroupName
-}
-
-resource acrResourceGroup 'Microsoft.Resources/resourceGroups@2024-03-01' existing = {
-  name: acrResourceGroupName
-}
-
 module registry 'br/public:avm/res/container-registry/registry:0.13.0' = if (provisionAcr) {
   name: 'envoy-cache-adapter-registry'
-  scope: acrResourceGroup
+  scope: resourceGroup(acrResourceGroupName)
   params: {
     name: acrName
     location: location
     acrSku: 'Basic'
     acrAdminUserEnabled: false
     azureADAuthenticationAsArmPolicyStatus: 'enabled'
+    publicNetworkAccess: 'Enabled'
+    networkRuleSetDefaultAction: 'Allow'
   }
 }
 
 module app 'app.bicep' = {
-  scope: platformResourceGroup
   name: 'envoy-cache-adapter-app'
   params: {
     location: location
@@ -73,7 +61,7 @@ module app 'app.bicep' = {
 }
 
 module acrRole 'acr-role.bicep' = {
-  scope: acrResourceGroup
+  scope: resourceGroup(acrResourceGroupName)
   name: 'envoy-cache-adapter-acr-role'
   dependsOn: [
     registry
@@ -85,8 +73,8 @@ module acrRole 'acr-role.bicep' = {
 }
 
 module apimIntegration 'apim.bicep' = {
-  scope: apimResourceGroup
-  name: 'envoy-cache-adapter-apim-${uniqueString(resourceGroupName)}'
+  scope: resourceGroup(apimResourceGroupName)
+  name: 'envoy-cache-adapter-apim-${uniqueString(resourceGroup().name)}'
   params: {
     apimName: apimName
     adapterKeyNamedValueName: adapterKeyNamedValueName

@@ -447,7 +447,8 @@ def test_full_upgrade_commands_plan_apply_repeat_and_rollback(
             assert command[command.index("--subscription") + 1] == "unit"
             if command[:3] == ["az", "account", "get-access-token"]:
                 return {"accessToken": "unit-token-not-persisted"}
-            assert command[:3] == ["az", "deployment", "sub"]
+            assert command[:3] == ["az", "deployment", "group"]
+            assert command[command.index("--resource-group") + 1] == "customer"
             parameter_file = Path(command[command.index("--parameters") + 1][1:])
             values = {name: value["value"] for name, value in json.loads(
                 parameter_file.read_text()
@@ -481,15 +482,15 @@ def test_full_upgrade_commands_plan_apply_repeat_and_rollback(
     monkeypatch.setattr(httpx, "Client", client)
     runner = Runner()
     deploy.gateway_upgrade(runner, inputs, outputs, "plan-upgrade")
-    assert not any(command[:4] == ["az", "deployment", "sub", "create"] for command in commands)
+    assert not any(command[:4] == ["az", "deployment", "group", "create"] for command in commands)
     deploy.gateway_upgrade(runner, inputs, outputs, "upgrade", assume_yes=True)
     assert current != original.revision
-    written = sum(command[:4] == ["az", "deployment", "sub", "create"] for command in commands)
+    written = sum(command[:4] == ["az", "deployment", "group", "create"] for command in commands)
     assert written == 2
     deploy.gateway_upgrade(runner, inputs, outputs, "upgrade", assume_yes=True)
     deploy.gateway_upgrade(runner, inputs, outputs, "check")
     assert written == sum(
-        command[:4] == ["az", "deployment", "sub", "create"] for command in commands
+        command[:4] == ["az", "deployment", "group", "create"] for command in commands
     )
     upgrade_revision = current
     current = "later-model-publication"
@@ -497,7 +498,7 @@ def test_full_upgrade_commands_plan_apply_repeat_and_rollback(
     deploy.gateway_upgrade(runner, inputs, outputs, "plan-upgrade")
     deploy.gateway_upgrade(runner, inputs, outputs, "upgrade", assume_yes=True)
     assert written == sum(
-        command[:4] == ["az", "deployment", "sub", "create"] for command in commands
+        command[:4] == ["az", "deployment", "group", "create"] for command in commands
     )
     with pytest.raises(ApimUpgradeError, match="changed API identity"):
         deploy.gateway_upgrade(runner, inputs, outputs, "rollback-upgrade", assume_yes=True)

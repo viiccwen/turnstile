@@ -243,3 +243,9 @@ def test_main_apim_has_an_explicit_all_model_observer_adoption_boundary() -> Non
     assert "mode: 'disabled'" in main
     assert "keyNamedValue: ''" in main
     assert "param apimUsageObserverLegacyRoutingEnabled bool = false" in main
+
+
+def test_observer_registry_public_endpoint_is_explicit() -> None:
+    main = (ROOT / "infra/envoy-cache-adapter/main.bicep").read_text(encoding="utf-8")
+
+    assert "publicNetworkAccess: 'Enabled'" in main

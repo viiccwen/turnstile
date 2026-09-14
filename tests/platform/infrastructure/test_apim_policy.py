@@ -469,8 +469,13 @@ def test_application_identity_comes_from_apim_and_validated_token_context() -> N
 
 def test_application_admission_uses_dynamic_ledger_mapping_and_exact_reservation() -> None:
     policy = POLICY_PATH.read_text()
+    module = APIM_MODULE_PATH.read_text()
 
     assert '&quot;app-map|__GATEWAY_PROFILE_ID__&quot;' in policy
+    assert "endsWith(trimmedLedgerTableEndpoint, '/')" in module
+    assert "normalizedLedgerTableEndpoint" in module.split(
+        "'__LEDGER_TABLE_ENDPOINT__'", 1
+    )[1]
     assert policy.count(
         '.Replace(&quot;\\u0027&quot;, &quot;\\u0027\\u0027&quot;)'
     ) == 2

@@ -277,6 +277,18 @@ def compose_image_parent_policy(source: str, profiles: Sequence[ImageGenerationP
     usage = _one(
         root.findall("./outbound/choose/otherwise/set-variable[@name='usagePayload']"), "usage"
     )
+    prior_cache_fallback = (
+        '?? (long?)usage?["cache_read_input_tokens"] ?? 0;'
+    )
+    current_cache_fallback = (
+        '?? (long?)usage?["cache_read_input_tokens"]\n'
+        '          ?? (long?)usage?["cached_tokens"] ?? 0;'
+    )
+    usage_value = usage.get("value", "")
+    if current_cache_fallback not in usage_value:
+        if usage_value.count(prior_cache_fallback) != 1:
+            raise PolicyCompilationError("Legacy cache usage fallback is not recognized")
+        usage.set("value", usage_value.replace(prior_cache_fallback, current_cache_fallback))
     _replace(root, usage, _branch(usage, _image_usage()))
     burst = max(
         (validate_image_profile(profile).burst_reservation_tokens for profile in profiles),
@@ -434,7 +446,10 @@ def parent_readback_matches(
             return False
     return (
         isinstance(expected_raw, str)
-        and hashlib.sha256(source.encode()).hexdigest() == expected_raw
+        and hashlib.sha256(
+            ET.canonicalize(source, strip_text=True, with_comments=True).encode()
+        ).hexdigest()
+        == expected_raw
     )
 
 

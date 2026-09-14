@@ -17,7 +17,7 @@ from .apim_control_plane_contract import (
     ReleaseGcPlanEvidence,
     RetryablePublicationError,
 )
-from .apim_policy_compiler import ApimPolicyCompiler
+from .apim_policy_compiler import ApimPolicyCompiler, policy_sha256
 from .apim_publisher_client import AzureApimPublisherClient
 from .apim_subscription_key_client import AzureApimSubscriptionKeyClient
 
@@ -34,6 +34,7 @@ __all__ = (
     "CompiledGatewayRelease",
     "NamedValueResource",
     "PolicyCompilationError",
+    "policy_sha256",
     "ReleaseGcPlanEvidence",
     "RetryablePublicationError",
 )

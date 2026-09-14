@@ -37,6 +37,14 @@ from .apim_control_plane_contract import (
 from .apim_image_policy import IMAGE_OPERATION_ID, IMAGE_POLICY_VERSION, image_request_validation
 
 
+def policy_sha256(*policies: str) -> str:
+    canonical = (
+        ElementTree.canonicalize(policy, strip_text=True, with_comments=True)
+        for policy in policies
+    )
+    return hashlib.sha256("\n".join(canonical).encode("utf-8")).hexdigest()
+
+
 def _chat_completions_policy(publication: GatewayPublication) -> str:
         aliases = [
                 item.id
@@ -304,19 +312,15 @@ class ApimPolicyCompiler:
             *([image_policy] if image_policy is not None else []),
         ):
             ElementTree.fromstring(value)
-        digest = hashlib.sha256(
-            "\n".join(
-                (
-                    chat_completions,
-                    responses,
-                    responses_compact,
-                    messages,
-                    count_tokens,
-                    models,
-                    *([image_policy] if image_policy is not None else []),
-                )
-            ).encode("utf-8")
-        ).hexdigest()
+        digest = policy_sha256(
+            chat_completions,
+            responses,
+            responses_compact,
+            messages,
+            count_tokens,
+            models,
+            *([image_policy] if image_policy is not None else []),
+        )
         return CompiledGatewayRelease(
             chat_completions_policy=chat_completions,
             responses_policy=responses,

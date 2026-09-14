@@ -3,6 +3,11 @@ targetScope = 'resourceGroup'
 param location string
 param resourcePrefix string
 param suffix string
+param storageName string
+param storageBlobEndpoint string
+param storageQueueEndpoint string
+param storageTableEndpoint string
+param deploymentContainerName string
 param virtualNetworkName string = 'vnet-turnstile-${suffix}'
 param functionSubnetName string = 'snet-flex-control'
 param keyVaultName string
@@ -34,54 +39,15 @@ param databricksOAuthEnabled bool = false
 param applicationDefaultMonthlyTokenLimit int = 100000
 @minValue(1)
 param applicationDefaultTokensPerMinute int = 100000
-param ledgerStorageName string
 param ledgerTableName string = 'TurnstileLedger'
 param ledgerTableEndpoint string
 
-var storageName = 'stturnstilecp${take(suffix, 11)}'
 var planName = 'plan-${resourcePrefix}-control-${suffix}'
 var functionName = 'func-${resourcePrefix}-control-${suffix}'
-var deploymentContainerName = 'deploy-control-plane'
 var observerConfigured = !empty(trim(usageObserverUrl)) && !empty(trim(usageObserverKeyNamedValue))
 var effectivePublicationWorkerEnabled = publicationWorkerEnabled && observerConfigured
 var effectiveReleaseWorkerEnabled = releaseWorkerEnabled && observerConfigured
 var effectiveEnabled = effectivePublicationWorkerEnabled || effectiveReleaseWorkerEnabled
-
-resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
-  name: storageName
-  location: location
-  tags: {
-    SecurityControl: 'Ignore'
-  }
-  sku: {
-    name: 'Standard_LRS'
-  }
-  kind: 'StorageV2'
-  properties: {
-    allowSharedKeyAccess: false
-    allowBlobPublicAccess: false
-    minimumTlsVersion: 'TLS1_2'
-    supportsHttpsTrafficOnly: true
-    publicNetworkAccess: 'Enabled'
-    networkAcls: {
-      bypass: 'AzureServices'
-      defaultAction: 'Allow'
-    }
-  }
-}
-
-resource deploymentBlobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
-  parent: storage
-  name: 'default'
-}
-
-resource deploymentContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
-  parent: deploymentBlobService
-  name: deploymentContainerName
-  properties: {
-    publicAccess: 'None'
-  }
-}
 
 resource plan 'Microsoft.Web/serverfarms@2024-11-01' = {
   name: planName
@@ -124,7 +90,7 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
       deployment: {
         storage: {
           type: 'blobContainer'
-          value: '${storage.properties.primaryEndpoints.blob}${deploymentContainer.name}'
+          value: '${storageBlobEndpoint}${deploymentContainerName}'
           authentication: {
             type: 'SystemAssignedIdentity'
           }
@@ -143,10 +109,10 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
       minTlsVersion: '1.2'
       appSettings: [
         { name: 'AzureWebJobsFeatureFlags', value: 'EnableWorkerIndexing' }
-        { name: 'AzureWebJobsStorage__accountName', value: storage.name }
-        { name: 'AzureWebJobsStorage__blobServiceUri', value: storage.properties.primaryEndpoints.blob }
-        { name: 'AzureWebJobsStorage__queueServiceUri', value: storage.properties.primaryEndpoints.queue }
-        { name: 'AzureWebJobsStorage__tableServiceUri', value: storage.properties.primaryEndpoints.table }
+        { name: 'AzureWebJobsStorage__accountName', value: storageName }
+        { name: 'AzureWebJobsStorage__blobServiceUri', value: storageBlobEndpoint }
+        { name: 'AzureWebJobsStorage__queueServiceUri', value: storageQueueEndpoint }
+        { name: 'AzureWebJobsStorage__tableServiceUri', value: storageTableEndpoint }
         { name: 'AzureWebJobsStorage__credential', value: 'managedidentity' }
         { name: 'DATABASE_URL', value: '@Microsoft.KeyVault(SecretUri=${databaseUrlSecretUri})' }
         { name: 'CREDENTIAL_ENCRYPTION_KEY', value: '@Microsoft.KeyVault(SecretUri=${credentialEncryptionKeySecretUri})' }
@@ -216,60 +182,6 @@ resource apimProbeSubscriptionKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-
   name: 'apim-probe-subscription-key'
 }
 
-resource functionStorageBlobOwner 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, functionApp.id, 'storage-blob-data-owner')
-  scope: storage
-  properties: {
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b')
-  }
-}
-
-resource functionStorageQueueContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, functionApp.id, 'storage-queue-data-contributor')
-  scope: storage
-  properties: {
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '974c5e8b-45b9-4653-ba55-5f855dd0fb88')
-  }
-}
-
-resource functionStorageTableContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, functionApp.id, 'storage-table-data-contributor')
-  scope: storage
-  properties: {
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')
-  }
-}
-
-resource ledgerStorage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
-  name: ledgerStorageName
-}
-
-resource ledgerTableService 'Microsoft.Storage/storageAccounts/tableServices@2023-05-01' existing = {
-  parent: ledgerStorage
-  name: 'default'
-}
-
-resource ledgerTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' existing = {
-  parent: ledgerTableService
-  name: ledgerTableName
-}
-
-resource applicationLedgerContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (applicationProvisioningEnabled) {
-  name: guid(ledgerTable.id, functionApp.id, 'application-provisioning-table-contributor')
-  scope: ledgerTable
-  properties: {
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')
-  }
-}
-
 resource functionDatabaseSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(databaseUrlSecret.id, functionApp.id, 'key-vault-secrets-user')
   scope: databaseUrlSecret
@@ -302,6 +214,6 @@ resource functionProbeSecretReader 'Microsoft.Authorization/roleAssignments@2022
 
 output functionName string = functionApp.name
 output principalId string = functionApp.identity.principalId
-output storageName string = storage.name
+output storageName string = storageName
 output appServicePlanName string = plan.name
-output deploymentContainerName string = deploymentContainer.name
+output deploymentContainerName string = deploymentContainerName

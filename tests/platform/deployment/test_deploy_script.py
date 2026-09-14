@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import stat
 import subprocess
@@ -20,6 +21,7 @@ from scripts.deploy import (
     DeploymentInputs,
     ExistingCore,
     _install_linux_dependencies,
+    _resource_group_deployment_command,
     _upgrade_lock,
     _write_private_json,
     build_and_start_observer,
@@ -28,12 +30,14 @@ from scripts.deploy import (
     deploy_webapp_package,
     deployment_parameters,
     deterministic_zip,
+    ensure_shared_storage_resources,
     execute,
     frontend_asset,
     linux_dependency_command,
     load_existing_core,
     load_or_create_secret_material,
     observer_names,
+    observer_outputs_complete,
     observer_parameters,
     observer_plan_name,
     observer_source_version,
@@ -45,7 +49,9 @@ from scripts.deploy import (
     validate_flex_consumption_capabilities,
     validate_packaged_dependencies,
     validate_postgres_capabilities,
+    validate_shared_storage_account,
     verify_owner_login,
+    verify_shared_storage_roles,
     wait_for_health,
     wait_for_observer_health,
     what_if,
@@ -63,6 +69,15 @@ def _parameters(path: Path) -> Path:
                     "location": {"value": "eastus2"},
                     "apimPublisherEmail": {"value": "admin@example.com"},
                     "bootstrapOwnerEmail": {"value": "owner@example.com"},
+                    "storageResourceGroupName": {"value": "storage"},
+                    "storageAccountName": {"value": "geoliangdatalake"},
+                    "telemetryDeploymentContainerName": {
+                        "value": "victurnstile-telemetry-deploy"
+                    },
+                    "controlPlaneDeploymentContainerName": {
+                        "value": "victurnstile-control-deploy"
+                    },
+                    "ledgerTableName": {"value": "VicturnstileLedger"},
                 }
             }
         ),
@@ -77,10 +92,16 @@ def test_secret_state_is_private_stable_and_excludes_plaintext(tmp_path: Path) -
         _parameters(tmp_path / "parameters.json"),
         tmp_path / "state.json",
     )
+    prompts: list[str] = []
     answers = iter(("a-secure-owner-password", "a-secure-owner-password"))
+
+    def read_password(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
     first = load_or_create_secret_material(
         inputs,
-        read_password=lambda _: next(answers),
+        read_password=read_password,
         require_owner_password=True,
     )
     second = load_or_create_secret_material(
@@ -91,9 +112,44 @@ def test_secret_state_is_private_stable_and_excludes_plaintext(tmp_path: Path) -
 
     assert first.values == second.values
     assert first.owner_password == "a-secure-owner-password"
+    assert prompts == [
+        "Initial Owner password (minimum 12 characters): ",
+        "Repeat Initial Owner password (minimum 12 characters): ",
+    ]
     assert first.values["observerAdapterSharedKey"] != first.values["managementApiKey"]
     assert "a-secure-owner-password" not in inputs.state_path.read_text(encoding="utf-8")
-    assert stat.S_IMODE(inputs.state_path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(inputs.state_path.stat().st_mode) == 0o600
+
+
+def test_resume_rejects_short_owner_password_before_deployment(tmp_path: Path) -> None:
+    inputs = DeploymentInputs.load(
+        "00000000-0000-0000-0000-000000000001",
+        _parameters(tmp_path / "parameters.json"),
+        tmp_path / "state.json",
+    )
+    answers = iter(("a-secure-owner-password", "a-secure-owner-password"))
+    load_or_create_secret_material(
+        inputs,
+        read_password=lambda _: next(answers),
+        require_owner_password=True,
+    )
+    prompts: list[str] = []
+
+    def read_short_password(prompt: str) -> str:
+        prompts.append(prompt)
+        return "too-short"
+
+    with pytest.raises(DeploymentError, match="at least 12 characters"):
+        load_or_create_secret_material(
+            inputs,
+            read_password=read_short_password,
+            require_owner_password=True,
+        )
+
+    assert prompts == [
+        "Initial Owner password for verification (minimum 12 characters): "
+    ]
 
 
 def test_public_parameter_file_rejects_secure_values(tmp_path: Path) -> None:
@@ -227,6 +283,101 @@ def test_postgres_preflight_accepts_requested_sku_and_zone(
     assert commands[0][commands[0].index("--location") + 1] == "eastus2"
 
 
+def test_shared_storage_preflight_requires_function_endpoints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = DeploymentInputs.load(
+        "subscription",
+        _parameters(tmp_path / "parameters.json"),
+        tmp_path / "state.json",
+    )
+    runner = CommandRunner()
+    monkeypatch.setattr(
+        runner,
+        "run_json",
+        lambda *_args, **_kwargs: {
+            "kind": "StorageV2",
+            "publicNetworkAccess": "Enabled",
+            "blob": "https://geoliangdatalake.blob.core.windows.net/",
+            "queue": "https://geoliangdatalake.queue.core.windows.net/",
+            "table": "https://geoliangdatalake.table.core.windows.net/",
+        },
+    )
+
+    validate_shared_storage_account(runner, inputs)
+
+
+def test_shared_storage_bootstrap_creates_only_owned_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = DeploymentInputs.load(
+        "subscription",
+        _parameters(tmp_path / "parameters.json"),
+        tmp_path / "state.json",
+    )
+    runner = CommandRunner()
+    commands: list[Sequence[str]] = []
+
+    def run(
+        command: Sequence[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="")
+
+    monkeypatch.setattr(runner, "run", run)
+
+    ensure_shared_storage_resources(runner, inputs)
+
+    assert [command[1:4] for command in commands] == [
+        ["storage", "container", "create"],
+        ["storage", "container", "create"],
+        ["storage", "table", "create"],
+    ]
+    assert all("--auth-mode" in command and "login" in command for command in commands)
+    assert all("queue" not in command for command in commands)
+
+
+def test_shared_storage_roles_exclude_queue_contributor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    inputs = DeploymentInputs.load(
+        "subscription",
+        _parameters(tmp_path / "parameters.json"),
+        tmp_path / "state.json",
+    )
+    runner = CommandRunner()
+
+    def run(
+        command: Sequence[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, stdout="[]")
+
+    monkeypatch.setattr(runner, "run", run)
+    outputs = {
+        "storageAccountId": (
+            "/subscriptions/subscription/resourceGroups/storage/providers/"
+            "Microsoft.Storage/storageAccounts/geoliangdatalake"
+        ),
+        "ledgerTableId": (
+            "/subscriptions/subscription/resourceGroups/storage/providers/"
+            "Microsoft.Storage/storageAccounts/geoliangdatalake/tableServices/"
+            "default/tables/VicturnstileLedger"
+        ),
+        "telemetryPrincipalId": "telemetry-principal",
+        "apiPrincipalId": "api-principal",
+        "controlPlanePrincipalId": "control-principal",
+        "apimPrincipalId": "apim-principal",
+    }
+
+    with pytest.raises(DeploymentError, match="role assignments are incomplete"):
+        verify_shared_storage_roles(runner, inputs, outputs)
+
+    instructions = capsys.readouterr().out
+    assert "Storage Blob Data Owner" in instructions
+    assert "Storage Table Data Contributor" in instructions
+    assert "Storage Queue Data Contributor" not in instructions
+
+
 def test_owner_credentials_are_private_and_match_public_email(tmp_path: Path) -> None:
     path = tmp_path / "owner.credentials.json"
     path.write_text(
@@ -248,6 +399,7 @@ def test_owner_credentials_are_private_and_match_public_email(tmp_path: Path) ->
         owner_credentials_password(path, "other@example.com")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows credentials use ACL protection")
 def test_owner_credentials_reject_group_or_world_access(tmp_path: Path) -> None:
     path = tmp_path / "owner.credentials.json"
     path.write_text(
@@ -398,10 +550,28 @@ def test_saved_outputs_enable_existing_core_on_rerun(tmp_path: Path) -> None:
     assert core.apim_resource_group_name == "turnstile-test"
 
 
+def test_platform_only_outputs_do_not_resume_runtime_release() -> None:
+    platform_outputs = {
+        "apiName": "api-turnstile-test",
+        "controlPlaneFunctionName": "func-turnstile-control-test",
+    }
+    completed_outputs = {
+        **platform_outputs,
+        "acrName": "crturnstiletest",
+        "webAppName": "obs-turnstile-test",
+        "webAppUrl": "https://obs-turnstile-test.azurewebsites.net",
+        "adapterKeyNamedValueName": "turnstile-observer-key",
+    }
+
+    assert observer_outputs_complete(platform_outputs) is False
+    assert observer_outputs_complete(completed_outputs) is True
+
+
 def test_temporary_parameter_file_is_private_and_deleted(tmp_path: Path) -> None:
     with temporary_parameter_file({"parameters": {}}, tmp_path) as path:
         assert path.is_file()
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        if os.name != "nt":
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert not path.exists()
 
 
@@ -473,7 +643,7 @@ def test_observer_parameters_reuse_apps_but_isolate_the_observer_plan(
     ("existing_observer", "expected_acr_group"),
     (
         (None, "turnstile-test"),
-        ({"acrName": "acrexisting", "webAppName": "observer-existing"}, "shared-apim"),
+        ({"acrName": "acrexisting", "webAppName": "observer-existing"}, "turnstile-test"),
         (
             {
                 "acrName": "acrexisting",
@@ -594,6 +764,45 @@ def test_existing_observer_image_skips_rebuild_and_restart(
     assert commands[0][:4] == ["az", "acr", "repository", "show"]
 
 
+def test_missing_observer_image_is_built_and_restarted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = DeploymentInputs.load(
+        "subscription",
+        _parameters(tmp_path / "parameters.json"),
+        tmp_path / "state.json",
+    )
+    runner = CommandRunner()
+    commands: list[Sequence[str]] = []
+
+    def run(
+        command: Sequence[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if command[:4] == ["az", "acr", "repository", "show"]:
+            raise DeploymentError("Error: the specified tag does not exist")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(runner, "run", run)
+
+    build_and_start_observer(
+        runner,
+        inputs,
+        {
+            "acrName": "acrexisting",
+            "image": "acrexisting.azurecr.io/turnstile/observer:new-tag",
+            "webAppName": "observer-existing",
+        },
+        "new-tag",
+    )
+
+    assert [command[:3] for command in commands] == [
+        ["az", "acr", "repository"],
+        ["az", "acr", "build"],
+        ["az", "webapp", "restart"],
+    ]
+
+
 def test_api_deployment_uses_entra_publish_and_turnstile_health_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -655,9 +864,17 @@ def test_webapp_package_deployment_uses_entra_without_logging_token(
             commands.append(list(command))
             return {"accessToken": "secret-token"}
 
+    responses = iter(
+        (
+            b'{"id":"previous","status":4,"complete":true}',
+            b"{}",
+            b'{"id":"current","status":4,"complete":true}',
+        )
+    )
+
     def capture_request(request: urllib.request.Request, timeout: float) -> bytes:
         requests.append((request, timeout))
-        return b"{}"
+        return next(responses)
 
     monkeypatch.setattr(
         "scripts.deploy._open_without_proxy",
@@ -686,15 +903,57 @@ def test_webapp_package_deployment_uses_entra_without_logging_token(
             "json",
         ]
     ]
-    request, timeout = requests[0]
+    assert requests[0][0].full_url == (
+        "https://api.scm.azurewebsites.net/api/deployments/latest"
+    )
+    request, timeout = requests[1]
     assert request.full_url == (
         "https://api.scm.azurewebsites.net/api/publish"
-        "?type=zip&clean=true&restart=true"
+        "?type=zip&clean=true&restart=true&isAsync=true"
     )
     assert request.get_header("Authorization") == "Bearer secret-token"
     assert request.data == b"package-bytes"
-    assert timeout == 1800
+    assert timeout == 120
+    assert requests[2][0].full_url == (
+        "https://api.scm.azurewebsites.net/api/deployments/latest"
+    )
     assert "secret-token" not in capsys.readouterr().out
+
+
+def test_webapp_package_accepts_completed_flex_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = tmp_path / "function.zip"
+    package.write_bytes(b"package-bytes")
+
+    class Runner:
+        def run_json(self, _command: Sequence[str], **_: object) -> dict[str, str]:
+            return {"accessToken": "secret-token"}
+
+    responses = iter(
+        (
+            b'{"id":"previous","status":4,"complete":true}',
+            b"{}",
+            b'{"id":"current","status":2,"complete":false}',
+            json.dumps(
+                [
+                    {"type": 0, "message": "Finished deployment pipeline."},
+                    {"type": 0, "message": "[Kudu-SyncTriggerStep] completed."},
+                ]
+            ).encode(),
+        )
+    )
+    monkeypatch.setattr(
+        "scripts.deploy._open_without_proxy",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    deploy_webapp_package(
+        Runner(),  # type: ignore[arg-type]
+        type("Inputs", (), {"subscription": "sub"})(),
+        "function",
+        package,
+    )
 
 
 def test_function_package_deployment_restarts_and_retries_after_failure(
@@ -945,8 +1204,9 @@ def test_upgrade_files_are_private_and_concurrent_execution_is_rejected(tmp_path
     _write_private_json(path, {"status": "preparing"})
     _write_private_json(path, {"status": "passed"})
     assert json.loads(path.read_text()) == {"status": "passed"}
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
     with (
         _upgrade_lock(directory), pytest.raises(DeploymentError, match="Another process"),
         _upgrade_lock(directory),
@@ -1091,6 +1351,47 @@ class WhatIfRunner(CommandRunner):
     ) -> dict[str, object]:
         del command, cwd, env
         return self.result
+
+
+def test_platform_deployment_targets_the_existing_resource_group(tmp_path: Path) -> None:
+    inputs = DeploymentInputs.load(
+        "subscription",
+        _parameters(tmp_path / "parameters.json"),
+        tmp_path / "state.json",
+    )
+
+    command = _resource_group_deployment_command(
+        "what-if",
+        inputs,
+        Path("infra/main.bicep"),
+        tmp_path / "parameters.generated.json",
+        "turnstile-platform",
+    )
+
+    assert command[:4] == ["az", "deployment", "group", "what-if"]
+    assert command[command.index("--resource-group") + 1] == "turnstile-test"
+    assert "sub" not in command
+
+
+def test_command_runner_resolves_windows_command_shims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[str] = []
+    monkeypatch.setattr(
+        "scripts.deploy.shutil.which",
+        lambda name: f"C:/resolved/{name}.CMD",
+    )
+
+    def run(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.extend(command)
+        assert kwargs["encoding"] == ("mbcs" if os.name == "nt" else "utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="")
+
+    monkeypatch.setattr("scripts.deploy.subprocess.run", run)
+
+    CommandRunner().run(["az", "account", "show"])
+
+    assert captured == ["C:/resolved/az.CMD", "account", "show"]
 
 
 def test_what_if_reads_root_level_changes_and_rejects_delete(tmp_path: Path) -> None:

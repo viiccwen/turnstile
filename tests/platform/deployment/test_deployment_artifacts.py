@@ -147,14 +147,13 @@ def test_observer_registry_and_role_use_the_registry_resource_group() -> None:
     ).read_text(encoding="utf-8")
 
     assert (
-        "param acrResourceGroupName string = provisionAcr ? resourceGroupName : "
+        "param acrResourceGroupName string = provisionAcr ? resourceGroup().name : "
         "apimResourceGroupName"
     ) in template
-    assert "name: acrResourceGroupName" in template
     for module_name in ("registry", "acrRole"):
         module = re.search(rf"module {module_name}\b.*?\n}}", template, re.DOTALL)
         assert module is not None
-        assert "scope: acrResourceGroup" in module.group()
+        assert "scope: resourceGroup(acrResourceGroupName)" in module.group()
     assert "output acrResourceGroupName string = acrResourceGroupName" in template
 
 

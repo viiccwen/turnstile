@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -22,6 +21,7 @@ from ..integrations.apim_control_plane import (
     AuthorizationRequiredError,
     PolicyCompilationError,
     RetryablePublicationError,
+    policy_sha256,
 )
 from ..integrations.apim_policy_components import (
     component_digest,
@@ -193,7 +193,7 @@ class GatewayPublicationWorker:
             updates["resource_manifest"] = {
                 **publication.resource_manifest,
                 "base_apim_revision": base_revision,
-                "base_policy_sha256": hashlib.sha256(live_policy.encode("utf-8")).hexdigest(),
+                "base_policy_sha256": policy_sha256(live_policy),
             }
         elif status == "validating":
             encrypted = self._repository.gateway_publication_credential(publication.id)
@@ -249,7 +249,7 @@ class GatewayPublicationWorker:
             )
             base_revision, live_policy = self._client.current_api_policy()
             manifest = publication.resource_manifest
-            live_hash = hashlib.sha256(live_policy.encode("utf-8")).hexdigest()
+            live_hash = policy_sha256(live_policy)
             if (
                 manifest.get("base_apim_revision") != base_revision
                 or manifest.get("base_policy_sha256") != live_hash
@@ -304,7 +304,7 @@ class GatewayPublicationWorker:
             updates["policy_sha256"] = compiled.policy_sha256
             updates["resource_manifest"] = {
                 **publication.resource_manifest,
-                "parent_policy_sha256": hashlib.sha256(parent.encode("utf-8")).hexdigest(),
+                "parent_policy_sha256": policy_sha256(parent),
                 **(
                     {
                         "parent_policy_contract_sha256": component_digest(
