@@ -2,9 +2,60 @@
 
 ## Scope
 
-Turnstile infrastructure includes PostgreSQL, Event Hubs, Storage, Key Vault, Application Insights, the Web App, telemetry and control-plane Functions, and APIM configuration. FastAPI and the observer each have a dedicated App Service Plan. The telemetry and control-plane Functions each have a separate Flex Consumption plan, deployment container, and VNet subnet. The templates do not create Azure AI Foundry projects or provider model deployments.
+Turnstile infrastructure includes PostgreSQL, Event Hubs, an existing shared Storage account, Key Vault, Application Insights, the Web App, telemetry and control-plane Functions, and APIM configuration. FastAPI and the observer each have a dedicated App Service Plan. The telemetry and control-plane Functions each have a separate Flex Consumption plan, deployment container, and VNet subnet. The main deployment is resource-group scoped and does not create or reconfigure the shared account, Azure AI Foundry projects, or provider model deployments.
 
-The API, telemetry and control-plane Functions, observer, and budget ledger require public service endpoints for package deployment or runtime traffic. They explicitly enable public network access and carry the resource-level `SecurityControl=Ignore` tag so an organization-level network Modify policy does not silently disable them. The exemption is not applied at resource-group scope; platform Storage and Key Vault resources designed for private-link access remain private.
+The API, telemetry and control-plane Functions, and observer explicitly enable public network access and carry the resource-level `SecurityControl=Ignore` tag so an organization-level network Modify policy does not silently disable them. The exemption is not applied at resource-group scope. Shared Storage retains its administrator-managed network policy; verify runtime and deployment connectivity without weakening its firewall. Key Vault resources designed for private-link access remain isolated.
+
+### Shared Storage bootstrap and scoped permissions
+
+Before ARM deployment, the resumable deployment lifecycle must create or verify only the two
+deployment containers, the configured ledger table, and `ModelRoutes` on the existing shared
+account using Entra authentication. Never replace the account, recreate a ledger, overwrite
+table rows, or change shared-account networking. The shared account can be in another resource
+group in the same subscription. The templates publish `ledgerTableResourceId`,
+`routeTableResourceId` (also `routeTableId`), and both Table endpoints from that exact account;
+platform governance must reference those IDs, not a dedicated or platform-group account.
+
+The lifecycle must verify these exact-scope grants before package deployment and before enabling
+publication, Application provisioning, or Gateway Release workers; stop with actionable missing
+permissions rather than declaring the environment ready:
+
+| Scope | Identity | Required role |
+| --- | --- | --- |
+| Shared account | Telemetry and Control-plane Function identities | Storage Blob Data Owner for host/deployment blobs |
+| Configured ledger table only | API, Telemetry, APIM and enabled Application-provisioning worker | Storage Table Data Contributor |
+| ModelRoutes only | API and APIM | Storage Table Data Reader |
+| ModelRoutes only | Enabled publication/release worker | Storage Table Data Contributor |
+
+Host Queue permissions, if required by enabled triggers, must be reviewed separately; do not
+silently introduce account-wide Queue or Table contributor roles. Skip absent Control-plane
+identities when that Function is not provisioned. Retain exact deterministic assignment IDs in
+deployment state so removal targets only this installation's grants and never the shared account.
+
+Gateway onboarding also requires constrained Role Based Access Control Administrator
+(`f58310d9-a9f6-439a-9e8d-f62e7b41a168`) assignments to the API and enabled release worker on
+each exact table. Use `conditionVersion=2.0`: ledger writes may grant only
+`0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3` (Storage Table Data Contributor), route writes only
+`76199698-9eea-4c19-bc75-cec21354c6b6` (Storage Table Data Reader), and only to
+`ServicePrincipal` recipients. Deny `Microsoft.Authorization/roleAssignments/delete` in both
+conditions. Never substitute unconditioned administrator access at account, group, or subscription
+scope. Cross-group table grants belong in the deployment lifecycle or a separately scoped ARM
+module, not in the compute modules.
+
+When migrating grants from a managed-account installation, retain the existing ARM `guid`
+inputs rather than creating duplicate assignments: `(table ID, API resource ID,
+apim-ledger-rbac-delegator/apim-route-rbac-delegator)` for the API and `(table ID,
+Function resource ID, onboarding-ledger-rbac-delegator/onboarding-route-rbac-delegator)` for
+the release worker. Route data grants use `(route table ID, API resource ID or APIM principal
+ID, route-table-reader)` and `(route table ID, Function resource ID, route-table-contributor)`.
+Do not replace a constrained grant with a broader grant merely because a shared account is used.
+
+The dedicated runtime credential vault is distinct from the configuration-secret vault. ARM
+retains APIM Secrets User access, enabled Publisher Secrets Officer access, and constrained
+Secrets User delegation on that credential vault, plus Event Hub Sender delegation on the exact
+usage hub. When adopting dependencies, preserve this distinction, use the actual credential-vault
+resource ID/group and network path, and verify externally scoped grants before enabling workers.
+Do not point route credentials at a read-only adopted configuration-secret bundle.
 
 ## Prepare for v1.2
 
@@ -223,10 +274,11 @@ availability and capacity for PostgreSQL 16, separate Flex Consumption Functions
 default StandardV2 APIM before provisioning. APIM creation can take substantially longer than
 deploying the application packages.
 
-The main template creates the ledger account/table and supplies `LEDGER_SYNC_ENABLED=true`,
-`LEDGER_TABLE_ENDPOINT` and `LEDGER_TABLE_NAME` to the API. It grants that API's managed
-identity Storage Table Data Contributor on the **new Table**, with dependencies on the new
-identity and table. No separate model-access upgrade template is required for this path.
+The main template references the existing shared account and supplies `LEDGER_SYNC_ENABLED=true`,
+`LEDGER_TABLE_ENDPOINT` and `LEDGER_TABLE_NAME` to the API. The deployment lifecycle bootstraps
+the owned shared-account children and verifies exact Table permissions as described above.
+No replacement account or ledger is created. No separate model-access upgrade template is
+required when these installation prerequisites have been verified.
 
 The initial database has no customer models, connections or usage. Sign in as the initial
 Owner, create a provider Connection, publish an existing upstream deployment, assign model
@@ -251,17 +303,17 @@ local-key authentication or weaken networking merely to complete installation.
 
 ### Control-plane host storage networking
 
-New installations provision the Control-plane Function's own host storage with public network
-access disabled, managed-identity authentication and Blob, Queue and Table private endpoints.
-These endpoints are distinct from the telemetry storage endpoints. The existing platform private
-DNS zones are linked to the Function VNet and receive records for this specific storage account.
+New shared-Storage installations use the existing account's Blob, Queue and Table endpoints
+with managed-identity authentication and a separate Control-plane deployment container.
+The main template does not create private endpoints or alter shared-account network settings.
+Verify host lease acquisition and Table access over the administrator-approved network path.
 
 For an older installation, use
 [control-plane-storage-network-upgrade.bicep](../infra/control-plane-storage-network-upgrade.bicep).
 Select the storage account named by that Function's `AzureWebJobsStorage__accountName`, its existing
 resource group, VNet and private endpoint subnet. The three platform storage private DNS zones must
 already exist in that resource group and be linked to the Function VNet. The upgrade reuses the
-same private endpoint module as a fresh installation; it does not recreate the Function, storage,
+standalone private endpoint module; it does not recreate the Function, storage,
 VNet or resource group, change application settings, open public access or grant additional roles.
 Review a subscription-scope what-if before deployment and require that only the selected account's
 three private endpoints and their DNS zone groups are created.
@@ -274,7 +326,7 @@ Do not submit another publication to work around a task that has never been clai
 
 ### Immediate model-access upgrade
 
-The API also needs network reachability to the ledger. With the default private ledger,
+The API also needs network reachability to the ledger. For a retained private-ledger installation,
 use [model-access-network-upgrade.bicep](../infra/model-access-network-upgrade.bicep) to add
 an unused `snet-api` subnet delegated to `Microsoft.Web/serverFarms` and integrate the API
 with the platform VNet. Review address-space overlap, private DNS links and the ledger private

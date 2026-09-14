@@ -34,6 +34,7 @@ from ..integrations.apim_control_plane import (
     AuthorizationRequiredError,
     PolicyCompilationError,
     RetryablePublicationError,
+    policy_sha256,
 )
 from ..integrations.apim_control_plane_contract import (
     ApimPublisherClientResolver,
@@ -566,7 +567,7 @@ class GatewayPublicationWorker:
                 **publication.resource_manifest,
                 "apim_target_identity_sha256": resolved.target_identity_sha256,
                 "base_apim_revision": base_revision,
-                "base_policy_sha256": hashlib.sha256(live_policy.encode("utf-8")).hexdigest(),
+                "base_policy_sha256": policy_sha256(live_policy),
                 "base_policy_document_sha256": policy_document_digest(live_policy),
             }
         elif status == "validating":
@@ -645,7 +646,7 @@ class GatewayPublicationWorker:
                 raise RuntimeError("Publication is missing its APIM revision")
             base_revision, live_policy = client.current_api_policy()
             manifest = publication.resource_manifest
-            live_hash = hashlib.sha256(live_policy.encode("utf-8")).hexdigest()
+            live_hash = policy_sha256(live_policy)
             expected_document = manifest.get("base_policy_document_sha256")
             matching_document = (
                 isinstance(expected_document, str)
@@ -746,9 +747,7 @@ class GatewayPublicationWorker:
                 **publication.resource_manifest,
                 **({"images_generations_operation": IMAGE_OPERATION_ID}
                    if compiled.images_generations_policy is not None else {}),
-                "parent_policy_sha256": hashlib.sha256(
-                    parent.encode("utf-8")
-                ).hexdigest(),
+                "parent_policy_sha256": policy_sha256(parent),
                 "parent_policy_contract_sha256": component_digest(
                     parse_policy(parent), normalize_text_defaults=False,
                 ),

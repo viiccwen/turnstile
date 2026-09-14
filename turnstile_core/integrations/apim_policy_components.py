@@ -957,7 +957,10 @@ def parent_readback_matches(
             return False
     return (
         isinstance(expected_raw, str)
-        and hashlib.sha256(source.encode()).hexdigest() == expected_raw
+        and hashlib.sha256(
+            ET.canonicalize(source, strip_text=True, with_comments=True).encode()
+        ).hexdigest()
+        == expected_raw
     )
 
 

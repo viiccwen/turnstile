@@ -1,4 +1,4 @@
-targetScope = 'subscription'
+targetScope = 'resourceGroup'
 
 type DisabledUsageObserver = {
   mode: 'disabled'
@@ -31,8 +31,17 @@ type EnabledUsageObserver = {
 @maxLength(12)
 param resourcePrefix string = 'turnstile'
 
-@description('Resource group created for the Turnstile platform.')
-param resourceGroupName string = '${resourcePrefix}-platform'
+@description('Resource group containing the existing shared Storage Account used by Turnstile.')
+param storageResourceGroupName string = resourceGroup().name
+
+@description('Existing StorageV2 account with Blob, Queue, and Table endpoints.')
+param storageAccountName string
+
+@description('Existing blob container used for the telemetry Function deployment package.')
+param telemetryDeploymentContainerName string = 'turnstile-telemetry-deploy'
+
+@description('Existing blob container used for the control-plane Function deployment package.')
+param controlPlaneDeploymentContainerName string = 'turnstile-control-deploy'
 
 param location string
 param postgresLocation string = location
@@ -215,23 +224,13 @@ param apimUsageObserverLegacyRoutingEnabled bool = false
 param postgresAdministratorLogin string = 'turnstileadmin'
 param postgresSkuName string = 'Standard_B1ms'
 param postgresTier string = 'Burstable'
-param suffix string = uniqueString(subscription().id, resourceGroupName)
+param suffix string = uniqueString(subscription().id, resourceGroup().name)
 
-resource platformResourceGroup 'Microsoft.Resources/resourceGroups@2024-11-01' = {
-  name: resourceGroupName
-  location: location
-  tags: {
-    workload: 'turnstile'
-    dataClassification: 'usage-metadata-only'
-  }
-}
-
-var effectiveApimResourceGroupName = provisionApimService ? platformResourceGroup.name : existingApimResourceGroupName
+var effectiveApimResourceGroupName = provisionApimService ? resourceGroup().name : existingApimResourceGroupName
 var provisionApimOutboundNetwork = provisionApimService && apimSkuName == 'StandardV2'
 
 module apim 'modules/apim-service.bicep' = if (provisionApimService) {
   name: 'turnstile-apim'
-  scope: platformResourceGroup
   params: {
     name: 'apim-${resourcePrefix}-${suffix}'
     location: location
@@ -247,15 +246,27 @@ var effectiveApimPrincipalId = provisionApimService ? apim!.outputs.principalId 
 var effectiveApimGatewayUrl = provisionApimService ? apim!.outputs.gatewayUrl : existingApimGatewayUrl
 var effectiveGatewayApiPath = '${effectiveApimGatewayUrl}/${gatewayApiRelativePath}'
 
+resource sharedStorage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
+  scope: resourceGroup(storageResourceGroupName)
+  name: storageAccountName
+}
+
 module dataPlane 'modules/data-plane.bicep' = {
   name: 'turnstile-data-plane'
-  scope: platformResourceGroup
   params: {
     location: location
     provisionApimOutboundNetwork: provisionApimOutboundNetwork
     postgresLocation: postgresLocation
     resourcePrefix: resourcePrefix
     suffix: suffix
+    telemetryStorageName: sharedStorage.name
+    telemetryBlobEndpoint: sharedStorage.properties.primaryEndpoints.blob
+    telemetryQueueEndpoint: sharedStorage.properties.primaryEndpoints.queue
+    telemetryTableEndpoint: sharedStorage.properties.primaryEndpoints.table
+    telemetryDeploymentContainerName: telemetryDeploymentContainerName
+    ledgerStorageName: sharedStorage.name
+    ledgerStorageResourceGroupName: storageResourceGroupName
+    ledgerTableEndpoint: sharedStorage.properties.primaryEndpoints.table
     postgresAdministratorLogin: postgresAdministratorLogin
     postgresAdministratorPassword: postgresAdministratorPassword
     postgresSkuName: postgresSkuName
@@ -289,7 +300,6 @@ module dataPlane 'modules/data-plane.bicep' = {
 
 module apimOutboundNetwork 'modules/apim-service.bicep' = if (provisionApimOutboundNetwork) {
   name: 'turnstile-apim-outbound-network'
-  scope: platformResourceGroup
   params: {
     name: effectiveApimName
     location: location
@@ -346,17 +356,21 @@ module apimIntegration 'modules/apim-integration.bicep' = if (deployApimBootstra
     employeeSurfaceMap: employeeSurfaceMap
     subscriptionAgentMap: subscriptionAgentMap
     appInsightsName: dataPlane.outputs.applicationInsightsName
-    appInsightsResourceGroupName: platformResourceGroup.name
+    appInsightsResourceGroupName: resourceGroup().name
   }
 }
 
 module controlPlane 'modules/control-plane-function.bicep' = if (provisionControlPlane) {
   name: 'turnstile-control-plane-function'
-  scope: platformResourceGroup
   params: {
     location: location
     resourcePrefix: resourcePrefix
     suffix: suffix
+    storageName: sharedStorage.name
+    storageBlobEndpoint: sharedStorage.properties.primaryEndpoints.blob
+    storageQueueEndpoint: sharedStorage.properties.primaryEndpoints.queue
+    storageTableEndpoint: sharedStorage.properties.primaryEndpoints.table
+    deploymentContainerName: controlPlaneDeploymentContainerName
     virtualNetworkName: 'vnet-${resourcePrefix}-${suffix}'
     functionSubnetName: 'snet-flex-control'
     keyVaultName: dataPlane.outputs.keyVaultName
@@ -384,7 +398,6 @@ module controlPlane 'modules/control-plane-function.bicep' = if (provisionContro
     applicationDefaultTokensPerMinute: gatewayApplicationDefaultTokensPerMinute
     eventHubNamespaceName: dataPlane.outputs.eventHubNamespaceName
     eventHubName: dataPlane.outputs.eventHubName
-    ledgerStorageName: dataPlane.outputs.ledgerStorageName
     ledgerTableName: ledgerTableName
     ledgerTableEndpoint: dataPlane.outputs.ledgerTableEndpoint
   }
@@ -436,27 +449,26 @@ module runtimeDiagnosticRbac 'modules/runtime-diagnostic-rbac.bicep' = {
   ]
 }
 
-var apimServiceContributorRoleDefinitionId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '312a565d-c81f-4fd8-895a-4e21e48d571c')
-
-resource apiSubscriptionApimContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroupName, 'api-apim-service-contributor')
-  properties: {
-    principalId: dataPlane.outputs.apiPrincipalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: apimServiceContributorRoleDefinitionId
-  }
-}
-
-resource controlPlaneSubscriptionApimContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (provisionControlPlane) {
-  name: guid(subscription().id, resourceGroupName, 'control-plane-apim-service-contributor')
-  properties: {
-    principalId: controlPlane!.outputs.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: apimServiceContributorRoleDefinitionId
-  }
-}
-
-output resourceGroupName string = platformResourceGroup.name
+output resourceGroupName string = resourceGroup().name
+output storageResourceGroupName string = storageResourceGroupName
+output storageAccountName string = sharedStorage.name
+output storageAccountId string = sharedStorage.id
+output ledgerTableId string = resourceId(
+  storageResourceGroupName,
+  'Microsoft.Storage/storageAccounts/tableServices/tables',
+  sharedStorage.name,
+  'default',
+  ledgerTableName
+)
+output ledgerTableResourceId string = dataPlane.outputs.ledgerTableResourceId
+output routeTableId string = dataPlane.outputs.routeTableResourceId
+output routeTableResourceId string = dataPlane.outputs.routeTableResourceId
+output routeTableName string = 'ModelRoutes'
+output ledgerTableEndpoint string = dataPlane.outputs.ledgerTableEndpoint
+output routeTableEndpoint string = dataPlane.outputs.ledgerTableEndpoint
+output credentialVaultName string = dataPlane.outputs.credentialVaultName
+output credentialVaultResourceId string = dataPlane.outputs.credentialVaultResourceId
+output eventHubResourceId string = '${dataPlane.outputs.eventHubNamespaceResourceId}/eventhubs/${dataPlane.outputs.eventHubName}'
 output apimName string = effectiveApimName
 output apimResourceGroupName string = effectiveApimResourceGroupName
 output apimPrincipalId string = effectiveApimPrincipalId
@@ -473,12 +485,17 @@ output applicationInsightsName string = dataPlane.outputs.applicationInsightsNam
 output appServicePlanName string = dataPlane.outputs.appServicePlanName
 output telemetryFunctionPlanName string = dataPlane.outputs.telemetryFunctionPlanName
 output telemetryDeploymentContainerName string = dataPlane.outputs.telemetryDeploymentContainerName
+output telemetryStorageName string = sharedStorage.name
+output ledgerStorageName string = sharedStorage.name
+output ledgerTableName string = ledgerTableName
 output apiName string = dataPlane.outputs.apiName
 output apiUrl string = dataPlane.outputs.apiUrl
 output telemetryFunctionName string = dataPlane.outputs.functionName
+output telemetryPrincipalId string = dataPlane.outputs.telemetryPrincipalId
 output apimGatewayUrl string = effectiveApimGatewayUrl
 output gatewayApiPath string = effectiveGatewayApiPath
 output controlPlaneFunctionName string = provisionControlPlane ? controlPlane!.outputs.functionName : ''
 output controlPlanePrincipalId string = provisionControlPlane ? controlPlane!.outputs.principalId : ''
 output controlPlaneFunctionPlanName string = provisionControlPlane ? controlPlane!.outputs.appServicePlanName : ''
 output controlPlaneDeploymentContainerName string = provisionControlPlane ? controlPlane!.outputs.deploymentContainerName : ''
+output controlPlaneStorageName string = sharedStorage.name

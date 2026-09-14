@@ -79,6 +79,7 @@ param employeeAudience string
 param employeeTokensPerMinute int
 
 @description('Table endpoint of the budget ledger, for example https://stfinopsledger.table.core.windows.net.')
+@minLength(1)
 param ledgerTableEndpoint string
 
 @description('Ledger table name.')
@@ -88,6 +89,11 @@ param ledgerTableResourceId string
 param routeTableResourceId string
 param credentialVaultResourceId string
 param platformGovernanceReaderPrincipalIds string[]
+
+var trimmedLedgerTableEndpoint = trim(ledgerTableEndpoint)
+var normalizedLedgerTableEndpoint = length(trimmedLedgerTableEndpoint) > 1 && endsWith(trimmedLedgerTableEndpoint, '/')
+  ? substring(trimmedLedgerTableEndpoint, 0, max(0, length(trimmedLedgerTableEndpoint) - 1))
+  : trimmedLedgerTableEndpoint
 
 @description('Output ceiling reserved when a caller omits max_tokens. OpenAI allows the field to be omitted, which would otherwise leave the reservation unbounded below the real cost.')
 @minValue(1)
@@ -690,7 +696,7 @@ resource apiPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = 
                   string(employeeTokensPerMinute)
                 ),
                 '__LEDGER_TABLE_ENDPOINT__',
-                trim(ledgerTableEndpoint)
+                normalizedLedgerTableEndpoint
               ),
               '__LEDGER_TABLE_NAME__',
               ledgerTableName

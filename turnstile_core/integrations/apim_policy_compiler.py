@@ -51,6 +51,14 @@ from .apim_policy_components import (
 from .apim_storage_routes import FixedRouteBinding, FixedRouteProgram, compile_fixed_route_program
 
 
+def policy_sha256(*policies: str) -> str:
+    canonical = (
+        ElementTree.canonicalize(policy, strip_text=True, with_comments=True)
+        for policy in policies
+    )
+    return hashlib.sha256("\n".join(canonical).encode("utf-8")).hexdigest()
+
+
 def _chat_completions_policy(publication: GatewayPublication) -> str:
         aliases = [
                 item.id
@@ -381,20 +389,16 @@ class ApimPolicyCompiler:
         ):
             if native_stream:
                 validate_native_stream_policy(policy, operation_id)
-        digest = hashlib.sha256(
-            "\n".join(
-                (
-                    chat_completions,
-                    responses,
-                    responses_compact,
-                    messages,
-                    count_tokens,
-                    models,
-                    *([image_policy] if image_policy is not None else []),
-                    *(source for _, source in probe_policies),
-                )
-            ).encode("utf-8")
-        ).hexdigest()
+        digest = policy_sha256(
+            chat_completions,
+            responses,
+            responses_compact,
+            messages,
+            count_tokens,
+            models,
+            *([image_policy] if image_policy is not None else []),
+            *(source for _, source in probe_policies),
+        )
         return CompiledGatewayRelease(
             chat_completions_policy=chat_completions,
             responses_policy=responses,

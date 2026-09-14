@@ -8,6 +8,7 @@ EXPECTED_DOCUMENTS = {
     "configuration.md",
     "deployment.md",
     "e2e-validation.md",
+    "project-overview.zh-TW.md",
     "security.md",
     "testing.md",
     "troubleshooting.md",

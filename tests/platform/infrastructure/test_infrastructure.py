@@ -8,6 +8,7 @@ from tests.support.paths import REPOSITORY_ROOT
 ROOT = REPOSITORY_ROOT
 MAIN = (ROOT / "infra/main.bicep").read_text(encoding="utf-8")
 DATA_PLANE = (ROOT / "infra/modules/data-plane.bicep").read_text(encoding="utf-8")
+DEPLOY_SCRIPT = (ROOT / "scripts/deploy.py").read_text(encoding="utf-8")
 APIM_SERVICE = (ROOT / "infra/modules/apim-service.bicep").read_text(encoding="utf-8")
 APIM_INTEGRATION = (ROOT / "infra/modules/apim-integration.bicep").read_text(
     encoding="utf-8"
@@ -52,13 +53,19 @@ def test_self_hosted_access_is_opt_in_and_separates_creation_from_tokens() -> No
     assert all(value not in access for value in ("listSecrets", "listKeys", "/delete", "'*'"))
 
 
-def test_main_creates_the_platform_resource_group_and_apim() -> None:
-    assert "targetScope = 'subscription'" in MAIN
-    assert "resource platformResourceGroup" in MAIN
+def test_main_deploys_into_an_existing_platform_resource_group() -> None:
+    assert "targetScope = 'resourceGroup'" in MAIN
+    assert "resource platformResourceGroup" not in MAIN
     assert "module apim 'modules/apim-service.bicep'" in MAIN
-    assert "scope: platformResourceGroup" in MAIN
+    assert "scope: platformResourceGroup" not in MAIN
+    assert "output resourceGroupName string = resourceGroup().name" in MAIN
+    assert "targetScope = 'resourceGroup'" in OBSERVER_MAIN
     assert "type: 'SystemAssigned'" in APIM_SERVICE
     assert "publisherEmail: publisherEmail" in APIM_SERVICE
+    assert PARAMETERS["storageResourceGroupName"]["value"] == (
+        "shared-storage-resource-group"
+    )
+    assert PARAMETERS["storageAccountName"]["value"] == "existingsharedstorage"
 
 
 def test_new_apim_defaults_to_standard_v2() -> None:
@@ -167,9 +174,9 @@ def test_fresh_apim_precreates_a_fail_closed_image_operation() -> None:
 def test_incremental_apim_template_only_prepares_and_promotes_existing_api_revisions() -> None:
     root = (ROOT / "infra/apim-upgrade.bicep").read_text()
     module = (ROOT / "infra/modules/apim-upgrade.bicep").read_text()
-    assert "targetScope = 'subscription'" in root
+    assert "targetScope = 'resourceGroup'" in root
     assert "name: 'apim-image-upgrade-${uniqueString(apimName, apiId, revision, stage)}'" in root
-    assert "scope: resourceGroup(apimResourceGroupName)" in root
+    assert "scope: resourceGroup(apimResourceGroupName)" not in root
     assert "sourceApiId: '${api.id};rev=${sourceRevision}'" in module
     assert "stage == 'prepare' && initializeImagePolicy" in module
     assert "stage == 'promote'" in module
@@ -247,13 +254,17 @@ def test_templates_create_platform_resources_without_foundry_projects_or_models(
     for resource in (
         "Microsoft.DBforPostgreSQL/flexibleServers@",
         "Microsoft.EventHub/namespaces@",
-        "Microsoft.Storage/storageAccounts@",
         "Microsoft.KeyVault/vaults@",
         "Microsoft.Insights/components@",
         "Microsoft.Web/sites@",
     ):
         assert resource in DATA_PLANE
+    assert "resource sharedStorage 'Microsoft.Storage/storageAccounts@" in MAIN
+    assert "existing = {" in MAIN.split("resource sharedStorage", 1)[1].split(
+        "module dataPlane", 1
+    )[0]
     combined = MAIN + DATA_PLANE + APIM_SERVICE + CONTROL_PLANE
+    assert combined.count("Microsoft.Storage/storageAccounts@") == 1
     assert "Microsoft.CognitiveServices/accounts/projects" not in combined
     assert "Microsoft.CognitiveServices/accounts/deployments" not in combined
 
@@ -310,14 +321,20 @@ def test_observer_uses_a_configurable_premium_v3_plan() -> None:
     assert "appServicePlanWorkerCount: appServicePlanWorkerCount" in OBSERVER_MAIN
 
 
+def test_basic_observer_registry_does_not_emit_network_rules() -> None:
+    assert "acrSku: 'Basic'" in OBSERVER_MAIN
+    assert "publicNetworkAccess: 'Enabled'" in OBSERVER_MAIN
+    assert "networkRuleSetDefaultAction: 'Allow'" in OBSERVER_MAIN
+
+
 def test_flex_functions_have_isolated_network_and_deployment_storage() -> None:
     assert "addressPrefix: '10.42.3.0/27'" in DATA_PLANE
     assert "addressPrefix: '10.42.3.32/27'" in DATA_PLANE
     assert DATA_PLANE.count("serviceName: 'Microsoft.App/environments'") == 2
-    assert "var telemetryDeploymentContainerName = 'deploy-telemetry'" in DATA_PLANE
-    assert "name: telemetryDeploymentContainerName" in DATA_PLANE
-    assert "var deploymentContainerName = 'deploy-control-plane'" in CONTROL_PLANE
-    assert "name: deploymentContainerName" in CONTROL_PLANE
+    assert "param telemetryDeploymentContainerName string" in MAIN
+    assert "param controlPlaneDeploymentContainerName string" in MAIN
+    assert "telemetryDeploymentContainerName: telemetryDeploymentContainerName" in MAIN
+    assert "deploymentContainerName: controlPlaneDeploymentContainerName" in MAIN
     assert "resource functionVnetIntegration 'Microsoft.Web/sites/networkConfig@" in (
         DATA_PLANE
     )
@@ -328,7 +345,6 @@ def test_flex_functions_have_isolated_network_and_deployment_storage() -> None:
 
 def test_public_runtime_resources_are_exempt_from_network_modify_policy() -> None:
     for template, resource_name in (
-        (DATA_PLANE, "ledgerStorage"),
         (DATA_PLANE, "api"),
         (DATA_PLANE, "functionApp"),
         (CONTROL_PLANE, "functionApp"),
@@ -350,42 +366,44 @@ def test_vnet_subnets_are_created_serially() -> None:
     )[0]
     private_endpoint_subnet = DATA_PLANE.split("resource privateEndpointSubnet", 1)[
         1
-    ].split("resource blobPrivateDnsZone", 1)[0]
+    ].split("module keyVaultPrivateEndpoint", 1)[0]
     assert "virtualNetwork" in telemetry_subnet.split("dependsOn:", 1)[1]
     assert "telemetryFunctionSubnet" in control_subnet.split("dependsOn:", 1)[1]
     assert "controlFunctionSubnet" in private_endpoint_subnet.split("dependsOn:", 1)[1]
 
 
-def test_telemetry_host_storage_is_fully_reachable_over_private_links() -> None:
-    for service in ("blob", "queue", "table"):
-        assert f"privatelink.{service}.${{environment().suffixes.storage}}" in DATA_PLANE
-        assert f"name: 'pe-${{storageName}}-{service}'" in DATA_PLANE
-        assert f"'{service}'" in DATA_PLANE
+def test_functions_use_shared_storage_service_endpoints_without_private_links() -> None:
     for setting in (
         "AzureWebJobsStorage__blobServiceUri",
         "AzureWebJobsStorage__queueServiceUri",
         "AzureWebJobsStorage__tableServiceUri",
     ):
         assert setting in DATA_PLANE
-    assert "resource functionStorageQueueContributor" in DATA_PLANE
-    assert "resource functionStorageTableContributor" in DATA_PLANE
+        assert setting in CONTROL_PLANE
+    assert "privatelink.blob.core.windows.net" not in DATA_PLANE
+    assert "privatelink.queue.core.windows.net" not in DATA_PLANE
+    assert "privatelink.table.core.windows.net" not in DATA_PLANE
+    assert "Storage Queue Data Contributor" not in DEPLOY_SCRIPT
 
 
-def test_control_plane_host_storage_uses_private_links_for_new_and_existing_installs() -> None:
-    storage = CONTROL_PLANE.split("resource storage ", 1)[1].split(
-        "module storagePrivateNetwork", 1
-    )[0]
-    assert "publicNetworkAccess: 'Disabled'" in storage
-    assert "allowSharedKeyAccess: false" in storage
-    assert "defaultAction: 'Deny'" in storage
-    assert "bypass: 'None'" in storage
-    assert "SecurityControl" not in storage
-    assert "module storagePrivateNetwork 'storage-private-endpoints.bicep'" in CONTROL_PLANE
-    assert "storageAccountName: storage.name" in CONTROL_PLANE
+def test_control_plane_host_storage_reuses_shared_endpoints_without_recreating_storage() -> None:
+    assert "storageName: sharedStorage.name" in MAIN
+    for service in ("blob", "queue", "table"):
+        assert (
+            f"storage{service.title()}Endpoint: sharedStorage.properties.primaryEndpoints.{service}"
+            in MAIN
+        )
+    assert "Microsoft.Storage/storageAccounts@" not in CONTROL_PLANE
+    assert "module storagePrivateNetwork" not in CONTROL_PLANE
     function_app = CONTROL_PLANE.split("resource functionApp ", 1)[1].split(
         "resource functionVnetIntegration", 1
     )[0]
-    assert "dependsOn: [\n    storagePrivateNetwork\n  ]" in function_app
+    assert "storagePrivateNetwork" not in function_app
+    assert "value: '${storageBlobEndpoint}${deploymentContainerName}'" in function_app
+    assert "type: 'SystemAssignedIdentity'" in function_app
+
+
+def test_legacy_control_plane_storage_private_link_upgrade_remains_standalone() -> None:
     network = (ROOT / "infra/modules/storage-private-endpoints.bicep").read_text()
     upgrade = (ROOT / "infra/control-plane-storage-network-upgrade.bicep").read_text()
     for service in ("blob", "queue", "table"):
@@ -446,49 +464,44 @@ def test_collapsed_migration_restores_search_path_after_pg_dump() -> None:
     assert "CREATE TABLE pinned_report_layout" in historical_migrations
 
 
-def test_data_plane_creates_an_entra_only_budget_ledger() -> None:
-    assert "resource ledgerStorage 'Microsoft.Storage/storageAccounts@" in DATA_PLANE
-    assert (
-        "resource ledgerTable 'Microsoft.Storage/storageAccounts/tableServices/tables@"
-        in DATA_PLANE
-    )
-    assert "allowSharedKeyAccess: false" in DATA_PLANE
-    assert "publicNetworkAccess: 'Enabled'" in DATA_PLANE
-    assert "bypass: 'AzureServices'" in DATA_PLANE
-    assert "name: ledgerTableName" in DATA_PLANE
-    assert (
-        "var ledgerTableEndpoint = 'https://${ledgerStorage.name}.table."
-        "${environment().suffixes.storage}'" in DATA_PLANE
-    )
+def test_ledger_and_model_routes_use_exact_shared_storage_children() -> None:
+    assert "param ledgerStorageResourceGroupName string" in DATA_PLANE
+    assert "ledgerStorageResourceGroupName: storageResourceGroupName" in MAIN
+    assert "ledgerStorageName: sharedStorage.name" in MAIN
+    assert "ledgerTableEndpoint: sharedStorage.properties.primaryEndpoints.table" in MAIN
+    for variable, table_name in (
+        ("ledgerTableResourceId", "ledgerTableName"),
+        ("routeTableResourceId", "'ModelRoutes'"),
+    ):
+        assert (
+            f"var {variable} = resourceId(ledgerStorageResourceGroupName, "
+            "'Microsoft.Storage/storageAccounts/tableServices/tables', "
+            f"ledgerStorageName, 'default', {table_name})"
+        ) in DATA_PLANE
+        assert f"output {variable} string = {variable}" in DATA_PLANE
+        assert f"{variable}: dataPlane.outputs.{variable}" in MAIN
+    assert "Microsoft.Storage/storageAccounts@" not in DATA_PLANE
+    assert "resource ledgerTable " not in DATA_PLANE
+    assert "resource routeTable " not in DATA_PLANE
     assert "output ledgerTableEndpoint string = ledgerTableEndpoint" in DATA_PLANE
 
 
-def test_ledger_has_its_own_table_private_endpoint_without_opening_the_firewall() -> None:
-    ledger = DATA_PLANE.split("resource ledgerStorage ", 1)[1].split(
-        "resource ledgerTableService ", 1
-    )[0]
-    assert "defaultAction: 'Deny'" in ledger
-    assert "ipRules: []" in ledger
-    assert "allowSharedKeyAccess: false" in ledger
-    endpoint = DATA_PLANE.split("resource ledgerTablePrivateEndpoint ", 1)[1].split(
-        "resource ledgerTablePrivateDnsZoneGroup ", 1
-    )[0]
-    assert "name: 'pe-${ledgerStorageName}-table'" in endpoint
-    assert "privateLinkServiceId: ledgerStorage.id" in endpoint
-    assert "id: privateEndpointSubnet.id" in endpoint
-    assert "'table'" in endpoint
-    dns = DATA_PLANE.split("resource ledgerTablePrivateDnsZoneGroup ", 1)[1].split(
-        "module keyVaultPrivateEndpoint ", 1
-    )[0]
-    assert "parent: ledgerTablePrivateEndpoint" in dns
-    assert "privateDnsZoneId: tablePrivateDnsZone.id" in dns
+def test_deployment_bootstraps_only_owned_shared_storage_children() -> None:
+    assert '"storage",\n                "container",\n                "create"' in DEPLOY_SCRIPT
+    assert '"storage",\n            "table",\n            "create"' in DEPLOY_SCRIPT
+    assert '"--auth-mode",\n                "login"' in DEPLOY_SCRIPT
+    assert "resource sharedStorage 'Microsoft.Storage/storageAccounts@" in MAIN
+    assert "output storageAccountId string = sharedStorage.id" in MAIN
+    assert "output ledgerTableId string = resourceId(" in MAIN
 
 
-def test_ledger_and_telemetry_roles_are_deterministic_and_scoped() -> None:
-    assert "resource telemetryLedgerContributor" in DATA_PLANE
-    assert "resource apimLedgerContributor" in DATA_PLANE
-    assert "scope: ledgerTable" in DATA_PLANE
-    assert "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3" in DATA_PLANE
+def test_shared_storage_roles_are_verified_outside_arm_deployment() -> None:
+    assert "Storage Blob Data Owner" in DEPLOY_SCRIPT
+    assert "Storage Table Data Contributor" in DEPLOY_SCRIPT
+    assert "Storage Queue Data Contributor" not in DEPLOY_SCRIPT
+    assert '_output_string(outputs, "apiPrincipalId")' in DEPLOY_SCRIPT
+    assert '_output_string(outputs, "controlPlanePrincipalId")' in DEPLOY_SCRIPT
+    assert "module storageRbac" not in MAIN
     assert "name: guid(workspace.id, functionApp.id, 'log-analytics-reader')" in DATA_PLANE
 
 
@@ -502,14 +515,8 @@ def test_api_projects_model_access_using_its_exact_ledger_and_identity() -> None
         "{ name: 'LEDGER_TABLE_NAME', value: ledgerTableName }",
     ):
         assert api.count(setting) == 1
-    role = DATA_PLANE.split("resource apiLedgerContributor ", 1)[1].split(
-        "resource telemetryLedgerContributor ", 1
-    )[0]
-    assert "name: guid(ledgerTable.id, api.id, 'table-data-contributor')" in role
-    assert "scope: ledgerTable" in role
-    assert "principalId: api.identity.principalId" in role
-    assert "roleDefinitionId: tableDataContributorRoleDefinitionId" in role
-    assert "scope: ledgerStorage" not in role
+    assert "output apiPrincipalId string = dataPlane.outputs.apiPrincipalId" in MAIN
+    assert "resource apiLedgerContributor" not in DATA_PLANE
 
 
 def test_existing_api_model_access_upgrade_reuses_ledger_and_preserves_settings() -> None:
@@ -538,7 +545,7 @@ def test_existing_api_model_access_upgrade_reuses_ledger_and_preserves_settings(
     assert "output " not in upgrade + roles
 
 
-def test_api_ledger_private_network_is_wired_for_new_and_existing_installations() -> None:
+def test_api_ledger_network_supports_shared_public_storage() -> None:
     upgrade = (ROOT / "infra/model-access-network-upgrade.bicep").read_text(encoding="utf-8")
     for template in (DATA_PLANE, upgrade):
         subnet = template.split("resource apiSubnet ", 1)[1].split("\nresource ", 1)[0]
@@ -553,6 +560,8 @@ def test_api_ledger_private_network_is_wired_for_new_and_existing_installations(
         assert "swiftSupported: true" in integration
     assert "addressPrefix: '10.42.3.64/27'" in DATA_PLANE
     assert "dependsOn: [\n    privateEndpointSubnet\n  ]" in DATA_PLANE
+    assert "resource ledgerTablePrivateEndpoint" not in DATA_PLANE
+    assert "resource storageBlobPrivateEndpoint" not in DATA_PLANE
     assert "Microsoft.Storage/" not in upgrade
     assert "Microsoft.Authorization/" not in upgrade
     assert "appsettings" not in upgrade
@@ -601,7 +610,6 @@ def test_application_creation_is_gated_and_uses_the_exact_platform_ledger() -> N
         "gatewayApplicationProvisioningEnabled: provisionControlPlane "
         "&& gatewayApplicationProvisioningEnabled" in MAIN
     )
-    assert "ledgerStorageName: dataPlane.outputs.ledgerStorageName" in MAIN
     assert "ledgerTableEndpoint: dataPlane.outputs.ledgerTableEndpoint" in MAIN
     assert MAIN.count("apimProductId: apimProductId") == 2
     assert "value: string(applicationProvisioningEnabled)" in CONTROL_PLANE
@@ -621,13 +629,8 @@ def test_application_creation_is_gated_and_uses_the_exact_platform_ledger() -> N
     ):
         assert f"param {parameter} bool = true" in release
         assert release.count(f"{setting}: string({parameter})") == 2
-    role = CONTROL_PLANE.split("resource applicationLedgerContributor", 1)[1].split(
-        "resource functionDatabaseSecretReader", 1
-    )[0]
-    assert "if (applicationProvisioningEnabled)" not in role
-    assert "scope: ledgerTable" in role
-    assert "principalId: functionApp.identity.principalId" in role
-    assert "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3" in role
+    assert "resource applicationLedgerContributor" not in CONTROL_PLANE
+    assert '_output_string(outputs, "controlPlanePrincipalId")' in DEPLOY_SCRIPT
     for template in (DATA_PLANE, CONTROL_PLANE):
         for setting in (
             "APIM_PRODUCT_ID", "LEDGER_TABLE_ENDPOINT", "LEDGER_TABLE_NAME",
@@ -683,7 +686,11 @@ def test_control_plane_uses_its_own_flex_plan_and_the_platform_vnet() -> None:
     assert "resourcePrefix: resourcePrefix" in MAIN
     assert "virtualNetworkName: 'vnet-${resourcePrefix}-${suffix}'" in MAIN
     assert "apimGatewayUrl: effectiveGatewayApiPath" in MAIN
-    assert "var storageName = 'stturnstilecp${take(suffix, 11)}'" in CONTROL_PLANE
+    assert (
+        "var storageName = 'st${take(compactResourcePrefix, 12)}cp${take(suffix, 8)}'"
+        not in CONTROL_PLANE
+    )
+    assert "param storageName string" in CONTROL_PLANE
     assert "var functionName = 'func-${resourcePrefix}-control-${suffix}'" in CONTROL_PLANE
     assert "var planName = 'plan-${resourcePrefix}-control-${suffix}'" in CONTROL_PLANE
     assert "plan-finops" not in CONTROL_PLANE
@@ -712,6 +719,21 @@ def test_foundry_managed_identity_access_matches_account_role_contract() -> None
     assert FOUNDRY_INFERENCE_ROLE_ID in documentation
     assert "Cognitive Services OpenAI User" in documentation
     assert "does not read or output keys" in documentation
+
+
+def test_only_existing_storage_reference_targets_the_storage_resource_group() -> None:
+    assert "param storageResourceGroupName string = resourceGroup().name" in MAIN
+    assert MAIN.count("scope: resourceGroup(storageResourceGroupName)") == 1
+    shared_storage = MAIN.split("resource sharedStorage", 1)[1].split(
+        "module dataPlane", 1
+    )[0]
+    assert "scope: resourceGroup(storageResourceGroupName)" in shared_storage
+    assert "existing = {" in shared_storage
+
+
+def test_observability_public_endpoints_are_explicit() -> None:
+    assert DATA_PLANE.count("publicNetworkAccessForIngestion: 'Enabled'") == 2
+    assert DATA_PLANE.count("publicNetworkAccessForQuery: 'Enabled'") == 2
 
 
 def test_application_key_management_role_is_least_privilege() -> None:
@@ -819,8 +841,6 @@ def test_example_parameters_are_non_secret_and_environment_neutral() -> None:
 def test_platform_identities_can_delegate_scoped_apim_dependency_roles() -> None:
     expected_roles = (
         ("usageEventHub", "2b629674-e913-4c01-ae53-ef4638d8f975"),
-        ("ledgerTable", "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3"),
-        ("routeTable", "76199698-9eea-4c19-bc75-cec21354c6b6"),
         ("credentialVault", "4633458b-17de-408a-b874-0445c86b69e6"),
     )
     for template in (DATA_PLANE, CONTROL_PLANE):
@@ -830,9 +850,80 @@ def test_platform_identities_can_delegate_scoped_apim_dependency_roles() -> None
         for scope_name, role_id in expected_roles:
             assert f"scope: {scope_name}" in template
             assert f"GuidEquals {{{role_id}}}" in template
-    assert "312a565d-c81f-4fd8-895a-4e21e48d571c" in MAIN
+    assert "resource apiSubscriptionApimContributor" not in MAIN
+    assert "resource controlPlaneSubscriptionApimContributor" not in MAIN
     assert "eventHubNamespaceName: dataPlane.outputs.eventHubNamespaceName" in MAIN
     assert "eventHubName: dataPlane.outputs.eventHubName" in MAIN
+
+
+def test_shared_table_permissions_have_an_explicit_external_installation_contract() -> None:
+    documentation = (ROOT / "docs/deployment.md").read_text(encoding="utf-8")
+    for template in (DATA_PLANE, CONTROL_PLANE):
+        assert "scope: ledgerTable" not in template
+        assert "scope: routeTable" not in template
+    for required in (
+        "ModelRoutes", "routeTableResourceId", "ledgerTableResourceId",
+        "Storage Table Data Reader", "Storage Table Data Contributor",
+        "f58310d9-a9f6-439a-9e8d-f62e7b41a168",
+        "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
+        "76199698-9eea-4c19-bc75-cec21354c6b6",
+        "conditionVersion=2.0", "ServicePrincipal", "roleAssignments/delete",
+    ):
+        assert required in documentation
+    for output in (
+        "routeTableId", "routeTableResourceId", "ledgerTableResourceId",
+        "ledgerTableEndpoint", "routeTableEndpoint", "credentialVaultResourceId",
+    ):
+        assert f"output {output} string = dataPlane.outputs." in MAIN
+
+
+def test_deployment_installs_model_routes_and_constrained_shared_table_permissions() -> None:
+    # These permissions moved out of ARM, not out of the installation contract.
+    # Keep this regression guard even while the deployment script is merged separately.
+    assert "ModelRoutes" in DEPLOY_SCRIPT
+    assert "routeTableResourceId" in DEPLOY_SCRIPT or "routeTableId" in DEPLOY_SCRIPT
+    assert (
+        "Storage Table Data Reader" in DEPLOY_SCRIPT
+        or "76199698-9eea-4c19-bc75-cec21354c6b6" in DEPLOY_SCRIPT
+    )
+    assert (
+        "Role Based Access Control Administrator" in DEPLOY_SCRIPT
+        or "f58310d9-a9f6-439a-9e8d-f62e7b41a168" in DEPLOY_SCRIPT
+    )
+    for condition_fragment in (
+        "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
+        "76199698-9eea-4c19-bc75-cec21354c6b6",
+        "GuidEquals", "PrincipalType", "ServicePrincipal",
+        "Microsoft.Authorization/roleAssignments/delete",
+    ):
+        assert condition_fragment in DEPLOY_SCRIPT
+    assert "conditionVersion" in DEPLOY_SCRIPT or "--condition-version" in DEPLOY_SCRIPT
+
+
+def test_governance_and_route_credentials_retain_scoped_access() -> None:
+    for name in (
+        "ledgerTableResourceId", "routeTableResourceId", "credentialVaultResourceId",
+    ):
+        assert f"param {name} string" in APIM_INTEGRATION
+        assert f"{name}: dataPlane.outputs.{name}" in MAIN
+    assert "resource platformGovernance " in APIM_INTEGRATION
+    assert "scope: platformGovernance" in APIM_INTEGRATION
+    assert "credential_vault_resource_id: credentialVaultResourceId" in APIM_INTEGRATION
+    assert "route_table_resource_id: routeTableResourceId" in APIM_INTEGRATION
+    assert "normalizedLedgerTableEndpoint" in APIM_INTEGRATION
+    assert "endsWith(trimmedLedgerTableEndpoint, '/')" in APIM_INTEGRATION
+    reader = DATA_PLANE.split("resource apimRouteCredentialReader ", 1)[1].split(
+        "\nresource ", 1
+    )[0]
+    assert "scope: credentialVault" in reader
+    assert "principalId: apimPrincipalId" in reader
+    assert "4633458b-17de-408a-b874-0445c86b69e6" in reader
+    writer = CONTROL_PLANE.split("resource routeCredentialWriter ", 1)[1].split(
+        "\nresource ", 1
+    )[0]
+    assert "if (effectiveEnabled)" in writer
+    assert "scope: credentialVault" in writer
+    assert "b86a8fe4-44ce-4948-aee5-eccb2c155cd7" in writer
 
 
 def test_runtime_diagnostic_access_is_generic_probe_scoped_and_not_key_management() -> None:
@@ -871,10 +962,12 @@ def test_runtime_diagnostic_access_is_generic_probe_scoped_and_not_key_managemen
     assert all(value not in source for value in ("xle-", "contoso", "regenerate", "Contributor"))
     assert "module publisherProbeAccess 'runtime-diagnostic-rbac.bicep'" in CONTROL_PLANE_APIM_RBAC
     assert "module runtimeDiagnosticRbac 'modules/runtime-diagnostic-rbac.bicep'" in MAIN
-    diagnostic = MAIN.split("module runtimeDiagnosticRbac", 1)[1].split("\nvar ", 1)[0]
-    assert "probeSubscriptionId: apimProbeSubscriptionId" in diagnostic
-    assert "apimIntegration.outputs" not in diagnostic
-    assert "dependsOn: [\n    apimIntegration\n  ]" in diagnostic
+    runtime_rbac = MAIN.split("module runtimeDiagnosticRbac ", 1)[1].split(
+        "\noutput ", 1
+    )[0]
+    assert "probeSubscriptionId: apimProbeSubscriptionId" in runtime_rbac
+    assert "apimIntegration.outputs" not in runtime_rbac
+    assert "dependsOn: [\n    apimIntegration\n  ]" in runtime_rbac
     assert "output runtimeDiagnosticScope string = runtimeDiagnosticRbac.outputs.probeScope" in MAIN
     assert (
         "output publisherProbeScope string = provisionControlPlane ? runtimeDiagnosticRbac"

@@ -8,6 +8,21 @@
     "resourceGroupName": {
       "value": "turnstile-platform"
     },
+    "storageResourceGroupName": {
+      "value": "shared-storage-resource-group"
+    },
+    "storageAccountName": {
+      "value": "existingsharedstorage"
+    },
+    "telemetryDeploymentContainerName": {
+      "value": "turnstile-telemetry-deploy"
+    },
+    "controlPlaneDeploymentContainerName": {
+      "value": "turnstile-control-deploy"
+    },
+    "ledgerTableName": {
+      "value": "TurnstileLedger"
+    },
     "location": {
       "value": "eastus2"
     },
