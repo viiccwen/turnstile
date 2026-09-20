@@ -8,10 +8,11 @@ param storageBlobEndpoint string
 param storageQueueEndpoint string
 param storageTableEndpoint string
 param deploymentContainerName string
-param virtualNetworkName string = 'vnet-turnstile-${suffix}'
-param functionSubnetName string = 'snet-flex-control'
+param functionSubnetResourceId string
 param keyVaultName string
 param credentialVaultName string
+param manageKeyVaultRoleAssignments bool = true
+param manageEventHubRoleAssignments bool = true
 param databaseUrlSecretUri string
 param apimProbeSubscriptionKeySecretUri string
 param credentialEncryptionKeySecretUri string
@@ -64,15 +65,6 @@ resource plan 'Microsoft.Web/serverfarms@2024-11-01' = {
   properties: {
     reserved: true
   }
-}
-
-resource virtualNetwork 'Microsoft.Network/virtualNetworks@2024-05-01' existing = {
-  name: virtualNetworkName
-}
-
-resource functionSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' existing = {
-  parent: virtualNetwork
-  name: functionSubnetName
 }
 
 resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
@@ -163,26 +155,26 @@ resource functionVnetIntegration 'Microsoft.Web/sites/networkConfig@2024-11-01' 
   parent: functionApp
   name: 'virtualNetwork'
   properties: {
-    subnetResourceId: functionSubnet.id
+    subnetResourceId: functionSubnetResourceId
     swiftSupported: true
   }
 }
 
-resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
+resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = if (manageKeyVaultRoleAssignments) {
   name: keyVaultName
 }
 
-resource databaseUrlSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = {
+resource databaseUrlSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = if (manageKeyVaultRoleAssignments) {
   parent: keyVault
   name: 'database-url'
 }
 
-resource credentialEncryptionKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = {
+resource credentialEncryptionKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = if (manageKeyVaultRoleAssignments) {
   parent: keyVault
   name: 'credential-encryption-key'
 }
 
-resource apimProbeSubscriptionKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = {
+resource apimProbeSubscriptionKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = if (manageKeyVaultRoleAssignments) {
   parent: keyVault
   name: 'apim-probe-subscription-key'
 }
@@ -191,11 +183,12 @@ resource credentialVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
   name: credentialVaultName
 }
 
-resource eventHubNamespace 'Microsoft.EventHub/namespaces@2024-01-01' existing = if (!empty(eventHubNamespaceName)) {
+// Adopted Event Hub grants are verified externally at the exact adopted hub ID.
+resource eventHubNamespace 'Microsoft.EventHub/namespaces@2024-01-01' existing = if (manageEventHubRoleAssignments && !empty(eventHubNamespaceName)) {
   name: eventHubNamespaceName
 }
 
-resource usageEventHub 'Microsoft.EventHub/namespaces/eventhubs@2024-01-01' existing = if (!empty(eventHubNamespaceName)) {
+resource usageEventHub 'Microsoft.EventHub/namespaces/eventhubs@2024-01-01' existing = if (manageEventHubRoleAssignments && !empty(eventHubNamespaceName)) {
   parent: eventHubNamespace
   name: eventHubName
 }
@@ -214,7 +207,7 @@ resource routeCredentialWriter 'Microsoft.Authorization/roleAssignments@2022-04-
 
 // Shared Storage table grants and constrained delegation are verified by the deployment
 // lifecycle at the exact table scopes, which may be in another resource group.
-resource functionDatabaseSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource functionDatabaseSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (manageKeyVaultRoleAssignments) {
   name: guid(databaseUrlSecret.id, functionApp.id, 'key-vault-secrets-user')
   scope: databaseUrlSecret
   properties: {
@@ -224,7 +217,7 @@ resource functionDatabaseSecretReader 'Microsoft.Authorization/roleAssignments@2
   }
 }
 
-resource functionCredentialSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource functionCredentialSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (manageKeyVaultRoleAssignments) {
   name: guid(credentialEncryptionKeySecret.id, functionApp.id, 'key-vault-secrets-user')
   scope: credentialEncryptionKeySecret
   properties: {
@@ -233,7 +226,7 @@ resource functionCredentialSecretReader 'Microsoft.Authorization/roleAssignments
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
   }
 }
-resource onboardingEventHubRoleDelegator 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(eventHubNamespaceName)) {
+resource onboardingEventHubRoleDelegator 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (effectiveReleaseWorkerEnabled && manageEventHubRoleAssignments && !empty(eventHubNamespaceName)) {
   name: guid(usageEventHub.id, functionApp.id, 'onboarding-event-hub-rbac-delegator')
   scope: usageEventHub
   properties: {
@@ -268,7 +261,7 @@ resource controlPlaneResourceGroupApimContributor 'Microsoft.Authorization/roleA
 }
 
 
-resource functionProbeSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource functionProbeSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (manageKeyVaultRoleAssignments) {
   name: guid(apimProbeSubscriptionKeySecret.id, functionApp.id, 'key-vault-secrets-user')
   scope: apimProbeSubscriptionKeySecret
   properties: {

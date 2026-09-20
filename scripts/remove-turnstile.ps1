@@ -56,15 +56,39 @@ function Get-ParameterValue($Document, [string]$Name, $Default = $null) {
     return $property.Value.value
 }
 
+function Get-ObjectValue($Object, [string]$Name, $Default = $null) {
+    if ($null -eq $Object) {
+        return $Default
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $Default
+    }
+    return $property.Value
+}
+
+function Get-DependencyValue($OutputDocument, [string]$Resource, [string]$Name, $Default = $null) {
+    $dependencies = Get-ObjectValue $OutputDocument 'dependencyResources'
+    $dependency = Get-ObjectValue $dependencies $Resource
+    return Get-ObjectValue $dependency $Name $Default
+}
+
 function Invoke-AzJson([string[]]$Arguments, [switch]$AllowFailure) {
     $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $output = & az @Arguments 2>$null
-        $exitCode = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $previousErrorActionPreference
+    $output = $null
+    $exitCode = 1
+    foreach ($attempt in 1..3) {
+        try {
+            $ErrorActionPreference = 'Continue'
+            $output = & az @Arguments 2>$null
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        if ($exitCode -eq 0) {
+            break
+        }
     }
     if ($exitCode -ne 0) {
         if ($AllowFailure) {
@@ -87,15 +111,51 @@ function Add-AzAction([string]$Description, [string[]]$Arguments) {
     })
 }
 
+function Get-ManagedRoleAssignmentName(
+    [string]$Scope,
+    [string]$PrincipalId,
+    [string]$RoleId
+) {
+    $value = "turnstile|$($Scope.ToLowerInvariant())|$($PrincipalId.ToLowerInvariant())|$($RoleId.ToLowerInvariant())"
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($value))
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    $hex = ([System.BitConverter]::ToString($hash)).Replace('-', '').ToLowerInvariant()
+    return "$($hex.Substring(0, 8))-$($hex.Substring(8, 4))-$($hex.Substring(12, 4))-$($hex.Substring(16, 4))-$($hex.Substring(20, 12))"
+}
+
+function Get-ArmRoleAssignmentName([string]$Scope, [string]$Identity, [string]$Label) {
+    # ARM guid() is UUIDv5, using namespace bytes in network (not .NET Guid) order.
+    $namespace = '11fb06fb712d4ddd98c7e71bbd588830'
+    $bytes = [byte[]]@(for ($index = 0; $index -lt 32; $index += 2) {
+        [Convert]::ToByte($namespace.Substring($index, 2), 16)
+    })
+    $sha1 = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        $hash = $sha1.ComputeHash([byte[]]($bytes + [System.Text.Encoding]::UTF8.GetBytes("$Scope-$Identity-$Label")))
+    }
+    finally { $sha1.Dispose() }
+    $hash[6] = ($hash[6] -band 15) -bor 80
+    $hash[8] = ($hash[8] -band 63) -bor 128
+    $hex = ([System.BitConverter]::ToString($hash, 0, 16)).Replace('-', '').ToLowerInvariant()
+    return "$($hex.Substring(0, 8))-$($hex.Substring(8, 4))-$($hex.Substring(12, 4))-$($hex.Substring(16, 4))-$($hex.Substring(20, 12))"
+}
+
 function Assert-ManifestAction(
     $Action,
     [string]$PlatformResourceGroup,
+    [string]$Prefix,
     [string]$StorageResourceGroup,
     [string]$ApimId,
     [string]$StorageAccountName,
     [string]$TelemetryContainerName,
     [string]$ControlContainerName,
-    [string]$LedgerTableName
+    [string]$LedgerTableName,
+    [string[]]$ManagedRoleAssignmentIds
 ) {
     $arguments = @($Action.Arguments | ForEach-Object { [string]$_ })
     if ($arguments.Count -lt 2) {
@@ -104,7 +164,10 @@ function Assert-ManifestAction(
     $signature = "$($arguments[0]) $($arguments[1])"
     $allowedSignatures = @(
         'functionapp stop',
+        'functionapp delete',
         'webapp stop',
+        'webapp delete',
+        'appservice plan',
         'apim subscription',
         'apim api',
         'apim product',
@@ -112,6 +175,8 @@ function Assert-ManifestAction(
         'rest --method',
         'role assignment',
         'resource delete',
+        'network private-endpoint',
+        'network nsg',
         'network private-dns',
         'storage container',
         'storage table'
@@ -124,7 +189,7 @@ function Assert-ManifestAction(
     if ($joined -match '(?i)\bgroup\s+delete\b' -or $joined -match '(?i)\bapim\s+delete\b') {
         throw "Manifest action attempts to delete a protected boundary: $($Action.Description)"
     }
-    if ($joined -match '(?i)Microsoft\.CognitiveServices') {
+    if ($joined -match '(?i)Microsoft\.CognitiveServices' -and $signature -ne 'role assignment') {
         throw "Manifest action attempts to delete a Foundry resource: $($Action.Description)"
     }
 
@@ -133,6 +198,24 @@ function Assert-ManifestAction(
         if ($groupIndex -lt 0) { $groupIndex = [Array]::IndexOf($arguments, '--resource-group') }
         if ($groupIndex -lt 0 -or $arguments[$groupIndex + 1] -cne $PlatformResourceGroup) {
             throw "Manifest stop action is outside the platform resource group: $($Action.Description)"
+        }
+    }
+
+    if ($signature -in @('functionapp delete', 'webapp delete', 'appservice plan')) {
+        if ($signature -eq 'appservice plan' -and (
+            $arguments.Count -lt 3 -or $arguments[2] -cne 'delete' -or
+            $arguments -notcontains '--yes'
+        )) {
+            throw "Manifest App Service plan action is not an approved delete: $($Action.Description)"
+        }
+        $groupIndex = [Array]::IndexOf($arguments, '--resource-group')
+        $nameIndex = [Array]::IndexOf($arguments, '--name')
+        if (
+            $groupIndex -lt 0 -or $nameIndex -lt 0 -or
+            $arguments[$groupIndex + 1] -cne $PlatformResourceGroup -or
+            $arguments[$nameIndex + 1] -notlike "*$Prefix*"
+        ) {
+            throw "Manifest App Service action targets an unexpected resource: $($Action.Description)"
         }
     }
 
@@ -189,6 +272,21 @@ function Assert-ManifestAction(
         }
     }
 
+    if ($signature -in @('network private-endpoint', 'network nsg')) {
+        if ($arguments.Count -lt 3 -or $arguments[2] -cne 'delete') {
+            throw "Manifest network action is not an explicit delete: $($Action.Description)"
+        }
+        $groupIndex = [Array]::IndexOf($arguments, '--resource-group')
+        $nameIndex = [Array]::IndexOf($arguments, '--name')
+        if (
+            $groupIndex -lt 0 -or $nameIndex -lt 0 -or
+            $arguments[$groupIndex + 1] -cne $PlatformResourceGroup -or
+            $arguments[$nameIndex + 1] -notlike "*$Prefix*"
+        ) {
+            throw "Manifest network action targets an unexpected resource: $($Action.Description)"
+        }
+    }
+
     if ($signature -in @('storage container', 'storage table')) {
         if ($arguments.Count -lt 3 -or $arguments[2] -cne 'delete') {
             throw "Manifest storage action is not an explicit delete: $($Action.Description)"
@@ -206,10 +304,15 @@ function Assert-ManifestAction(
         $expectedNames = if ($signature -eq 'storage container') {
             @($TelemetryContainerName, $ControlContainerName)
         } else {
-            @($LedgerTableName)
+            @($LedgerTableName, 'ModelRoutes')
         }
         if ($arguments[$nameIndex + 1] -cnotin $expectedNames) {
             throw "Manifest storage action targets an unexpected child: $($Action.Description)"
+        }
+        $childPath = if ($signature -eq 'storage container') { 'blobServices/default/containers' } else { 'tableServices/default/tables' }
+        $childId = "/subscriptions/$Subscription/resourceGroups/$StorageResourceGroup/providers/Microsoft.Storage/storageAccounts/$StorageAccountName/$childPath/$($arguments[$nameIndex + 1])"
+        if ($childId -notin $managedStorageChildResourceIds) {
+            throw "Manifest storage action lacks deployment-created ownership evidence: $childId"
         }
     }
 
@@ -232,11 +335,17 @@ function Assert-ManifestAction(
             throw "Manifest RBAC action is not an explicit delete: $($Action.Description)"
         }
         $idIndex = [Array]::IndexOf($arguments, '--ids')
-        if (
-            $idIndex -lt 0 -or
-            -not $arguments[$idIndex + 1].StartsWith("$ApimId/providers/Microsoft.Authorization/roleAssignments/", [System.StringComparison]::OrdinalIgnoreCase)
-        ) {
-            throw "Manifest RBAC action is outside the configured APIM service: $($Action.Description)"
+        $assignmentId = if ($idIndex -ge 0 -and $idIndex + 1 -lt $arguments.Count) {
+            $arguments[$idIndex + 1]
+        } else {
+            ''
+        }
+        $approved = $assignmentId.StartsWith(
+            "$ApimId/providers/Microsoft.Authorization/roleAssignments/",
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -or $assignmentId -in $ManagedRoleAssignmentIds
+        if (-not $approved) {
+            throw "Manifest RBAC action is outside the approved resource scopes: $($Action.Description)"
         }
     }
 
@@ -267,6 +376,7 @@ function Assert-ManifestAction(
             $groupIndex -lt 0 -or $zoneIndex -lt 0 -or $nameIndex -lt 0 -or
             $arguments[$groupIndex + 1] -cne $PlatformResourceGroup -or
             $arguments[$zoneIndex + 1] -notin $allowedZones -or
+            -not $arguments[$nameIndex + 1].EndsWith('-vnet', [System.StringComparison]::OrdinalIgnoreCase) -and
             $arguments[$nameIndex + 1] -cne 'finops-vnet'
         ) {
             throw "Manifest DNS action targets an unexpected link: $($Action.Description)"
@@ -289,6 +399,8 @@ function Invoke-RecordedCleanup(
     [string]$TelemetryContainerName,
     [string]$ControlContainerName,
     [string]$LedgerTableName,
+    [string]$FoundryResourceId,
+    [string[]]$ManagedRoleAssignmentIds,
     [bool]$ExecuteActions,
     [bool]$SkipConfirmation,
     [bool]$DeleteLocalSecretState
@@ -327,6 +439,7 @@ function Invoke-RecordedCleanup(
         telemetryDeploymentContainerName = $TelemetryContainerName
         controlPlaneDeploymentContainerName = $ControlContainerName
         ledgerTableName = $LedgerTableName
+        foundryCognitiveServicesAccountResourceId = $FoundryResourceId
         parametersSha256 = $ParameterSha256
         outputsSha256 = $OutputSha256
     }
@@ -339,8 +452,9 @@ function Invoke-RecordedCleanup(
     $recordedActions = [System.Collections.Generic.List[object]]::new()
     foreach ($action in @($manifestDocument.actions)) {
         Assert-ManifestAction `
-            $action $PlatformResourceGroup $StorageResourceGroup $apimId `
-            $StorageAccountName $TelemetryContainerName $ControlContainerName $LedgerTableName
+            $action $PlatformResourceGroup $Prefix $StorageResourceGroup $apimId `
+            $StorageAccountName $TelemetryContainerName $ControlContainerName `
+            $LedgerTableName $ManagedRoleAssignmentIds
         $recordedActions.Add([pscustomobject]@{
             Description = [string]$action.description
             Arguments = @($action.arguments | ForEach-Object { [string]$_ })
@@ -482,7 +596,8 @@ function Get-DeploymentResources(
         '--output', 'json'
     ) -AllowFailure
     if ($null -eq $operations) {
-        throw "Deployment record is unavailable: $key. A resource manifest cannot be captured safely."
+        Write-Warning "Deployment record is unavailable: $key. Cleanup will use exact saved outputs only."
+        return @()
     }
 
     $resources = [System.Collections.Generic.List[object]]::new()
@@ -534,16 +649,32 @@ $appInsightsLoggerId = [string](Get-ParameterValue $parameterDocument 'apimAppIn
 $eventHubLoggerId = [string](Get-ParameterValue $parameterDocument 'apimEventHubLoggerId' "$prefix-eventhub")
 $diagnosticSettingName = [string](Get-ParameterValue $parameterDocument 'apimDiagnosticSettingName' "$prefix-gateway-logs")
 $observerNamedValue = [string](Get-ParameterValue $parameterDocument 'observerAdapterKeyNamedValueName' "$prefix-observer-key")
-
-if (-not $prefix -or -not $platformResourceGroup -or -not $storageAccountName -or -not $apimName -or -not $apimResourceGroup) {
-    throw 'resourcePrefix, resourceGroupName, storageAccountName, existingApimName, and existingApimResourceGroupName are required.'
-}
+$foundryResourceId = [string](Get-ParameterValue $parameterDocument 'foundryCognitiveServicesAccountResourceId' '')
+$foundryResourceId = $foundryResourceId.Trim().TrimEnd('/')
 
 if (-not $Outputs) {
-    $Outputs = Join-Path $repositoryRoot ".turnstile\deployments\$platformResourceGroup.outputs.json"
+    $prefixOutput = Join-Path $repositoryRoot ".turnstile\deployments\$platformResourceGroup.$prefix.outputs.json"
+    $legacyOutput = Join-Path $repositoryRoot ".turnstile\deployments\$platformResourceGroup.outputs.json"
+    $Outputs = if (Test-Path -LiteralPath $prefixOutput -PathType Leaf) { $prefixOutput } else { $legacyOutput }
 }
 $outputPath = (Resolve-Path $Outputs).Path
 $outputDocument = Read-JsonFile $outputPath
+$apimName = if ($apimName) { $apimName } else { [string](Get-ObjectValue $outputDocument 'apimName' '') }
+$apimResourceGroup = if ($apimResourceGroup) { $apimResourceGroup } else { [string](Get-ObjectValue $outputDocument 'apimResourceGroupName' '') }
+if (-not $prefix -or -not $platformResourceGroup -or -not $storageAccountName -or -not $apimName -or -not $apimResourceGroup) {
+    throw 'resourcePrefix, resourceGroupName, storageAccountName, and APIM identity from parameters or outputs are required.'
+}
+$managedRoleAssignmentIds = @(
+    @(Get-ObjectValue $outputDocument 'managedRoleAssignmentIds' @()) |
+        ForEach-Object { [string]$_ } |
+        Where-Object { $_ }
+)
+# Older outputs cannot prove that an idempotent storage create actually created a child.
+# Preserve those children rather than claiming pre-existing tables or containers.
+$managedStorageChildResourceIds = @(
+    @(Get-ObjectValue $outputDocument 'managedStorageChildResourceIds' @()) |
+        ForEach-Object { [string]$_ } | Where-Object { $_ }
+)
 if (-not $Manifest) {
     $Manifest = $outputPath -replace '\.outputs\.json$', '.resources.json'
 }
@@ -602,6 +733,8 @@ if (-not $CaptureManifest) {
         -TelemetryContainerName $telemetryContainerName `
         -ControlContainerName $controlContainerName `
         -LedgerTableName $ledgerTableName `
+        -FoundryResourceId $foundryResourceId `
+        -ManagedRoleAssignmentIds $managedRoleAssignmentIds `
         -ExecuteActions ([bool]$Execute) `
         -SkipConfirmation ([bool]$Force) `
         -DeleteLocalSecretState ([bool]$RemoveLocalSecretState)
@@ -610,6 +743,10 @@ if (-not $CaptureManifest) {
 
 if ($Execute) {
     throw '-CaptureManifest and -Execute cannot be used together.'
+}
+
+if ($managedStorageChildResourceIds.Count -eq 0) {
+    Write-Warning 'Shared storage children will be preserved: saved outputs contain no deployment-created child ownership evidence.'
 }
 
 $apiName = [string]$outputDocument.apiName
@@ -850,11 +987,165 @@ foreach ($principal in @($apiPrincipal, $controlPrincipal)) {
     }
 }
 
-$visitedDeployments = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-$deploymentResources = @(
-    Get-DeploymentResources $platformResourceGroup "$prefix-platform" $visitedDeployments
-    Get-DeploymentResources $platformResourceGroup "$prefix-observer" $visitedDeployments
-)
+if ($managedRoleAssignmentIds.Count -gt 0) {
+    $storageId = "/subscriptions/$Subscription/resourceGroups/$storageResourceGroup/providers/Microsoft.Storage/storageAccounts/$storageAccountName"
+    $ledgerTableId = "$storageId/tableServices/default/tables/$ledgerTableName"
+    $routeTableId = "$storageId/tableServices/default/tables/ModelRoutes"
+    $credentialVaultId = [string](Get-DependencyValue $outputDocument 'credentialVault' 'resourceId' '')
+    $blobOwnerRoleId = 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
+    $tableContributorRoleId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
+    $tableReaderRoleId = '76199698-9eea-4c19-bc75-cec21354c6b6'
+    $rbacAdministratorRoleId = 'f58310d9-a9f6-439a-9e8d-f62e7b41a168'
+    $keyVaultSecretsOfficerRoleId = 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7'
+    $cognitiveServicesUserRoleId = 'a97b65f3-24c7-4388-baec-2e87135dc908'
+    $eventHubReceiverRoleId = 'a638d3c7-ab3a-418d-83e6-5f17a39d4fde'
+    $eventHubSenderRoleId = '2b629674-e913-4c01-ae53-ef4638d8f975'
+    $logAnalyticsReaderRoleId = '73c42c96-874c-492b-b04d-ab87d138a893'
+    $keyVaultSecretsUserRoleId = '4633458b-17de-408a-b874-0445c86b69e6'
+    $expectedManagedRoleAssignmentIds = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    $managedRoleRequirements = @(
+        @($storageId, [string]$outputDocument.telemetryPrincipalId, $blobOwnerRoleId),
+        @($storageId, [string]$outputDocument.controlPlanePrincipalId, $blobOwnerRoleId),
+        @($ledgerTableId, [string]$outputDocument.telemetryPrincipalId, $tableContributorRoleId),
+        @($ledgerTableId, [string]$outputDocument.apiPrincipalId, $tableContributorRoleId),
+        @($ledgerTableId, [string]$outputDocument.controlPlanePrincipalId, $tableContributorRoleId),
+        @($ledgerTableId, [string]$outputDocument.apimPrincipalId, $tableContributorRoleId)
+    )
+    $managedRoleRequirements += @(
+        ,@($routeTableId, [string]$outputDocument.apiPrincipalId, $tableReaderRoleId)
+        ,@($routeTableId, [string]$outputDocument.apimPrincipalId, $tableReaderRoleId)
+        ,@($routeTableId, [string]$outputDocument.controlPlanePrincipalId, $tableContributorRoleId)
+        ,@($credentialVaultId, [string]$outputDocument.apimPrincipalId, $keyVaultSecretsUserRoleId)
+        ,@($credentialVaultId, [string]$outputDocument.controlPlanePrincipalId, $keyVaultSecretsOfficerRoleId)
+    )
+    $sitePrefix = "/subscriptions/$Subscription/resourceGroups/$platformResourceGroup/providers/Microsoft.Web/sites/"
+    $siteIds = @{}
+    foreach ($pair in @(
+        @('telemetryPrincipalId', 'telemetryFunctionName'),
+        @('apiPrincipalId', 'apiName'),
+        @('controlPlanePrincipalId', 'controlPlaneFunctionName')
+    )) {
+        $principal = [string](Get-ObjectValue $outputDocument $pair[0] '')
+        $siteName = [string](Get-ObjectValue $outputDocument $pair[1] '')
+        if ($principal -and $siteName) { $siteIds[$principal] = "$sitePrefix$siteName" }
+    }
+    foreach ($requirement in $managedRoleRequirements) {
+        $scope, $principal, $role = $requirement
+        if (-not $scope -or -not $principal) { continue }
+        $identity = if ($principal -eq [string]$outputDocument.apimPrincipalId) { $principal } else { $siteIds[$principal] }
+        if (-not $identity) { continue }
+        $label = if ($scope -eq $storageId) { 'storage-blob-data-owner' }
+        elseif ($scope -eq $ledgerTableId) {
+            if ($principal -eq [string]$outputDocument.controlPlanePrincipalId) { 'application-provisioning-table-contributor' } else { 'table-data-contributor' }
+        } elseif ($scope -eq $routeTableId) {
+            if ($principal -eq [string]$outputDocument.controlPlanePrincipalId) { 'route-table-contributor' } else { 'route-table-reader' }
+        } else {
+            if ($principal -eq [string]$outputDocument.controlPlanePrincipalId) { 'route-credential-writer' } else { 'route-credential-reader' }
+        }
+        $name = Get-ArmRoleAssignmentName $scope $identity $label
+        $null = $expectedManagedRoleAssignmentIds.Add("$scope/providers/Microsoft.Authorization/roleAssignments/$name")
+    }
+    foreach ($pair in @(@('apiPrincipalId', 'apim'), @('controlPlanePrincipalId', 'onboarding'))) {
+        $principal = [string](Get-ObjectValue $outputDocument $pair[0] '')
+        if (-not $principal -or -not $siteIds[$principal]) { continue }
+        foreach ($table in @(@($ledgerTableId, 'ledger'), @($routeTableId, 'route'))) {
+            $name = Get-ArmRoleAssignmentName $table[0] $siteIds[$principal] "$($pair[1])-$($table[1])-rbac-delegator"
+            $null = $expectedManagedRoleAssignmentIds.Add("$($table[0])/providers/Microsoft.Authorization/roleAssignments/$name")
+            $managedRoleRequirements += ,@($table[0], $principal, $rbacAdministratorRoleId)
+        }
+    }
+    if ($foundryResourceId) {
+        $managedRoleRequirements += ,@(
+            $foundryResourceId,
+            [string]$outputDocument.apimPrincipalId,
+            $cognitiveServicesUserRoleId
+        )
+    }
+    if (-not [bool](Get-DependencyValue $outputDocument 'eventHub' 'provisioned' $true)) {
+        $eventHubId = [string](Get-DependencyValue $outputDocument 'eventHub' 'resourceId' '')
+        $managedRoleRequirements += ,@(
+            $eventHubId,
+            [string]$outputDocument.telemetryPrincipalId,
+            $eventHubReceiverRoleId
+        )
+        $managedRoleRequirements += ,@(
+            $eventHubId,
+            [string]$outputDocument.apimPrincipalId,
+            $eventHubSenderRoleId
+        )
+        $managedRoleRequirements += ,@(
+            $eventHubId,
+            [string]$outputDocument.webAppPrincipalId,
+            $eventHubSenderRoleId
+        )
+    }
+    if (-not [bool](Get-DependencyValue $outputDocument 'observability' 'provisioned' $true)) {
+        $managedRoleRequirements += ,@(
+            [string](Get-DependencyValue $outputDocument 'observability' 'workspaceResourceId' ''),
+            [string]$outputDocument.telemetryPrincipalId,
+            $logAnalyticsReaderRoleId
+        )
+    }
+    if (-not [bool](Get-DependencyValue $outputDocument 'keyVault' 'provisioned' $true)) {
+        foreach ($secretField in @(
+            'databaseUrlSecretResourceId',
+            'credentialEncryptionKeySecretResourceId',
+            'apimProbeSubscriptionKeySecretResourceId'
+        )) {
+            $managedRoleRequirements += ,@(
+                [string](Get-DependencyValue $outputDocument 'keyVault' $secretField ''),
+                [string]$outputDocument.controlPlanePrincipalId,
+                $keyVaultSecretsUserRoleId
+            )
+        }
+    }
+    foreach ($requirement in $managedRoleRequirements) {
+        if (-not $requirement[0] -or -not $requirement[1]) {
+            continue
+        }
+        $name = Get-ManagedRoleAssignmentName $requirement[0] $requirement[1] $requirement[2]
+        $null = $expectedManagedRoleAssignmentIds.Add(
+            "$($requirement[0])/providers/Microsoft.Authorization/roleAssignments/$name"
+        )
+    }
+    foreach ($assignmentId in $managedRoleAssignmentIds) {
+        if (-not $expectedManagedRoleAssignmentIds.Contains($assignmentId)) {
+            throw "Deployment output contains an unexpected managed role assignment: $assignmentId"
+        }
+        Add-AzAction "Delete deployment-managed role assignment $assignmentId" @(
+            'role', 'assignment', 'delete', '--ids', $assignmentId
+        )
+    }
+}
+
+$adoptedResourceIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($dependencySpec in @(
+    [pscustomobject]@{ dependency = 'postgres'; field = 'resourceId' }
+    [pscustomobject]@{ dependency = 'eventHub'; field = 'namespaceResourceId' }
+    [pscustomobject]@{ dependency = 'eventHub'; field = 'resourceId' }
+    [pscustomobject]@{ dependency = 'observability'; field = 'workspaceResourceId' }
+    [pscustomobject]@{ dependency = 'observability'; field = 'applicationInsightsResourceId' }
+    [pscustomobject]@{ dependency = 'keyVault'; field = 'resourceId' }
+    [pscustomobject]@{ dependency = 'credentialVault'; field = 'resourceId' }
+    [pscustomobject]@{ dependency = 'credentialVault'; field = 'privateEndpointId' }
+    [pscustomobject]@{ dependency = 'network'; field = 'virtualNetworkResourceId' }
+    [pscustomobject]@{ dependency = 'network'; field = 'telemetryFunctionSubnetResourceId' }
+    [pscustomobject]@{ dependency = 'network'; field = 'controlFunctionSubnetResourceId' }
+    [pscustomobject]@{ dependency = 'network'; field = 'privateEndpointSubnetResourceId' }
+    [pscustomobject]@{ dependency = 'network'; field = 'apiSubnetResourceId' }
+)) {
+    if (-not [bool](Get-DependencyValue $outputDocument $dependencySpec.dependency 'provisioned' $true)) {
+        $resourceId = [string](Get-DependencyValue $outputDocument $dependencySpec.dependency $dependencySpec.field '')
+        if ($resourceId) { $null = $adoptedResourceIds.Add($resourceId) }
+    }
+}
+if (-not [bool](Get-DependencyValue $outputDocument 'keyVault' 'privateDnsZoneProvisioned' $true)) {
+    $privateDnsZoneId = [string](Get-DependencyValue $outputDocument 'keyVault' 'privateDnsZoneId' '')
+    if ($privateDnsZoneId) { $null = $adoptedResourceIds.Add($privateDnsZoneId) }
+}
+
 $platformIdPrefix = "/subscriptions/$Subscription/resourceGroups/$platformResourceGroup/providers/"
 $deletableResourceTypes = @(
     'Microsoft.Web/sites',
@@ -869,17 +1160,11 @@ $deletableResourceTypes = @(
     'Microsoft.Network/privateEndpoints'
 )
 $ownedById = @{}
-foreach ($resource in $deploymentResources) {
-    $inPlatformGroup = [string]$resource.id -like "$platformIdPrefix*"
-    if ($inPlatformGroup -and [string]$resource.type -in $deletableResourceTypes) {
-        $ownedById[[string]$resource.id] = $resource
-    }
-}
 
 $outputResourceSpecs = @(
-    @{ output = 'postgresServerName'; type = 'Microsoft.DBforPostgreSQL/flexibleServers'; group = $platformResourceGroup },
-    @{ output = 'eventHubNamespaceName'; type = 'Microsoft.EventHub/namespaces'; group = $platformResourceGroup },
-    @{ output = 'applicationInsightsName'; type = 'Microsoft.Insights/components'; group = $platformResourceGroup },
+    @{ output = 'postgresServerName'; type = 'Microsoft.DBforPostgreSQL/flexibleServers'; group = $platformResourceGroup; dependency = 'postgres' },
+    @{ output = 'eventHubNamespaceName'; type = 'Microsoft.EventHub/namespaces'; group = $platformResourceGroup; dependency = 'eventHub' },
+    @{ output = 'applicationInsightsName'; type = 'Microsoft.Insights/components'; group = $platformResourceGroup; dependency = 'observability' },
     @{ output = 'appServicePlanName'; type = 'Microsoft.Web/serverFarms'; group = $platformResourceGroup },
     @{ output = 'telemetryFunctionPlanName'; type = 'Microsoft.Web/serverFarms'; group = $platformResourceGroup },
     @{ output = 'controlPlaneFunctionPlanName'; type = 'Microsoft.Web/serverFarms'; group = $platformResourceGroup },
@@ -891,11 +1176,21 @@ $outputResourceSpecs = @(
     @{ output = 'acrName'; type = 'Microsoft.ContainerRegistry/registries'; group = $platformResourceGroup }
 )
 foreach ($spec in $outputResourceSpecs) {
+    $dependencyProperty = $spec.PSObject.Properties['dependency']
+    if (
+        $null -ne $dependencyProperty -and
+        -not [bool](Get-DependencyValue $outputDocument ([string]$dependencyProperty.Value) 'provisioned' $true)
+    ) {
+        continue
+    }
     $property = $outputDocument.PSObject.Properties[[string]$spec.output]
     if ($null -eq $property -or -not [string]$property.Value) {
         continue
     }
     $resourceId = "/subscriptions/$Subscription/resourceGroups/$($spec.group)/providers/$($spec.type)/$($property.Value)"
+    if ($adoptedResourceIds.Contains($resourceId)) {
+        continue
+    }
     $resource = Invoke-AzJson @('resource', 'show', '--ids', $resourceId, '--output', 'json') -AllowFailure
     if ($null -eq $resource) {
         throw "Deployment output references a missing Azure resource: $resourceId"
@@ -903,6 +1198,36 @@ foreach ($spec in $outputResourceSpecs) {
     $ownedById[$resourceId] = [pscustomobject]@{
         id = $resourceId
         name = [string]$property.Value
+        type = [string]$spec.type
+    }
+}
+
+$dependencyResourceSpecs = @(
+    @{ dependency = 'network'; field = 'virtualNetworkResourceId'; type = 'Microsoft.Network/virtualNetworks' },
+    @{ dependency = 'observability'; field = 'workspaceResourceId'; type = 'Microsoft.OperationalInsights/workspaces' },
+    @{ dependency = 'keyVault'; field = 'resourceId'; type = 'Microsoft.KeyVault/vaults' },
+    @{ dependency = 'keyVault'; field = 'privateEndpointId'; type = 'Microsoft.Network/privateEndpoints' },
+    @{ dependency = 'credentialVault'; field = 'resourceId'; type = 'Microsoft.KeyVault/vaults' },
+    @{ dependency = 'credentialVault'; field = 'privateEndpointId'; type = 'Microsoft.Network/privateEndpoints' }
+)
+foreach ($spec in $dependencyResourceSpecs) {
+    if (-not [bool](Get-DependencyValue $outputDocument $spec.dependency 'provisioned' $true)) {
+        continue
+    }
+    $resourceId = [string](Get-DependencyValue $outputDocument $spec.dependency $spec.field '')
+    if (-not $resourceId -or $adoptedResourceIds.Contains($resourceId)) {
+        continue
+    }
+    if ($resourceId -notlike "$platformIdPrefix*") {
+        throw "Managed dependency resource is outside the platform resource group: $resourceId"
+    }
+    $resource = Invoke-AzJson @('resource', 'show', '--ids', $resourceId, '--output', 'json') -AllowFailure
+    if ($null -eq $resource) {
+        throw "Deployment output references a missing Azure resource: $resourceId"
+    }
+    $ownedById[$resourceId] = [pscustomobject]@{
+        id = $resourceId
+        name = [string]$resource.name
         type = [string]$spec.type
     }
 }
@@ -936,20 +1261,40 @@ $zones = @(
     'privatelink.vaultcore.azure.net'
 )
 $dnsLinkIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-if ($null -ne $vnet) {
-    foreach ($zone in $zones) {
+$dependencyMetadata = Get-ObjectValue $outputDocument 'dependencyResources'
+$dnsVnetId = if ($null -ne $vnet) {
+    [string]$vnet.id
+} else {
+    [string](Get-DependencyValue $outputDocument 'network' 'virtualNetworkResourceId' '')
+}
+foreach ($dnsDependency in @('keyVault', 'credentialVault')) {
+    $dnsLinkProvisioned = if ($null -ne $dependencyMetadata) {
+        [bool](Get-DependencyValue $outputDocument $dnsDependency 'privateDnsLinkProvisioned' $false)
+    } else { $dnsDependency -eq 'keyVault' -and $null -ne $vnet }
+    $dnsLinkId = [string](Get-DependencyValue $outputDocument $dnsDependency 'privateDnsLinkId' '')
+    $dnsLinkName = [string](Get-DependencyValue $outputDocument $dnsDependency 'privateDnsLinkName' 'finops-vnet')
+    if (-not $dnsLinkProvisioned -or -not $dnsVnetId) { continue }
+    $dependencyZones = $zones
+    if ($dnsLinkId) {
+        if ($dnsLinkId -notmatch "(?i)^$([regex]::Escape($platformIdPrefix))Microsoft.Network/privateDnsZones/([^/]+)/virtualNetworkLinks/([^/]+)$") {
+            throw "Managed private DNS link is outside the platform resource group: $dnsLinkId"
+        }
+        $dependencyZones = @($Matches[1])
+        $dnsLinkName = $Matches[2]
+    }
+    foreach ($zone in $dependencyZones) {
         $link = Invoke-AzJson @(
             'network', 'private-dns', 'link', 'vnet', 'show',
-            '-g', $platformResourceGroup, '-z', $zone, '-n', 'finops-vnet', '--output', 'json'
+            '-g', $platformResourceGroup, '-z', $zone, '-n', $dnsLinkName, '--output', 'json'
         ) -AllowFailure
         if ($null -ne $link) {
-            if ([string]$link.virtualNetwork.id -ine [string]$vnet.id) {
-                throw "Private DNS link $zone/finops-vnet points to an unexpected VNet: $($link.virtualNetwork.id)"
+            if ([string]$link.virtualNetwork.id -ine $dnsVnetId) {
+                throw "Private DNS link $zone/$dnsLinkName points to an unexpected VNet: $($link.virtualNetwork.id)"
             }
-            $null = $dnsLinkIds.Add([string]$link.id)
-            Add-AzAction "Delete private DNS link $zone/finops-vnet" @(
+            if (-not $dnsLinkIds.Add([string]$link.id)) { continue }
+            Add-AzAction "Delete private DNS link $zone/$dnsLinkName" @(
                 'network', 'private-dns', 'link', 'vnet', 'delete',
-                '-g', $platformResourceGroup, '-z', $zone, '-n', 'finops-vnet', '-y'
+                '-g', $platformResourceGroup, '-z', $zone, '-n', $dnsLinkName, '-y'
             )
         }
     }
@@ -976,12 +1321,46 @@ $ownedResources = $ownedResources | Sort-Object @{
 }, @{ Expression = { [string]$_.name } }
 
 foreach ($resource in $ownedResources) {
-    Add-AzAction "Delete Azure resource $($resource.type)/$($resource.name)" @(
-        'resource', 'delete', '--ids', [string]$resource.id, '--only-show-errors'
-    )
+    if ([string]$resource.type -ieq 'Microsoft.Web/sites') {
+        $siteCommand = if ([string]$resource.name -like 'func-*') { 'functionapp' } else { 'webapp' }
+        Add-AzAction "Delete Azure resource $($resource.type)/$($resource.name)" @(
+            $siteCommand, 'delete',
+            '--subscription', $Subscription,
+            '--resource-group', $platformResourceGroup,
+            '--name', [string]$resource.name
+        )
+    } elseif ([string]$resource.type -ieq 'Microsoft.Web/serverFarms') {
+        Add-AzAction "Delete Azure resource $($resource.type)/$($resource.name)" @(
+            'appservice', 'plan', 'delete',
+            '--subscription', $Subscription,
+            '--resource-group', $platformResourceGroup,
+            '--name', [string]$resource.name,
+            '--yes'
+        )
+    } elseif ([string]$resource.type -ieq 'Microsoft.Network/privateEndpoints') {
+        Add-AzAction "Delete Azure resource $($resource.type)/$($resource.name)" @(
+            'network', 'private-endpoint', 'delete',
+            '--subscription', $Subscription,
+            '--resource-group', $platformResourceGroup,
+            '--name', [string]$resource.name
+        )
+    } elseif ([string]$resource.type -ieq 'Microsoft.Network/networkSecurityGroups') {
+        Add-AzAction "Delete Azure resource $($resource.type)/$($resource.name)" @(
+            'network', 'nsg', 'delete',
+            '--subscription', $Subscription,
+            '--resource-group', $platformResourceGroup,
+            '--name', [string]$resource.name
+        )
+    } else {
+        Add-AzAction "Delete Azure resource $($resource.type)/$($resource.name)" @(
+            'resource', 'delete', '--ids', [string]$resource.id, '--only-show-errors'
+        )
+    }
 }
 
 foreach ($containerName in @($telemetryContainerName, $controlContainerName)) {
+    $childId = "/subscriptions/$Subscription/resourceGroups/$storageResourceGroup/providers/Microsoft.Storage/storageAccounts/$storageAccountName/blobServices/default/containers/$containerName"
+    if ($childId -notin $managedStorageChildResourceIds) { continue }
     Add-AzAction "Delete shared storage container $containerName" @(
         'storage', 'container', 'delete',
         '--subscription', $Subscription,
@@ -991,20 +1370,30 @@ foreach ($containerName in @($telemetryContainerName, $controlContainerName)) {
         '--only-show-errors'
     )
 }
-Add-AzAction "Delete shared storage table $ledgerTableName" @(
+foreach ($tableName in @($ledgerTableName, 'ModelRoutes') | Select-Object -Unique) {
+    $childId = "/subscriptions/$Subscription/resourceGroups/$storageResourceGroup/providers/Microsoft.Storage/storageAccounts/$storageAccountName/tableServices/default/tables/$tableName"
+    if ($childId -notin $managedStorageChildResourceIds) { continue }
+    Add-AzAction "Delete shared storage table $tableName" @(
     'storage', 'table', 'delete',
     '--subscription', $Subscription,
     '--account-name', $storageAccountName,
-    '--name', $ledgerTableName,
+    '--name', $tableName,
     '--auth-mode', 'login',
     '--only-show-errors'
 )
+}
 
 $manifestOptions = [ordered]@{
     coreEnvironmentOnly = $true
 }
 
 if ($CaptureManifest) {
+    foreach ($action in $actions) {
+        Assert-ManifestAction `
+            $action $platformResourceGroup $prefix $storageResourceGroup $apimId `
+            $storageAccountName $telemetryContainerName $controlContainerName `
+            $ledgerTableName $managedRoleAssignmentIds
+    }
     $productApiLinks = @(Get-ApimCollection $apimId "products/$productId/apiLinks")
     $apimResourceIds = @(
         foreach ($environmentApi in $environmentApis) {
@@ -1048,6 +1437,7 @@ if ($CaptureManifest) {
         telemetryDeploymentContainerName = $telemetryContainerName
         controlPlaneDeploymentContainerName = $controlContainerName
         ledgerTableName = $ledgerTableName
+        foundryCognitiveServicesAccountResourceId = $foundryResourceId
         apimResourceGroup = $apimResourceGroup
         apimName = $apimName
         apimId = $apimId
@@ -1060,6 +1450,7 @@ if ($CaptureManifest) {
             $apimId,
             'Microsoft.CognitiveServices resources',
             "$apimId/loggers/azuremonitor"
+            @($adoptedResourceIds)
         )
         resources = [ordered]@{
             azureResourceIds = @(
@@ -1067,6 +1458,7 @@ if ($CaptureManifest) {
             )
             apimResourceIds = $apimResourceIds
             roleAssignmentIds = $roleAssignmentIds
+            adoptedResourceIds = @($adoptedResourceIds | Sort-Object -Unique)
         }
         options = $manifestOptions
         actions = @(

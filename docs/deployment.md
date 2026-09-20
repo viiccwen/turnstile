@@ -57,6 +57,60 @@ usage hub. When adopting dependencies, preserve this distinction, use the actual
 resource ID/group and network path, and verify externally scoped grants before enabling workers.
 Do not point route credentials at a read-only adopted configuration-secret bundle.
 
+### Adopted dependencies and credential-vault networking
+
+`dependencyResources` records exact dependency IDs and ownership. Adoption does not authorize
+reconfiguring the external VNet/subnets, PostgreSQL, configuration vault/secrets, Event Hub,
+workspace or Application Insights. The shared Storage account is always existing; its two
+deployment containers, configured ledger and `ModelRoutes` are the only bootstrap children.
+Keep the existing runtime-release settings for registered targets, self-hosted Gateways and
+multi-target rollout; dependency adoption is not a feature downgrade.
+
+The runtime credential vault remains a **managed** resource in the Turnstile deployment group,
+even when `provisionKeyVault=false` adopts configuration secrets. Its separate
+`credentialVaultName`, `credentialVaultResourceId`, `credentialVaultResourceGroupName` and
+`credentialVaultPrivateEndpointId` outputs identify it; `dependencyResources.credentialVault`
+records its ownership independently from `dependencyResources.keyVault`. Never reuse the
+adopted configuration-vault ID as the credential-vault ID or clean up the adopted vault.
+
+Both vault endpoints use the effective private-endpoint subnet ID: the managed subnet or the
+exact adopted `existingPrivateEndpointSubnetResourceId`. The credential vault always gets one
+endpoint. The configuration vault gets a new endpoint only when Turnstile manages that vault;
+adoption leaves its existing endpoint untouched. Preserve each endpoint's existing name and
+private-link connection name when upgrading.
+
+| Configuration vault | DNS selection | DNS owner and endpoint behavior |
+| --- | --- | --- |
+| Managed | Managed zone | Configuration endpoint module creates one zone/link; credential endpoint reuses its exact zone ID. |
+| Adopted | Managed zone | Credential endpoint module creates one zone/link in the deployment group. No configuration endpoint is deployed. |
+| Either | Existing zone | Both applicable endpoints use the supplied exact zone ID, even in another resource group. Neither module creates or modifies that zone or its VNet links. |
+
+An exact `existingKeyVaultPrivateDnsZoneResourceId` takes precedence over DNS name/group
+fallbacks and forces reuse even if the DNS provisioning switch was left true. DNS ownership
+outputs reflect the actual module action, not just the requested switch. The shared DNS zone
+and link IDs appear in both dependency records: deduplicate by exact ID during cleanup and
+delete only resources whose recorded ownership is true. The configuration-vault ownership
+flag alone must not decide ownership of the dedicated credential endpoint or shared DNS.
+
+Before enabling workers, verify the selected DNS zone is already linked to the effective VNet,
+both required vault names resolve to their approved endpoints, and the actual runtime identities
+can reach them. An adopted configuration vault may use a separate existing approved DNS path;
+do not create a second endpoint or relink external DNS to work around a failed lookup.
+
+For adopted Event Hubs, ARM suppresses the managed receiver/sender grants and the API and
+Control-plane Sender delegators. The observer also suppresses its Sender grant through
+`manageEventHubRoleAssignment=false`. The deployment lifecycle must verify/install those
+grants on the **exact adopted hub ID**, including its real resource group, before runtime
+activation. API and enabled release-worker delegation uses the same constrained Sender role,
+`ServicePrincipal` restriction and delete denial described above; it must not target a
+same-named hub in the deployment group. Configuration-secret readers are likewise handled
+externally for adoption, while credential-vault Secrets User/Officer and constrained Secrets
+User delegation remain managed against the dedicated vault.
+
+Runtime diagnostics retain the named `runtimeDiagnosticScope` and `publisherProbeScope`
+outputs and the configured `apimProbeSubscriptionId`, including when APIM bootstrap is skipped.
+Probe access is scoped to that subscription, not to Dashboard keys or a broader APIM role.
+
 ## Prepare for v1.2
 
 Turnstile v1.2 is the current public release. Upgrading an existing v1.1 installation requires
@@ -462,7 +516,7 @@ cp infra/main.parameters.example.json .turnstile/main.parameters.json
 
 Set the resource prefix, resource group, Azure and PostgreSQL regions, APIM publisher email, and `bootstrapOwnerEmail`. New deployments provision a capacity-one `StandardV2` APIM by default. `entraClientId` and `entraAllowedEmailDomains` are optional; password Owner login works without Entra.
 
-To run a clean end-to-end deployment without provisioning another APIM service, set all four `existingApimName`, `existingApimResourceGroupName`, `existingApimPrincipalId`, and `existingApimGatewayUrl` values. PostgreSQL and every other platform resource are still created from scratch. The deployment derives environment-unique API, path, product, subscription, logger, diagnostic-setting, and observer Named Value identifiers from `resourcePrefix`, so the shared APIM configuration does not overwrite another Turnstile environment.
+To run a clean end-to-end deployment without provisioning another APIM service, set all four `existingApimName`, `existingApimResourceGroupName`, `existingApimPrincipalId`, and `existingApimGatewayUrl` values. Other dependencies are managed unless explicitly adopted through their existing-resource parameters; shared Storage is always existing and the dedicated runtime credential vault remains managed. The deployment derives environment-unique API, path, product, subscription, logger, diagnostic-setting, and observer Named Value identifiers from `resourcePrefix`, so the shared APIM configuration does not overwrite another Turnstile environment. Review all shared named values, including platform governance, before reusing an APIM across installations; environment-specific child names alone do not establish full configuration isolation.
 
 Do not add passwords, keys, hashes, or connection strings to this file. The deployment command rejects secure parameter names in the public file.
 

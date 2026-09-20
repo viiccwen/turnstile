@@ -17,6 +17,7 @@ param image string
 param acrLoginServer string
 param eventHubNamespaceName string
 param eventHubName string
+param manageEventHubRoleAssignment bool = true
 
 @secure()
 param adapterSharedKey string
@@ -74,16 +75,16 @@ resource webApp 'Microsoft.Web/sites@2024-11-01' = {
   }
 }
 
-resource eventHubNamespace 'Microsoft.EventHub/namespaces@2024-01-01' existing = {
+resource eventHubNamespace 'Microsoft.EventHub/namespaces@2024-01-01' existing = if (manageEventHubRoleAssignment) {
   name: eventHubNamespaceName
 }
 
-resource usageEventHub 'Microsoft.EventHub/namespaces/eventhubs@2024-01-01' existing = {
+resource usageEventHub 'Microsoft.EventHub/namespaces/eventhubs@2024-01-01' existing = if (manageEventHubRoleAssignment) {
   parent: eventHubNamespace
   name: eventHubName
 }
 
-resource eventHubSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource eventHubSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (manageEventHubRoleAssignment) {
   scope: usageEventHub
   name: guid(usageEventHub.id, webApp.id, 'envoy-cache-adapter-event-hub-sender')
   properties: {

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import json
+import re
 from xml.etree import ElementTree
 
 from tests.support.paths import REPOSITORY_ROOT
@@ -168,7 +170,7 @@ def test_fresh_apim_precreates_a_fail_closed_image_operation() -> None:
     assert body["error"]["code"] == "image_model_not_published"
     assert policy.find(".//send-request") is None
     assert policy.find(".//forward-request") is None
-    assert "Microsoft.ApiManagement/service/apis/operations/write" not in CONTROL_PLANE_APIM_RBAC
+    assert "Microsoft.ApiManagement/service/apis/operations/write" in CONTROL_PLANE_APIM_RBAC
 
 
 def test_incremental_apim_template_only_prepares_and_promotes_existing_api_revisions() -> None:
@@ -358,18 +360,18 @@ def test_public_runtime_resources_are_exempt_from_network_modify_policy() -> Non
 
 
 def test_vnet_subnets_are_created_serially() -> None:
-    telemetry_subnet = DATA_PLANE.split("resource telemetryFunctionSubnet", 1)[1].split(
-        "resource controlFunctionSubnet", 1
+    telemetry_subnet = DATA_PLANE.split("resource managedTelemetryFunctionSubnet", 1)[1].split(
+        "resource managedControlFunctionSubnet", 1
     )[0]
-    control_subnet = DATA_PLANE.split("resource controlFunctionSubnet", 1)[1].split(
-        "resource privateEndpointSubnet", 1
+    control_subnet = DATA_PLANE.split("resource managedControlFunctionSubnet", 1)[1].split(
+        "resource managedPrivateEndpointSubnet", 1
     )[0]
-    private_endpoint_subnet = DATA_PLANE.split("resource privateEndpointSubnet", 1)[
+    private_endpoint_subnet = DATA_PLANE.split("resource managedPrivateEndpointSubnet", 1)[
         1
     ].split("module keyVaultPrivateEndpoint", 1)[0]
-    assert "virtualNetwork" in telemetry_subnet.split("dependsOn:", 1)[1]
-    assert "telemetryFunctionSubnet" in control_subnet.split("dependsOn:", 1)[1]
-    assert "controlFunctionSubnet" in private_endpoint_subnet.split("dependsOn:", 1)[1]
+    assert "parent: managedVirtualNetwork" in telemetry_subnet
+    assert "managedTelemetryFunctionSubnet" in control_subnet.split("dependsOn:", 1)[1]
+    assert "managedControlFunctionSubnet" in private_endpoint_subnet.split("dependsOn:", 1)[1]
 
 
 def test_functions_use_shared_storage_service_endpoints_without_private_links() -> None:
@@ -487,22 +489,45 @@ def test_ledger_and_model_routes_use_exact_shared_storage_children() -> None:
 
 
 def test_deployment_bootstraps_only_owned_shared_storage_children() -> None:
-    assert '"storage",\n                "container",\n                "create"' in DEPLOY_SCRIPT
-    assert '"storage",\n            "table",\n            "create"' in DEPLOY_SCRIPT
-    assert '"--auth-mode",\n                "login"' in DEPLOY_SCRIPT
+    module = ast.parse(DEPLOY_SCRIPT)
+    bootstrap = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "ensure_shared_storage_resources"
+    )
+    commands = [
+        [ast.literal_eval(item) for item in node.elts[:4]]
+        for node in ast.walk(bootstrap)
+        if isinstance(node, ast.List) and len(node.elts) >= 4
+        and all(isinstance(item, ast.Constant) for item in node.elts[:4])
+    ]
+    assert commands == [
+        ["az", "storage", "container", "create"],
+        ["az", "storage", "table", "create"],
+    ]
+    source = ast.unparse(bootstrap)
+    assert "(telemetry_container, control_container)" in source
+    assert "dict.fromkeys((ledger_table, DEFAULT_ROUTE_TABLE_NAME))" in source
+    assert "'--auth-mode', 'login'" in source
+    assert re.search(r'^DEFAULT_ROUTE_TABLE_NAME\s*=\s*[\'"]ModelRoutes[\'"]', DEPLOY_SCRIPT, re.M)
+    assert "param ledgerTableName string = 'TurnstileLedger'" in MAIN
     assert "resource sharedStorage 'Microsoft.Storage/storageAccounts@" in MAIN
     assert "output storageAccountId string = sharedStorage.id" in MAIN
     assert "output ledgerTableId string = resourceId(" in MAIN
 
 
-def test_shared_storage_roles_are_verified_outside_arm_deployment() -> None:
+def test_shared_storage_roles_are_granted_outside_arm_deployment() -> None:
     assert "Storage Blob Data Owner" in DEPLOY_SCRIPT
     assert "Storage Table Data Contributor" in DEPLOY_SCRIPT
     assert "Storage Queue Data Contributor" not in DEPLOY_SCRIPT
     assert '_output_string(outputs, "apiPrincipalId")' in DEPLOY_SCRIPT
     assert '_output_string(outputs, "controlPlanePrincipalId")' in DEPLOY_SCRIPT
     assert "module storageRbac" not in MAIN
-    assert "name: guid(workspace.id, functionApp.id, 'log-analytics-reader')" in DATA_PLANE
+    assert (
+        "name: guid(managedWorkspace!.id, functionApp.id, 'log-analytics-reader')"
+        in DATA_PLANE
+    )
+    assert "if (provisionObservability)" in DATA_PLANE
 
 
 def test_api_projects_model_access_using_its_exact_ledger_and_identity() -> None:
@@ -547,19 +572,29 @@ def test_existing_api_model_access_upgrade_reuses_ledger_and_preserves_settings(
 
 def test_api_ledger_network_supports_shared_public_storage() -> None:
     upgrade = (ROOT / "infra/model-access-network-upgrade.bicep").read_text(encoding="utf-8")
-    for template in (DATA_PLANE, upgrade):
-        subnet = template.split("resource apiSubnet ", 1)[1].split("\nresource ", 1)[0]
-        assert "parent: virtualNetwork" in subnet
-        assert "serviceName: 'Microsoft.Web/serverFarms'" in subnet
-        integration = template.split("resource apiVnetIntegration ", 1)[1].split(
-            "\nresource ", 1,
-        )[0]
-        assert "parent: api" in integration
-        assert "name: 'virtualNetwork'" in integration
-        assert "subnetResourceId: apiSubnet.id" in integration
-        assert "swiftSupported: true" in integration
+    subnet = DATA_PLANE.split("resource managedApiSubnet ", 1)[1].split(
+        "\n  dependsOn:", 1
+    )[0]
+    assert "parent: managedVirtualNetwork" in subnet
+    assert "serviceName: 'Microsoft.Web/serverFarms'" in subnet
+    integration = DATA_PLANE.split("resource apiVnetIntegration ", 1)[1].split(
+        "\nresource ", 1,
+    )[0]
+    assert "parent: api" in integration
+    assert "name: 'virtualNetwork'" in integration
+    assert "subnetResourceId: effectiveApiSubnetResourceId" in integration
+    assert "swiftSupported: true" in integration
+    upgrade_subnet = upgrade.split("resource apiSubnet ", 1)[1].split(
+        "\nresource ", 1
+    )[0]
+    assert "parent: virtualNetwork" in upgrade_subnet
+    assert "serviceName: 'Microsoft.Web/serverFarms'" in upgrade_subnet
+    upgrade_integration = upgrade.split("resource apiVnetIntegration ", 1)[1].split(
+        "\nresource ", 1,
+    )[0]
+    assert "subnetResourceId: apiSubnet.id" in upgrade_integration
     assert "addressPrefix: '10.42.3.64/27'" in DATA_PLANE
-    assert "dependsOn: [\n    privateEndpointSubnet\n  ]" in DATA_PLANE
+    assert "dependsOn: [\n    managedPrivateEndpointSubnet\n  ]" in DATA_PLANE
     assert "resource ledgerTablePrivateEndpoint" not in DATA_PLANE
     assert "resource storageBlobPrivateEndpoint" not in DATA_PLANE
     assert "Microsoft.Storage/" not in upgrade
@@ -589,7 +624,13 @@ def test_databricks_oauth_is_opt_in_for_api_publisher_and_scoped_permissions() -
             action = f"Microsoft.ApiManagement/service/authorizationProviders{suffix}/{operation}"
             assert action in oauth
     assert "], oauthActions)" in CONTROL_PLANE_APIM_RBAC
-    assert "Microsoft.ApiManagement/service/apis/operations/write" not in CONTROL_PLANE_APIM_RBAC
+    assert "Microsoft.ApiManagement/service/apis/operations/write" in CONTROL_PLANE_APIM_RBAC
+    contract = json.loads(
+        (ROOT / "turnstile_core/domain/apim_publication_permissions.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert set(re.findall(r"'([^']+)'", oauth)) == set(contract["oauth"])
 
 
 def test_control_plane_features_default_to_disabled() -> None:
@@ -648,7 +689,9 @@ def test_application_creation_is_gated_and_uses_the_exact_platform_ledger() -> N
         "Microsoft.ApiManagement/service/gateways/read",
     ):
         assert action in CONTROL_PLANE_APIM_RBAC
-    assert "listSecrets" not in CONTROL_PLANE_APIM_RBAC
+    # Initialization reads existing subscription keys; rotation remains a separate role.
+    assert "Microsoft.ApiManagement/service/subscriptions/listSecrets/action" in CONTROL_PLANE_APIM_RBAC
+    assert "regenerate" not in CONTROL_PLANE_APIM_RBAC
 
 
 def test_control_plane_initialization_roles_do_not_depend_on_worker_activation() -> None:
@@ -684,7 +727,9 @@ def test_control_plane_uses_its_own_flex_plan_and_the_platform_vnet() -> None:
         "module controlPlaneApimRbac", 1
     )[0]
     assert "resourcePrefix: resourcePrefix" in MAIN
-    assert "virtualNetworkName: 'vnet-${resourcePrefix}-${suffix}'" in MAIN
+    assert "functionSubnetResourceId: dataPlane.outputs.controlFunctionSubnetResourceId" in MAIN
+    assert "param functionSubnetResourceId string" in CONTROL_PLANE
+    assert "subnetResourceId: functionSubnetResourceId" in CONTROL_PLANE
     assert "apimGatewayUrl: effectiveGatewayApiPath" in MAIN
     assert (
         "var storageName = 'st${take(compactResourcePrefix, 12)}cp${take(suffix, 8)}'"
@@ -719,6 +764,43 @@ def test_foundry_managed_identity_access_matches_account_role_contract() -> None
     assert FOUNDRY_INFERENCE_ROLE_ID in documentation
     assert "Cognitive Services OpenAI User" in documentation
     assert "does not read or output keys" in documentation
+
+
+def test_existing_dependency_contracts_are_conditional_and_output_ownership() -> None:
+    for name in (
+        "existingVirtualNetworkResourceId",
+        "existingTelemetryFunctionSubnetResourceId",
+        "existingControlPlaneFunctionSubnetResourceId",
+        "existingPrivateEndpointSubnetResourceId",
+        "existingApiSubnetResourceId",
+        "existingPostgresServerResourceId",
+        "existingEventHubResourceId",
+        "existingLogAnalyticsWorkspaceResourceId",
+        "existingApplicationInsightsResourceId",
+        "existingKeyVaultResourceId",
+    ):
+        assert name in MAIN or name in DEPLOY_SCRIPT
+        assert name in PARAMETERS
+    for switch in (
+        "provisionNetwork",
+        "provisionEventHub",
+        "provisionObservability",
+        "provisionKeyVault",
+    ):
+        assert f"param {switch} bool = true" in MAIN
+        assert f"param {switch} bool = true" in DATA_PLANE
+    assert "output dependencyResources object" in MAIN
+    assert "param keyVaultPrivateDnsLinkName string = 'finops-vnet'" in MAIN
+    assert "privateDnsLinkName: keyVaultPrivateDnsLinkName" in DATA_PLANE
+    for resource in ("postgres", "eventHub", "observability", "keyVault", "network"):
+        assert f"  {resource}: {{" in MAIN
+        assert "provisioned:" in MAIN.split(f"  {resource}: {{", 1)[1].split("  }", 1)[0]
+    assert "if (provisionNetwork)" in DATA_PLANE
+    assert "if (provisionEventHub)" in DATA_PLANE
+    assert "if (provisionObservability)" in DATA_PLANE
+    assert "if (provisionKeyVault)" in DATA_PLANE
+    assert "manageEventHubRoleAssignment" in OBSERVER_APP
+    assert "manageKeyVaultRoleAssignments" in CONTROL_PLANE
 
 
 def test_only_existing_storage_reference_targets_the_storage_resource_group() -> None:
@@ -771,6 +853,7 @@ def test_apim_inventory_role_is_read_only_and_resource_scoped() -> None:
         "Microsoft.ApiManagement/service/gateways/apis/read",
         "Microsoft.ApiManagement/service/gateways/hostnameConfigurations/read",
         "Microsoft.ApiManagement/service/gateways/certificateAuthorities/read",
+        "Microsoft.ApiManagement/service/namedValues/read",
     }
     assignment = inventory_role.split("resource apiInventoryReaders ", 1)[1]
     assert "scope: apim" in assignment
@@ -808,6 +891,43 @@ def test_publisher_observer_key_read_is_scoped_to_one_named_value() -> None:
     assert all(value not in source for value in ("xle-", "finops-", "75038ef6", "*/"))
 
 
+def test_publisher_actions_match_the_exact_approved_contract() -> None:
+    contract = json.loads(
+        (ROOT / "turnstile_core/domain/apim_publication_permissions.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    base = CONTROL_PLANE_APIM_RBAC.split("actions: concat([", 1)[1].split(
+        "], oauthActions)", 1
+    )[0]
+    actions = re.findall(r"'([^']+)'", base)
+    expected = set(contract["publication"]) | {
+        "Microsoft.ApiManagement/service/apis/products/read",
+        "Microsoft.ApiManagement/service/apis/revisions/read",
+        "Microsoft.ApiManagement/service/gateways/apis/read",
+        "Microsoft.ApiManagement/service/gateways/certificateAuthorities/read",
+        "Microsoft.ApiManagement/service/gateways/hostnameConfigurations/read",
+        "Microsoft.ApiManagement/service/gateways/read",
+        "Microsoft.ApiManagement/service/loggers/read",
+        "Microsoft.ApiManagement/service/loggers/write",
+        "Microsoft.ApiManagement/service/policies/read",
+        "Microsoft.ApiManagement/service/policyFragments/read",
+        "Microsoft.ApiManagement/service/products/apiLinks/read",
+        "Microsoft.ApiManagement/service/products/apis/read",
+        "Microsoft.ApiManagement/service/products/policies/read",
+        "Microsoft.ApiManagement/service/products/policy/read",
+        "Microsoft.ApiManagement/service/products/read",
+        "Microsoft.ApiManagement/service/subscriptions/read",
+        "Microsoft.ApiManagement/service/subscriptions/listSecrets/action",
+        "Microsoft.ApiManagement/service/subscriptions/write",
+    }
+    assert set(actions) == expected
+    assert len(actions) == len(expected)
+    assert all("*" not in action and "/delete" not in action for action in actions)
+    assert "notActions: []" in CONTROL_PLANE_APIM_RBAC
+    assert "dataActions: []" in CONTROL_PLANE_APIM_RBAC
+
+
 def test_custom_roles_use_installation_specific_names() -> None:
     for template in (CONTROL_PLANE_APIM_RBAC, APPLICATION_KEY_MANAGEMENT_RBAC):
         assert "var roleNameSuffix = uniqueString(resourceGroup().id)" in template
@@ -839,21 +959,108 @@ def test_example_parameters_are_non_secret_and_environment_neutral() -> None:
 
 
 def test_platform_identities_can_delegate_scoped_apim_dependency_roles() -> None:
-    expected_roles = (
-        ("usageEventHub", "2b629674-e913-4c01-ae53-ef4638d8f975"),
-        ("credentialVault", "4633458b-17de-408a-b874-0445c86b69e6"),
-    )
-    for template in (DATA_PLANE, CONTROL_PLANE):
+    for template, event_hub in (
+        (DATA_PLANE, "managedUsageEventHub"),
+        (CONTROL_PLANE, "usageEventHub"),
+    ):
         assert "f58310d9-a9f6-439a-9e8d-f62e7b41a168" in template
         assert "312a565d-c81f-4fd8-895a-4e21e48d571c" in template
         assert "conditionVersion: '2.0'" in template
-        for scope_name, role_id in expected_roles:
+        for scope_name, role_id in (
+            (event_hub, "2b629674-e913-4c01-ae53-ef4638d8f975"),
+            ("credentialVault", "4633458b-17de-408a-b874-0445c86b69e6"),
+        ):
             assert f"scope: {scope_name}" in template
             assert f"GuidEquals {{{role_id}}}" in template
     assert "resource apiSubscriptionApimContributor" not in MAIN
     assert "resource controlPlaneSubscriptionApimContributor" not in MAIN
     assert "eventHubNamespaceName: dataPlane.outputs.eventHubNamespaceName" in MAIN
     assert "eventHubName: dataPlane.outputs.eventHubName" in MAIN
+
+
+def test_adopted_event_hub_grants_are_not_applied_at_a_managed_or_wrong_group_scope() -> None:
+    assert "manageEventHubRoleAssignments: dataPlane.outputs.eventHubProvisioned" in MAIN
+    for name in (
+        "functionEventHubReceiver", "apimEventHubSender", "apiEventHubRoleDelegator",
+    ):
+        resource = DATA_PLANE.split(f"resource {name} ", 1)[1].split("\nresource ", 1)[0]
+        assert "= if (provisionEventHub)" in resource
+        assert "scope: managedUsageEventHub" in resource
+    delegator = CONTROL_PLANE.split("resource onboardingEventHubRoleDelegator ", 1)[1].split(
+        "\nresource ", 1
+    )[0]
+    assert "effectiveReleaseWorkerEnabled && manageEventHubRoleAssignments" in delegator
+    assert "scope: usageEventHub" in delegator
+    for template, resource_name, switch in (
+        (CONTROL_PLANE, "eventHubNamespace", "manageEventHubRoleAssignments"),
+        (CONTROL_PLANE, "usageEventHub", "manageEventHubRoleAssignments"),
+        (OBSERVER_APP, "eventHubNamespace", "manageEventHubRoleAssignment"),
+        (OBSERVER_APP, "usageEventHub", "manageEventHubRoleAssignment"),
+        (OBSERVER_APP, "eventHubSender", "manageEventHubRoleAssignment"),
+    ):
+        resource = template.split(f"resource {resource_name} ", 1)[1].split("\nresource ", 1)[0]
+        assert f"if ({switch}" in resource
+    assert "manageEventHubRoleAssignment: manageEventHubRoleAssignment" in OBSERVER_MAIN
+
+
+def test_credential_vault_is_separate_and_uses_the_effective_private_network() -> None:
+    credential_vault = DATA_PLANE.split("resource credentialVault ", 1)[1].split(
+        "\nvar ", 1
+    )[0]
+    assert "= if (provisionKeyVault)" not in credential_vault
+    assert "name: credentialVaultName" in credential_vault
+    assert "defaultAction: 'Deny'" in credential_vault
+    assert "credentialVaultName: dataPlane.outputs.credentialVaultName" in MAIN
+    assert "manageKeyVaultRoleAssignments: dataPlane.outputs.keyVaultProvisioned" in MAIN
+    for name in (
+        "functionDatabaseSecretReader", "functionCredentialSecretReader", "functionProbeSecretReader",
+    ):
+        resource = CONTROL_PLANE.split(f"resource {name} ", 1)[1].split("\nresource ", 1)[0]
+        assert "= if (manageKeyVaultRoleAssignments)" in resource
+    endpoint = DATA_PLANE.split("module credentialVaultPrivateEndpoint ", 1)[1].split(
+        "\nresource ", 1
+    )[0]
+    for required in (
+        "'key-vault-private-endpoint.bicep'", "keyVaultName: credentialVault.name",
+        "privateEndpointSubnetResourceId: effectivePrivateEndpointSubnetResourceId",
+        "virtualNetworkResourceId: effectiveVirtualNetworkResourceId",
+        "provisionPrivateDnsZone: !provisionKeyVault && provisionKeyVaultPrivateDnsZone",
+        "existingPrivateDnsZoneResourceId: provisionKeyVault",
+        "? keyVaultPrivateEndpoint!.outputs.privateDnsZoneId",
+        ": existingKeyVaultPrivateDnsZoneResourceId",
+        "privateLinkServiceConnectionName: 'route-credentials'",
+    ):
+        assert required in endpoint
+    assert "resource vaultPrivateDnsZone " not in DATA_PLANE
+    assert "id: privateEndpointSubnet.id" not in DATA_PLANE
+    assert "output credentialVaultPrivateEndpointId string" in MAIN
+    assert "  credentialVault: {" in MAIN
+    assert "output routeTableName string = 'ModelRoutes'" in MAIN
+    assert "output routeTableName string = 'ModelRoutes'" in DATA_PLANE
+    assert "output routeTableId string = routeTableResourceId" in DATA_PLANE
+    assert "output credentialVaultResourceGroupName string = resourceGroup().name" in DATA_PLANE
+
+
+def test_vault_dns_reuses_exact_external_ids_without_duplicate_zones_or_links() -> None:
+    endpoint = (ROOT / "infra/modules/key-vault-private-endpoint.bicep").read_text(
+        encoding="utf-8"
+    )
+    assert "param existingPrivateDnsZoneResourceId string = ''" in endpoint
+    assert (
+        "var reusePrivateDnsZone = !provisionPrivateDnsZone "
+        "|| !empty(existingPrivateDnsZoneResourceId)"
+    ) in endpoint
+    for name in ("managedPrivateDnsZone", "privateDnsLink"):
+        resource = endpoint.split(f"resource {name} ", 1)[1].split("\nresource ", 1)[0]
+        assert "= if (!reusePrivateDnsZone)" in resource
+    assert "? existingPrivateDnsZoneResourceId : existingPrivateDnsZone!.id" in endpoint
+    assert "privateDnsZoneId: effectivePrivateDnsZoneId" in endpoint
+    assert "output privateDnsZoneProvisioned bool = !reusePrivateDnsZone" in endpoint
+    assert "output privateDnsLinkProvisioned bool = !reusePrivateDnsZone" in endpoint
+    assert DATA_PLANE.count("module credentialVaultPrivateEndpoint ") == 1
+    assert "resource credentialVaultPrivateDnsZoneGroup " not in DATA_PLANE
+    for output in ("privateDnsZoneProvisioned", "privateDnsLinkProvisioned"):
+        assert f"credentialVaultPrivateEndpoint.outputs.{output}" in DATA_PLANE
 
 
 def test_shared_table_permissions_have_an_explicit_external_installation_contract() -> None:

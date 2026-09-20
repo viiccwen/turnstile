@@ -59,6 +59,63 @@
     "existingApimGatewayUrl": {
       "value": ""
     },
+    "foundryCognitiveServicesAccountResourceId": {
+      "value": ""
+    },
+    "existingVirtualNetworkResourceId": {
+      "value": ""
+    },
+    "existingTelemetryFunctionSubnetResourceId": {
+      "value": ""
+    },
+    "existingControlPlaneFunctionSubnetResourceId": {
+      "value": ""
+    },
+    "existingPrivateEndpointSubnetResourceId": {
+      "value": ""
+    },
+    "existingApiSubnetResourceId": {
+      "value": ""
+    },
+    "existingKeyVaultPrivateDnsZoneResourceId": {
+      "value": ""
+    },
+    "keyVaultPrivateDnsLinkName": {
+      "value": ""
+    },
+    "existingPostgresServerResourceId": {
+      "value": ""
+    },
+    "existingPostgresDatabaseName": {
+      "value": ""
+    },
+    "existingEventHubResourceId": {
+      "value": ""
+    },
+    "existingLogAnalyticsWorkspaceResourceId": {
+      "value": ""
+    },
+    "existingApplicationInsightsResourceId": {
+      "value": ""
+    },
+    "existingKeyVaultResourceId": {
+      "value": ""
+    },
+    "existingDatabaseUrlSecretUri": {
+      "value": ""
+    },
+    "existingCredentialEncryptionKeySecretUri": {
+      "value": ""
+    },
+    "existingManagementApiKeySecretUri": {
+      "value": ""
+    },
+    "existingApimSubscriptionKeySecretUri": {
+      "value": ""
+    },
+    "existingApimProbeSubscriptionKeySecretUri": {
+      "value": ""
+    },
     "entraClientId": {
       "value": ""
     },

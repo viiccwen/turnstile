@@ -25,7 +25,8 @@ _TOKENS = re.compile(
 CACHE_READ_WITHOUT_FALLBACK = '?? (long?)usage?["cache_read_input_tokens"] ?? 0;'
 
 CACHE_READ_WITH_FALLBACK = (
-    '?? (long?)usage?["cache_read_input_tokens"]\n          ?? (long?)usage?["cached_tokens"] ?? 0;'
+    '?? (long?)usage?["cache_read_input_tokens"]\n'
+    '          ?? (long?)usage?["cached_tokens"] ?? 0;'
 )
 
 _BOUND_NAMES = ("maxOutputBound", "applicationMaxOutputBound")
