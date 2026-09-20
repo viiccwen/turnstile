@@ -21,6 +21,7 @@ param imageRepository string = 'turnstile/envoy-cache-adapter'
 param imageTag string
 param eventHubNamespaceName string
 param eventHubName string = 'token-usage'
+param manageEventHubRoleAssignment bool = true
 param apimName string
 param adapterKeyNamedValueName string = 'turnstile-envoy-adapter-key'
 
@@ -31,7 +32,7 @@ var acrLoginServer = '${acrName}.azurecr.io'
 var image = '${acrLoginServer}/${imageRepository}:${imageTag}'
 
 module registry 'br/public:avm/res/container-registry/registry:0.13.0' = if (provisionAcr) {
-  name: 'envoy-cache-adapter-registry'
+  name: 'observer-registry-${take(uniqueString(webAppName), 8)}'
   scope: resourceGroup(acrResourceGroupName)
   params: {
     name: acrName
@@ -45,7 +46,7 @@ module registry 'br/public:avm/res/container-registry/registry:0.13.0' = if (pro
 }
 
 module app 'app.bicep' = {
-  name: 'envoy-cache-adapter-app'
+  name: 'observer-app-${take(uniqueString(webAppName), 8)}'
   params: {
     location: location
     appServicePlanName: appServicePlanName
@@ -56,13 +57,14 @@ module app 'app.bicep' = {
     acrLoginServer: acrLoginServer
     eventHubNamespaceName: eventHubNamespaceName
     eventHubName: eventHubName
+    manageEventHubRoleAssignment: manageEventHubRoleAssignment
     adapterSharedKey: adapterSharedKey
   }
 }
 
 module acrRole 'acr-role.bicep' = {
   scope: resourceGroup(acrResourceGroupName)
-  name: 'envoy-cache-adapter-acr-role'
+  name: 'observer-acr-role-${take(uniqueString(webAppName), 8)}'
   dependsOn: [
     registry
   ]
@@ -74,7 +76,7 @@ module acrRole 'acr-role.bicep' = {
 
 module apimIntegration 'apim.bicep' = {
   scope: resourceGroup(apimResourceGroupName)
-  name: 'envoy-cache-adapter-apim-${uniqueString(resourceGroup().name)}'
+  name: 'observer-apim-${take(uniqueString(webAppName, apimName), 8)}'
   params: {
     apimName: apimName
     adapterKeyNamedValueName: adapterKeyNamedValueName

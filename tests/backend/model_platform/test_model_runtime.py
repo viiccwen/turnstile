@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -967,16 +968,16 @@ def test_production_invocation_rejects_non_apim_transport() -> None:
 
 
 def test_cli_adapter_executes_restricted_command(tmp_path: Path) -> None:
-    executable = tmp_path / "fake-model"
+    executable = tmp_path / "fake_model.py"
     executable.write_text(
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake-1.0; else echo CLI_OK; fi\n"
+        "import sys\nprint('fake-1.0' if '--version' in sys.argv else 'CLI_OK')\n",
+        encoding="utf-8",
     )
-    executable.chmod(0o700)
     route = {
         "runtime_id": UUID("30000000-0000-4000-8000-000000000099"),
         "runtime_config": {
-            "command": str(executable),
-            "args": ["-p", "{prompt}"],
+            "command": sys.executable,
+            "args": [str(executable), "-p", "{prompt}"],
             "working_directory": str(tmp_path),
         },
         "model_key": "fake-model",

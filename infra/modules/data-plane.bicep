@@ -2,6 +2,8 @@ targetScope = 'resourceGroup'
 
 param location string
 param postgresLocation string
+@minLength(3)
+@maxLength(12)
 param resourcePrefix string
 param suffix string
 param telemetryStorageName string
@@ -17,6 +19,49 @@ param postgresAdministratorPassword string
 param postgresSkuName string
 param postgresTier string
 param provisionPostgres bool = true
+param postgresAdopted bool = false
+param existingPostgresServerResourceId string = ''
+param existingPostgresServerName string = ''
+param existingPostgresDatabaseName string = ''
+param useDatabaseUrlOverride bool = false
+@secure()
+param databaseUrlOverride string = ''
+param provisionEventHub bool = true
+param existingEventHubNamespaceResourceGroupName string = ''
+param existingEventHubNamespaceName string = ''
+param existingEventHubName string = ''
+param existingEventHubNamespaceResourceId string = ''
+param existingEventHubResourceId string = ''
+param provisionObservability bool = true
+param existingLogAnalyticsWorkspaceResourceGroupName string = ''
+param existingLogAnalyticsWorkspaceName string = ''
+param existingApplicationInsightsResourceGroupName string = ''
+param existingApplicationInsightsName string = ''
+param provisionKeyVault bool = true
+param existingKeyVaultResourceGroupName string = ''
+param existingKeyVaultName string = ''
+param existingKeyVaultResourceId string = ''
+param existingDatabaseUrlSecretUri string = ''
+param existingDatabaseUrlResourceId string = ''
+param existingCredentialEncryptionKeySecretUri string = ''
+param existingCredentialKeyResourceId string = ''
+param existingManagementApiKeySecretUri string = ''
+param existingManagementKeyResourceId string = ''
+param existingApimSubscriptionKeySecretUri string = ''
+param existingApimKeyResourceId string = ''
+param existingApimProbeSubscriptionKeySecretUri string = ''
+param existingApimProbeKeyResourceId string = ''
+param provisionNetwork bool = true
+param existingVirtualNetworkResourceId string = ''
+param existingTelemetryFunctionSubnetResourceId string = ''
+param existingControlFunctionSubnetResourceId string = ''
+param existingPrivateEndpointSubnetResourceId string = ''
+param existingApiSubnetResourceId string = ''
+param provisionKeyVaultPrivateDnsZone bool = true
+param keyVaultPrivateDnsLinkName string = 'finops-vnet'
+param existingKeyVaultPrivateDnsZoneResourceId string = ''
+param existingKeyVaultPrivateDnsZoneResourceGroupName string = ''
+param existingKeyVaultPrivateDnsZoneName string = ''
 @secure()
 param credentialEncryptionKey string
 @secure()
@@ -46,30 +91,40 @@ param bootstrapOwnerEmail string
 @secure()
 param bootstrapOwnerPasswordHash string
 
-var postgresServerName = 'pg-${resourcePrefix}-${suffix}'
-var databaseName = 'turnstile'
-var eventHubNamespaceName = 'eh-${resourcePrefix}-${suffix}'
-var eventHubName = 'token-usage'
-var workspaceName = 'log-${resourcePrefix}-${suffix}'
-var appInsightsName = 'appi-${resourcePrefix}-${suffix}'
-var keyVaultName = 'kv-${resourcePrefix}-${take(suffix, 8)}'
+var managedPostgresServerName = 'pg-${resourcePrefix}-${suffix}'
+var managedDatabaseName = 'turnstile'
+var managedEventHubNamespaceName = 'eh-${resourcePrefix}-${suffix}'
+var managedEventHubName = 'token-usage'
+var managedWorkspaceName = 'log-${resourcePrefix}-${suffix}'
+var managedAppInsightsName = 'appi-${resourcePrefix}-${suffix}'
+var managedKeyVaultName = 'kv-${resourcePrefix}-${take(suffix, 8)}'
 var planName = 'plan-${resourcePrefix}-${suffix}'
 var telemetryPlanName = 'plan-${resourcePrefix}-telemetry-${suffix}'
 var apiName = 'api-${resourcePrefix}-${suffix}'
 var functionName = 'func-${resourcePrefix}-telemetry-${suffix}'
-var virtualNetworkName = 'vnet-${resourcePrefix}-${suffix}'
+var managedVirtualNetworkName = 'vnet-${resourcePrefix}-${suffix}'
 var telemetryFunctionSubnetName = 'snet-flex-telemetry'
 var controlFunctionSubnetName = 'snet-flex-control'
 var privateEndpointSubnetName = 'snet-private-endpoints'
 var apiSubnetName = 'snet-api'
-var postgresConnectionString = 'postgresql://${postgresAdministratorLogin}:${postgresAdministratorPassword}@${postgresServerName}.postgres.database.azure.com:5432/${databaseName}?sslmode=require'
+var effectivePostgresServerName = postgresAdopted ? existingPostgresServerName : managedPostgresServerName
+var effectiveDatabaseName = postgresAdopted ? existingPostgresDatabaseName : managedDatabaseName
+var generatedPostgresConnectionString = 'postgresql://${postgresAdministratorLogin}:${postgresAdministratorPassword}@${effectivePostgresServerName}.postgres.database.azure.com:5432/${effectiveDatabaseName}?sslmode=require'
+var effectiveDatabaseUrl = useDatabaseUrlOverride ? databaseUrlOverride : generatedPostgresConnectionString
+var effectiveEventHubNamespaceName = provisionEventHub ? managedEventHubNamespaceName : existingEventHubNamespaceName
+var effectiveEventHubName = provisionEventHub ? managedEventHubName : existingEventHubName
+var effectiveEventHubNamespaceResourceGroupName = provisionEventHub ? resourceGroup().name : existingEventHubNamespaceResourceGroupName
+var effectiveWorkspaceResourceGroupName = provisionObservability ? resourceGroup().name : existingLogAnalyticsWorkspaceResourceGroupName
+var effectiveAppInsightsResourceGroupName = provisionObservability ? resourceGroup().name : existingApplicationInsightsResourceGroupName
+var effectiveKeyVaultResourceGroupName = provisionKeyVault ? resourceGroup().name : existingKeyVaultResourceGroupName
+var effectiveKeyVaultName = provisionKeyVault ? managedKeyVaultName : existingKeyVaultName
 var logAnalyticsReaderRoleDefinitionId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   '73c42c96-874c-492b-b04d-ab87d138a893'
 )
 
-resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
-  name: workspaceName
+resource managedWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = if (provisionObservability) {
+  name: managedWorkspaceName
   location: location
   properties: {
     retentionInDays: 30
@@ -81,13 +136,23 @@ resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   }
 }
 
-resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
-  name: appInsightsName
+resource existingWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = if (!provisionObservability) {
+  scope: resourceGroup(existingLogAnalyticsWorkspaceResourceGroupName)
+  name: existingLogAnalyticsWorkspaceName
+}
+
+var effectiveWorkspaceId = provisionObservability ? managedWorkspace!.id : existingWorkspace!.id
+var effectiveWorkspaceCustomerId = provisionObservability
+  ? managedWorkspace!.properties.customerId
+  : existingWorkspace!.properties.customerId
+
+resource managedAppInsights 'Microsoft.Insights/components@2020-02-02' = if (provisionObservability) {
+  name: managedAppInsightsName
   location: location
   kind: 'web'
   properties: {
     Application_Type: 'web'
-    WorkspaceResourceId: workspace.id
+    WorkspaceResourceId: managedWorkspace!.id
     RetentionInDays: 30
     DisableIpMasking: false
     publicNetworkAccessForIngestion: 'Enabled'
@@ -95,8 +160,19 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   }
 }
 
-resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
-  name: keyVaultName
+resource existingAppInsights 'Microsoft.Insights/components@2020-02-02' existing = if (!provisionObservability) {
+  scope: resourceGroup(existingApplicationInsightsResourceGroupName)
+  name: existingApplicationInsightsName
+}
+
+var effectiveAppInsightsName = provisionObservability ? managedAppInsights!.name : existingAppInsights!.name
+var effectiveAppInsightsId = provisionObservability ? managedAppInsights!.id : existingAppInsights!.id
+var effectiveAppInsightsConnectionString = provisionObservability
+  ? managedAppInsights!.properties.ConnectionString
+  : existingAppInsights!.properties.ConnectionString
+
+resource managedKeyVault 'Microsoft.KeyVault/vaults@2023-07-01' = if (provisionKeyVault) {
+  name: managedKeyVaultName
   location: location
   properties: {
     tenantId: subscription().tenantId
@@ -118,8 +194,10 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   }
 }
 
-resource postgres 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = if (provisionPostgres) {
-  name: postgresServerName
+var effectiveKeyVaultId = provisionKeyVault ? managedKeyVault!.id : existingKeyVaultResourceId
+
+resource managedPostgres 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = if (provisionPostgres) {
+  name: managedPostgresServerName
   location: postgresLocation
   sku: {
     name: postgresSkuName
@@ -151,9 +229,9 @@ resource postgres 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = if (p
   }
 }
 
-resource database 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2024-08-01' = if (provisionPostgres) {
-  parent: postgres
-  name: databaseName
+resource managedDatabase 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2024-08-01' = if (provisionPostgres) {
+  parent: managedPostgres
+  name: managedDatabaseName
   properties: {
     charset: 'UTF8'
     collation: 'en_US.utf8'
@@ -161,7 +239,7 @@ resource database 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2024-08-0
 }
 
 resource allowAzure 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2024-08-01' = if (provisionPostgres) {
-  parent: postgres
+  parent: managedPostgres
   name: 'AllowAzureServices'
   properties: {
     startIpAddress: '0.0.0.0'
@@ -169,48 +247,64 @@ resource allowAzure 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@202
   }
 }
 
-resource databaseUrlSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: keyVault
+resource databaseUrlSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (provisionKeyVault) {
+  parent: managedKeyVault
   name: 'database-url'
   properties: {
-    value: postgresConnectionString
+    value: effectiveDatabaseUrl
   }
 }
 
-resource credentialKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: keyVault
+resource credentialKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (provisionKeyVault) {
+  parent: managedKeyVault
   name: 'credential-encryption-key'
   properties: {
     value: credentialEncryptionKey
   }
 }
 
-resource managementKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: keyVault
+resource managementKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (provisionKeyVault) {
+  parent: managedKeyVault
   name: 'management-api-key'
   properties: {
     value: managementApiKey
   }
 }
 
-resource apimKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: keyVault
+resource apimKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (provisionKeyVault) {
+  parent: managedKeyVault
   name: 'apim-subscription-key'
   properties: {
     value: apimSubscriptionKey
   }
 }
 
-resource apimProbeKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: keyVault
+resource apimProbeKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (provisionKeyVault) {
+  parent: managedKeyVault
   name: 'apim-probe-subscription-key'
   properties: {
     value: apimProbeSubscriptionKey
   }
 }
 
-resource eventHubNamespace 'Microsoft.EventHub/namespaces@2024-01-01' = {
-  name: eventHubNamespaceName
+var effectiveDatabaseUrlSecretUri = provisionKeyVault
+  ? databaseUrlSecret!.properties.secretUri
+  : existingDatabaseUrlSecretUri
+var effectiveCredentialEncryptionKeySecretUri = provisionKeyVault
+  ? credentialKeySecret!.properties.secretUri
+  : existingCredentialEncryptionKeySecretUri
+var effectiveManagementApiKeySecretUri = provisionKeyVault
+  ? managementKeySecret!.properties.secretUri
+  : existingManagementApiKeySecretUri
+var effectiveApimSubscriptionKeySecretUri = provisionKeyVault
+  ? apimKeySecret!.properties.secretUri
+  : existingApimSubscriptionKeySecretUri
+var effectiveApimProbeSubscriptionKeySecretUri = provisionKeyVault
+  ? apimProbeKeySecret!.properties.secretUri
+  : existingApimProbeSubscriptionKeySecretUri
+
+resource managedEventHubNamespace 'Microsoft.EventHub/namespaces@2024-01-01' = if (provisionEventHub) {
+  name: managedEventHubNamespaceName
   location: location
   sku: {
     name: 'Standard'
@@ -224,17 +318,24 @@ resource eventHubNamespace 'Microsoft.EventHub/namespaces@2024-01-01' = {
   }
 }
 
-resource usageEventHub 'Microsoft.EventHub/namespaces/eventhubs@2024-01-01' = {
-  parent: eventHubNamespace
-  name: eventHubName
+resource managedUsageEventHub 'Microsoft.EventHub/namespaces/eventhubs@2024-01-01' = if (provisionEventHub) {
+  parent: managedEventHubNamespace
+  name: managedEventHubName
   properties: {
     messageRetentionInDays: 7
     partitionCount: 4
   }
 }
 
-resource virtualNetwork 'Microsoft.Network/virtualNetworks@2024-05-01' = {
-  name: virtualNetworkName
+var effectiveEventHubNamespaceResourceId = provisionEventHub
+  ? managedEventHubNamespace!.id
+  : existingEventHubNamespaceResourceId
+var effectiveEventHubResourceId = provisionEventHub
+  ? managedUsageEventHub!.id
+  : existingEventHubResourceId
+
+resource managedVirtualNetwork 'Microsoft.Network/virtualNetworks@2024-05-01' = if (provisionNetwork) {
+  name: managedVirtualNetworkName
   location: location
   properties: {
     addressSpace: {
@@ -245,8 +346,8 @@ resource virtualNetwork 'Microsoft.Network/virtualNetworks@2024-05-01' = {
   }
 }
 
-resource telemetryFunctionSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = {
-  parent: virtualNetwork
+resource managedTelemetryFunctionSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = if (provisionNetwork) {
+  parent: managedVirtualNetwork
   name: telemetryFunctionSubnetName
   properties: {
     addressPrefix: '10.42.3.0/27'
@@ -259,13 +360,10 @@ resource telemetryFunctionSubnet 'Microsoft.Network/virtualNetworks/subnets@2024
       }
     ]
   }
-  dependsOn: [
-    virtualNetwork
-  ]
 }
 
-resource controlFunctionSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = {
-  parent: virtualNetwork
+resource managedControlFunctionSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = if (provisionNetwork) {
+  parent: managedVirtualNetwork
   name: controlFunctionSubnetName
   properties: {
     addressPrefix: '10.42.3.32/27'
@@ -279,24 +377,24 @@ resource controlFunctionSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-0
     ]
   }
   dependsOn: [
-    telemetryFunctionSubnet
+    managedTelemetryFunctionSubnet
   ]
 }
 
-resource privateEndpointSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = {
-  parent: virtualNetwork
+resource managedPrivateEndpointSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = if (provisionNetwork) {
+  parent: managedVirtualNetwork
   name: privateEndpointSubnetName
   properties: {
     addressPrefix: '10.42.2.0/24'
     privateEndpointNetworkPolicies: 'Disabled'
   }
   dependsOn: [
-    controlFunctionSubnet
+    managedControlFunctionSubnet
   ]
 }
 
-resource apiSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = {
-  parent: virtualNetwork
+resource managedApiSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = if (provisionNetwork) {
+  parent: managedVirtualNetwork
   name: apiSubnetName
   properties: {
     addressPrefix: '10.42.3.64/27'
@@ -310,16 +408,38 @@ resource apiSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = {
     ]
   }
   dependsOn: [
-    privateEndpointSubnet
+    managedPrivateEndpointSubnet
   ]
 }
-module keyVaultPrivateEndpoint 'key-vault-private-endpoint.bicep' = {
-  name: 'finops-key-vault-private-endpoint'
+
+var effectiveVirtualNetworkResourceId = provisionNetwork
+  ? managedVirtualNetwork!.id
+  : existingVirtualNetworkResourceId
+var effectiveTelemetryFunctionSubnetResourceId = provisionNetwork
+  ? managedTelemetryFunctionSubnet!.id
+  : existingTelemetryFunctionSubnetResourceId
+var effectiveControlFunctionSubnetResourceId = provisionNetwork
+  ? managedControlFunctionSubnet!.id
+  : existingControlFunctionSubnetResourceId
+var effectivePrivateEndpointSubnetResourceId = provisionNetwork
+  ? managedPrivateEndpointSubnet!.id
+  : existingPrivateEndpointSubnetResourceId
+var effectiveApiSubnetResourceId = provisionNetwork
+  ? managedApiSubnet!.id
+  : existingApiSubnetResourceId
+
+module keyVaultPrivateEndpoint 'key-vault-private-endpoint.bicep' = if (provisionKeyVault) {
+  name: '${resourcePrefix}-key-vault-private-endpoint'
   params: {
     location: location
-    keyVaultName: keyVault.name
-    virtualNetworkName: virtualNetwork.name
-    privateEndpointSubnetName: privateEndpointSubnet.name
+    keyVaultName: managedKeyVault!.name
+    keyVaultResourceGroupName: resourceGroup().name
+    virtualNetworkResourceId: effectiveVirtualNetworkResourceId
+    privateEndpointSubnetResourceId: effectivePrivateEndpointSubnetResourceId
+    provisionPrivateDnsZone: provisionKeyVaultPrivateDnsZone
+    privateDnsLinkName: keyVaultPrivateDnsLinkName
+    existingPrivateDnsZoneResourceGroupName: existingKeyVaultPrivateDnsZoneResourceGroupName
+    existingPrivateDnsZoneName: existingKeyVaultPrivateDnsZoneName
   }
 }
 
@@ -379,7 +499,7 @@ resource api 'Microsoft.Web/sites@2024-11-01' = {
         { name: 'PYTHONPATH', value: '/home/site/wwwroot:/home/site/wwwroot/.python_packages/lib/site-packages' }
         { name: 'WEBSITES_PORT', value: '8000' }
         { name: 'WEBSITES_CONTAINER_START_TIME_LIMIT', value: '1800' }
-        { name: 'DATABASE_URL', value: postgresConnectionString }
+        { name: 'DATABASE_URL', value: effectiveDatabaseUrl }
         { name: 'DATA_BACKEND', value: 'postgresql' }
         { name: 'CREDENTIAL_ENCRYPTION_KEY', value: credentialEncryptionKey }
         { name: 'MANAGEMENT_API_KEY', value: managementApiKey }
@@ -405,7 +525,7 @@ resource api 'Microsoft.Web/sites@2024-11-01' = {
         { name: 'BOOTSTRAP_OWNER_EMAIL', value: bootstrapOwnerEmail }
         { name: 'BOOTSTRAP_OWNER_PASSWORD_HASH', value: bootstrapOwnerPasswordHash }
         { name: 'PRODUCTION', value: 'true' }
-        { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsights.properties.ConnectionString }
+        { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: effectiveAppInsightsConnectionString }
         { name: 'TRAFFIC_GENERATION_BUDGET_USD', value: '20' }
         { name: 'WEB_DIST_DIR', value: 'frontend/dist' }
         { name: 'MIGRATIONS_DIR', value: 'migrations' }
@@ -418,7 +538,7 @@ resource apiVnetIntegration 'Microsoft.Web/sites/networkConfig@2024-11-01' = {
   parent: api
   name: 'virtualNetwork'
   properties: {
-    subnetResourceId: apiSubnet.id
+    subnetResourceId: effectiveApiSubnetResourceId
     swiftSupported: true
   }
 }
@@ -465,20 +585,20 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
         { name: 'AzureWebJobsStorage__queueServiceUri', value: telemetryQueueEndpoint }
         { name: 'AzureWebJobsStorage__tableServiceUri', value: telemetryTableEndpoint }
         { name: 'AzureWebJobsStorage__credential', value: 'managedidentity' }
-        { name: 'EVENT_HUB_NAME', value: eventHubName }
-        { name: 'EVENT_HUB_CONNECTION__fullyQualifiedNamespace', value: '${eventHubNamespace.name}.servicebus.windows.net' }
+        { name: 'EVENT_HUB_NAME', value: effectiveEventHubName }
+        { name: 'EVENT_HUB_CONNECTION__fullyQualifiedNamespace', value: '${effectiveEventHubNamespaceName}.servicebus.windows.net' }
         { name: 'EVENT_HUB_CONNECTION__credential', value: 'managedidentity' }
-        { name: 'DATABASE_URL', value: postgresConnectionString }
+        { name: 'DATABASE_URL', value: effectiveDatabaseUrl }
         { name: 'DATA_BACKEND', value: 'postgresql' }
         { name: 'PRODUCTION', value: 'true' }
-        { name: 'LOG_ANALYTICS_WORKSPACE_ID', value: workspace.properties.customerId }
+        { name: 'LOG_ANALYTICS_WORKSPACE_ID', value: effectiveWorkspaceCustomerId }
         { name: 'APIM_API_ID', value: apimApiId }
         { name: 'CACHE_READ_BACKFILL_HOURS', value: '720' }
         { name: 'CACHE_READ_OVERLAP_HOURS', value: '24' }
         { name: 'LEDGER_SYNC_ENABLED', value: 'true' }
         { name: 'LEDGER_TABLE_ENDPOINT', value: ledgerTableEndpoint }
         { name: 'LEDGER_TABLE_NAME', value: ledgerTableName }
-        { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsights.properties.ConnectionString }
+        { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: effectiveAppInsightsConnectionString }
       ]
     }
   }
@@ -488,14 +608,14 @@ resource functionVnetIntegration 'Microsoft.Web/sites/networkConfig@2024-11-01' 
   parent: functionApp
   name: 'virtualNetwork'
   properties: {
-    subnetResourceId: telemetryFunctionSubnet.id
+    subnetResourceId: effectiveTelemetryFunctionSubnetResourceId
     swiftSupported: true
   }
 }
 
-resource apiKeyVaultRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(keyVault.id, api.id, 'key-vault-secrets-user')
-  scope: keyVault
+resource apiKeyVaultRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (provisionKeyVault) {
+  name: guid(managedKeyVault!.id, api.id, 'key-vault-secrets-user')
+  scope: managedKeyVault
   properties: {
     principalId: api.identity.principalId
     principalType: 'ServicePrincipal'
@@ -503,9 +623,9 @@ resource apiKeyVaultRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
   }
 }
 
-resource functionKeyVaultRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(keyVault.id, functionApp.id, 'key-vault-secrets-user')
-  scope: keyVault
+resource functionKeyVaultRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (provisionKeyVault) {
+  name: guid(managedKeyVault!.id, functionApp.id, 'key-vault-secrets-user')
+  scope: managedKeyVault
   properties: {
     principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
@@ -513,9 +633,9 @@ resource functionKeyVaultRole 'Microsoft.Authorization/roleAssignments@2022-04-0
   }
 }
 
-resource functionEventHubReceiver 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(usageEventHub.id, functionApp.id, 'event-hubs-data-receiver')
-  scope: usageEventHub
+resource functionEventHubReceiver 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (provisionEventHub) {
+  name: guid(managedUsageEventHub!.id, functionApp.id, 'event-hubs-data-receiver')
+  scope: managedUsageEventHub
   properties: {
     principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
@@ -523,9 +643,9 @@ resource functionEventHubReceiver 'Microsoft.Authorization/roleAssignments@2022-
   }
 }
 
-resource functionLogAnalyticsReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(workspace.id, functionApp.id, 'log-analytics-reader')
-  scope: workspace
+resource functionLogAnalyticsReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (provisionObservability) {
+  name: guid(managedWorkspace!.id, functionApp.id, 'log-analytics-reader')
+  scope: managedWorkspace
   properties: {
     principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
@@ -533,9 +653,9 @@ resource functionLogAnalyticsReader 'Microsoft.Authorization/roleAssignments@202
   }
 }
 
-resource apimEventHubSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(usageEventHub.id, apimPrincipalId, 'event-hubs-data-sender')
-  scope: usageEventHub
+resource apimEventHubSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (provisionEventHub) {
+  name: guid(managedUsageEventHub!.id, apimPrincipalId, 'event-hubs-data-sender')
+  scope: managedUsageEventHub
   properties: {
     principalId: apimPrincipalId
     principalType: 'ServicePrincipal'
@@ -543,22 +663,61 @@ resource apimEventHubSender 'Microsoft.Authorization/roleAssignments@2022-04-01'
   }
 }
 
-output postgresServerName string = postgresServerName
-output postgresFqdn string = '${postgresServerName}.postgres.database.azure.com'
-output databaseName string = databaseName
-output eventHubNamespaceResourceId string = eventHubNamespace.id
-output eventHubNamespaceName string = eventHubNamespace.name
-output eventHubName string = usageEventHub.name
-output applicationInsightsName string = appInsights.name
-output applicationInsightsConnectionString string = appInsights.properties.ConnectionString
+output postgresServerName string = effectivePostgresServerName
+output postgresServerResourceId string = postgresAdopted
+  ? existingPostgresServerResourceId
+  : resourceId('Microsoft.DBforPostgreSQL/flexibleServers', managedPostgresServerName)
+output postgresFqdn string = '${effectivePostgresServerName}.postgres.database.azure.com'
+output databaseName string = effectiveDatabaseName
+output postgresProvisioned bool = !postgresAdopted
+output eventHubNamespaceResourceId string = effectiveEventHubNamespaceResourceId
+output eventHubResourceId string = effectiveEventHubResourceId
+output eventHubNamespaceResourceGroupName string = effectiveEventHubNamespaceResourceGroupName
+output eventHubNamespaceName string = effectiveEventHubNamespaceName
+output eventHubName string = effectiveEventHubName
+output eventHubProvisioned bool = provisionEventHub
+output logAnalyticsWorkspaceResourceId string = effectiveWorkspaceId
+output logAnalyticsWorkspaceResourceGroupName string = effectiveWorkspaceResourceGroupName
+output logAnalyticsWorkspaceName string = provisionObservability ? managedWorkspace!.name : existingWorkspace!.name
+output applicationInsightsResourceId string = effectiveAppInsightsId
+output applicationInsightsResourceGroupName string = effectiveAppInsightsResourceGroupName
+output applicationInsightsName string = effectiveAppInsightsName
+output applicationInsightsConnectionString string = effectiveAppInsightsConnectionString
+output observabilityProvisioned bool = provisionObservability
 output telemetryStorageName string = telemetryStorageName
 output ledgerStorageName string = ledgerStorageName
 output ledgerTableEndpoint string = ledgerTableEndpoint
-output keyVaultName string = keyVault.name
-output databaseUrlSecretUri string = databaseUrlSecret.properties.secretUri
-output apimSubscriptionKeySecretUri string = apimKeySecret.properties.secretUri
-output apimProbeSubscriptionKeySecretUri string = apimProbeKeySecret.properties.secretUri
-output credentialEncryptionKeySecretUri string = credentialKeySecret.properties.secretUri
+output keyVaultResourceId string = effectiveKeyVaultId
+output keyVaultResourceGroupName string = effectiveKeyVaultResourceGroupName
+output keyVaultName string = effectiveKeyVaultName
+output keyVaultProvisioned bool = provisionKeyVault
+output databaseUrlSecretUri string = effectiveDatabaseUrlSecretUri
+output databaseUrlSecretResourceId string = provisionKeyVault ? databaseUrlSecret!.id : existingDatabaseUrlResourceId
+output managementApiKeySecretUri string = effectiveManagementApiKeySecretUri
+output managementApiKeySecretResourceId string = provisionKeyVault ? managementKeySecret!.id : existingManagementKeyResourceId
+output apimSubscriptionKeySecretUri string = effectiveApimSubscriptionKeySecretUri
+output apimSubscriptionKeySecretResourceId string = provisionKeyVault ? apimKeySecret!.id : existingApimKeyResourceId
+output apimProbeSubscriptionKeySecretUri string = effectiveApimProbeSubscriptionKeySecretUri
+output apimProbeSubscriptionKeySecretResourceId string = provisionKeyVault ? apimProbeKeySecret!.id : existingApimProbeKeyResourceId
+output credentialEncryptionKeySecretUri string = effectiveCredentialEncryptionKeySecretUri
+output credentialEncryptionKeySecretResourceId string = provisionKeyVault ? credentialKeySecret!.id : existingCredentialKeyResourceId
+output virtualNetworkResourceId string = effectiveVirtualNetworkResourceId
+output telemetryFunctionSubnetResourceId string = effectiveTelemetryFunctionSubnetResourceId
+output controlFunctionSubnetResourceId string = effectiveControlFunctionSubnetResourceId
+output privateEndpointSubnetResourceId string = effectivePrivateEndpointSubnetResourceId
+output apiSubnetResourceId string = effectiveApiSubnetResourceId
+output networkProvisioned bool = provisionNetwork
+output keyVaultPrivateEndpointId string = provisionKeyVault ? keyVaultPrivateEndpoint!.outputs.privateEndpointId : ''
+output keyVaultPrivateDnsZoneId string = provisionKeyVault
+  ? keyVaultPrivateEndpoint!.outputs.privateDnsZoneId
+  : existingKeyVaultPrivateDnsZoneResourceId
+output keyVaultPrivateDnsZoneName string = provisionKeyVault
+  ? keyVaultPrivateEndpoint!.outputs.privateDnsZoneName
+  : existingKeyVaultPrivateDnsZoneName
+output keyVaultPrivateDnsZoneProvisioned bool = provisionKeyVault && provisionKeyVaultPrivateDnsZone
+output keyVaultPrivateDnsLinkName string = provisionKeyVault ? keyVaultPrivateEndpoint!.outputs.privateDnsLinkName : ''
+output keyVaultPrivateDnsLinkId string = provisionKeyVault ? keyVaultPrivateEndpoint!.outputs.privateDnsLinkId : ''
+output keyVaultPrivateDnsLinkProvisioned bool = provisionKeyVault && provisionKeyVaultPrivateDnsZone
 output appServicePlanName string = apiPlan.name
 output telemetryFunctionPlanName string = telemetryPlan.name
 output telemetryDeploymentContainerName string = telemetryDeploymentContainerName

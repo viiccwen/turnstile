@@ -4,6 +4,7 @@ import argparse
 import csv
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import tempfile
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from collections import Counter
@@ -46,7 +48,7 @@ from scripts.stage_deployment import REPOSITORY_ROOT, stage_deployment, validate
 
 JsonObject = dict[str, Any]
 PasswordReader = Callable[[str], str]
-SECRET_PARAMETER_NAMES = {
+GENERATED_SECRET_PARAMETER_NAMES = {
     "postgresAdministratorPassword",
     "credentialEncryptionKey",
     "managementApiKey",
@@ -54,7 +56,8 @@ SECRET_PARAMETER_NAMES = {
     "apimProbeSubscriptionKey",
     "bootstrapOwnerPasswordHash",
 }
-STATE_SECRET_NAMES = SECRET_PARAMETER_NAMES | {"observerAdapterSharedKey"}
+SECRET_PARAMETER_NAMES = GENERATED_SECRET_PARAMETER_NAMES | {"databaseUrlOverride"}
+STATE_SECRET_NAMES = GENERATED_SECRET_PARAMETER_NAMES | {"observerAdapterSharedKey"}
 EXPECTED_FUNCTIONS = {
     "telemetryFunctionName": {
         "telemetry_health",
@@ -75,17 +78,410 @@ DEFAULT_POSTGRES_TIER = "Burstable"
 DEFAULT_OBSERVER_PLAN_SKU_NAME = "P0v3"
 DEFAULT_OBSERVER_PLAN_WORKER_COUNT = 1
 OBSERVER_PLAN_SKU_NAMES = frozenset({"P0v3", "P1v3", "P2v3", "P3v3"})
-OBSERVER_ORCHESTRATOR_PARAMETERS = {
+ORCHESTRATOR_PARAMETERS = {
     "observerPlanSkuName",
     "observerPlanWorkerCount",
+    "foundryCognitiveServicesAccountResourceId",
+    "existingVirtualNetworkResourceId",
+    "existingTelemetryFunctionSubnetResourceId",
+    "existingControlPlaneFunctionSubnetResourceId",
+    "existingPrivateEndpointSubnetResourceId",
+    "existingApiSubnetResourceId",
+    "existingKeyVaultPrivateDnsZoneResourceId",
+    "existingPostgresServerResourceId",
+    "existingPostgresDatabaseName",
+    "existingEventHubResourceId",
+    "existingLogAnalyticsWorkspaceResourceId",
+    "existingApplicationInsightsResourceId",
+    "existingKeyVaultResourceId",
+    "existingDatabaseUrlSecretUri",
+    "existingCredentialEncryptionKeySecretUri",
+    "existingManagementApiKeySecretUri",
+    "existingApimSubscriptionKeySecretUri",
+    "existingApimProbeSubscriptionKeySecretUri",
 }
 DEFAULT_TELEMETRY_DEPLOYMENT_CONTAINER = "turnstile-telemetry-deploy"
 DEFAULT_CONTROL_PLANE_DEPLOYMENT_CONTAINER = "turnstile-control-deploy"
 DEFAULT_LEDGER_TABLE_NAME = "TurnstileLedger"
+STORAGE_BLOB_DATA_OWNER_ROLE_ID = "b7e6dc6d-f1e8-4753-8033-0f276bb0955b"
+STORAGE_TABLE_DATA_CONTRIBUTOR_ROLE_ID = "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3"
+COGNITIVE_SERVICES_USER_ROLE_ID = "a97b65f3-24c7-4388-baec-2e87135dc908"
+EVENT_HUB_DATA_RECEIVER_ROLE_ID = "a638d3c7-ab3a-418d-83e6-5f17a39d4fde"
+EVENT_HUB_DATA_SENDER_ROLE_ID = "2b629674-e913-4c01-ae53-ef4638d8f975"
+LOG_ANALYTICS_READER_ROLE_ID = "73c42c96-874c-492b-b04d-ab87d138a893"
+KEY_VAULT_SECRETS_USER_ROLE_ID = "4633458b-17de-408a-b874-0445c86b69e6"
+ADOPTED_SECRET_FIELDS = {
+    "databaseUrlOverride": "databaseUrl",
+    "credentialEncryptionKey": "credentialEncryptionKey",
+    "managementApiKey": "managementApiKey",
+    "apimSubscriptionKey": "apimSubscriptionKey",
+    "apimProbeSubscriptionKey": "apimProbeSubscriptionKey",
+}
+EXISTING_RESOURCE_API_VERSIONS = {
+    "microsoft.network/virtualnetworks": "2024-05-01",
+    "microsoft.network/privatednszones": "2024-06-01",
+    "microsoft.dbforpostgresql/flexibleservers": "2024-08-01",
+    "microsoft.eventhub/namespaces": "2024-01-01",
+    "microsoft.eventhub/namespaces/eventhubs": "2024-01-01",
+    "microsoft.operationalinsights/workspaces": "2023-09-01",
+    "microsoft.insights/components": "2020-02-02",
+    "microsoft.keyvault/vaults": "2023-07-01",
+}
 
 
 class DeploymentError(RuntimeError):
     pass
+
+
+def _adoption_values(
+    parameters: Mapping[str, Any], names: Sequence[str], label: str
+) -> dict[str, str] | None:
+    values: dict[str, str] = {}
+    for name in names:
+        raw = parameters.get(name, "")
+        if not isinstance(raw, str):
+            raise DeploymentError(f"Parameter {name} must be a string")
+        values[name] = raw.strip().rstrip("/")
+    configured = [name for name, value in values.items() if value]
+    if not configured:
+        return None
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise DeploymentError(
+            f"{label} adoption requires all parameters; missing: {', '.join(missing)}"
+        )
+    return values
+
+
+def _match_resource_id(
+    parameter: str,
+    value: str,
+    subscription: str,
+    provider_path_pattern: str,
+) -> re.Match[str]:
+    match = re.fullmatch(
+        r"/subscriptions/(?P<subscription>[^/]+)/resourceGroups/"
+        r"(?P<resource_group>[^/]+)/providers/" + provider_path_pattern,
+        value,
+        re.IGNORECASE,
+    )
+    if match is None:
+        raise DeploymentError(f"Parameter {parameter} has an unexpected Azure resource type")
+    if match.group("subscription").casefold() != subscription.casefold():
+        raise DeploymentError(f"Parameter {parameter} must be in the deployment subscription")
+    return match
+
+
+@dataclass(frozen=True)
+class ExistingNetwork:
+    virtual_network_resource_id: str
+    resource_group_name: str
+    virtual_network_name: str
+    telemetry_subnet_resource_id: str
+    control_plane_subnet_resource_id: str
+    private_endpoint_subnet_resource_id: str
+    api_subnet_resource_id: str
+    private_dns_zone_resource_id: str | None
+    private_dns_zone_resource_group_name: str | None
+    private_dns_zone_name: str | None
+
+    @classmethod
+    def from_parameters(
+        cls, parameters: Mapping[str, Any], subscription: str
+    ) -> ExistingNetwork | None:
+        names = (
+            "existingVirtualNetworkResourceId",
+            "existingTelemetryFunctionSubnetResourceId",
+            "existingControlPlaneFunctionSubnetResourceId",
+            "existingPrivateEndpointSubnetResourceId",
+            "existingApiSubnetResourceId",
+        )
+        values = _adoption_values(parameters, names, "Existing network")
+        raw_zone = parameters.get("existingKeyVaultPrivateDnsZoneResourceId", "")
+        if not isinstance(raw_zone, str):
+            raise DeploymentError(
+                "Parameter existingKeyVaultPrivateDnsZoneResourceId must be a string"
+            )
+        zone_id = raw_zone.strip().rstrip("/") or None
+        if values is None:
+            if zone_id is not None:
+                raise DeploymentError(
+                    "existingKeyVaultPrivateDnsZoneResourceId requires existing network adoption"
+                )
+            return None
+
+        vnet_id = values["existingVirtualNetworkResourceId"]
+        vnet_match = _match_resource_id(
+            "existingVirtualNetworkResourceId",
+            vnet_id,
+            subscription,
+            r"Microsoft\.Network/virtualNetworks/(?P<virtual_network>[^/]+)",
+        )
+        expected_subnet_prefix = f"{vnet_id}/subnets/".casefold()
+        subnet_ids = [values[name] for name in names[1:]]
+        if len({item.casefold() for item in subnet_ids}) != len(subnet_ids):
+            raise DeploymentError("Existing network adoption requires four distinct subnets")
+        for name in names[1:]:
+            subnet_id = values[name]
+            _match_resource_id(
+                name,
+                subnet_id,
+                subscription,
+                r"Microsoft\.Network/virtualNetworks/[^/]+/subnets/[^/]+",
+            )
+            if not subnet_id.casefold().startswith(expected_subnet_prefix):
+                raise DeploymentError(f"Parameter {name} must belong to the configured VNet")
+
+        zone_group: str | None = None
+        zone_name: str | None = None
+        if zone_id is not None:
+            zone_match = _match_resource_id(
+                "existingKeyVaultPrivateDnsZoneResourceId",
+                zone_id,
+                subscription,
+                r"Microsoft\.Network/privateDnsZones/(?P<zone>[^/]+)",
+            )
+            zone_group = zone_match.group("resource_group")
+            zone_name = zone_match.group("zone")
+            if zone_name.casefold() != "privatelink.vaultcore.azure.net":
+                raise DeploymentError(
+                    "existingKeyVaultPrivateDnsZoneResourceId must identify "
+                    "privatelink.vaultcore.azure.net"
+                )
+
+        return cls(
+            virtual_network_resource_id=vnet_id,
+            resource_group_name=vnet_match.group("resource_group"),
+            virtual_network_name=vnet_match.group("virtual_network"),
+            telemetry_subnet_resource_id=values[
+                "existingTelemetryFunctionSubnetResourceId"
+            ],
+            control_plane_subnet_resource_id=values[
+                "existingControlPlaneFunctionSubnetResourceId"
+            ],
+            private_endpoint_subnet_resource_id=values[
+                "existingPrivateEndpointSubnetResourceId"
+            ],
+            api_subnet_resource_id=values["existingApiSubnetResourceId"],
+            private_dns_zone_resource_id=zone_id,
+            private_dns_zone_resource_group_name=zone_group,
+            private_dns_zone_name=zone_name,
+        )
+
+
+@dataclass(frozen=True)
+class ExistingPostgres:
+    server_resource_id: str
+    resource_group_name: str
+    server_name: str
+    database_name: str
+
+    @classmethod
+    def from_parameters(
+        cls, parameters: Mapping[str, Any], subscription: str
+    ) -> ExistingPostgres | None:
+        values = _adoption_values(
+            parameters,
+            ("existingPostgresServerResourceId", "existingPostgresDatabaseName"),
+            "Existing PostgreSQL",
+        )
+        if values is None:
+            return None
+        resource_id = values["existingPostgresServerResourceId"]
+        match = _match_resource_id(
+            "existingPostgresServerResourceId",
+            resource_id,
+            subscription,
+            r"Microsoft\.DBforPostgreSQL/flexibleServers/(?P<server>[^/]+)",
+        )
+        return cls(
+            server_resource_id=resource_id,
+            resource_group_name=match.group("resource_group"),
+            server_name=match.group("server"),
+            database_name=values["existingPostgresDatabaseName"],
+        )
+
+
+@dataclass(frozen=True)
+class ExistingEventHub:
+    resource_id: str
+    namespace_resource_id: str
+    resource_group_name: str
+    namespace_name: str
+    name: str
+
+    @classmethod
+    def from_parameters(
+        cls, parameters: Mapping[str, Any], subscription: str
+    ) -> ExistingEventHub | None:
+        raw = parameters.get("existingEventHubResourceId", "")
+        if not isinstance(raw, str):
+            raise DeploymentError("Parameter existingEventHubResourceId must be a string")
+        resource_id = raw.strip().rstrip("/")
+        if not resource_id:
+            return None
+        match = _match_resource_id(
+            "existingEventHubResourceId",
+            resource_id,
+            subscription,
+            r"Microsoft\.EventHub/namespaces/(?P<namespace>[^/]+)/"
+            r"eventhubs/(?P<event_hub>[^/]+)",
+        )
+        event_hub_marker = resource_id.casefold().rfind("/eventhubs/")
+        return cls(
+            resource_id=resource_id,
+            namespace_resource_id=resource_id[:event_hub_marker],
+            resource_group_name=match.group("resource_group"),
+            namespace_name=match.group("namespace"),
+            name=match.group("event_hub"),
+        )
+
+
+@dataclass(frozen=True)
+class ExistingObservability:
+    workspace_resource_id: str
+    workspace_resource_group_name: str
+    workspace_name: str
+    application_insights_resource_id: str
+    application_insights_resource_group_name: str
+    application_insights_name: str
+
+    @classmethod
+    def from_parameters(
+        cls, parameters: Mapping[str, Any], subscription: str
+    ) -> ExistingObservability | None:
+        values = _adoption_values(
+            parameters,
+            (
+                "existingLogAnalyticsWorkspaceResourceId",
+                "existingApplicationInsightsResourceId",
+            ),
+            "Existing observability",
+        )
+        if values is None:
+            return None
+        workspace_id = values["existingLogAnalyticsWorkspaceResourceId"]
+        workspace = _match_resource_id(
+            "existingLogAnalyticsWorkspaceResourceId",
+            workspace_id,
+            subscription,
+            r"Microsoft\.OperationalInsights/workspaces/(?P<workspace>[^/]+)",
+        )
+        app_insights_id = values["existingApplicationInsightsResourceId"]
+        app_insights = _match_resource_id(
+            "existingApplicationInsightsResourceId",
+            app_insights_id,
+            subscription,
+            r"Microsoft\.Insights/components/(?P<app_insights>[^/]+)",
+        )
+        return cls(
+            workspace_resource_id=workspace_id,
+            workspace_resource_group_name=workspace.group("resource_group"),
+            workspace_name=workspace.group("workspace"),
+            application_insights_resource_id=app_insights_id,
+            application_insights_resource_group_name=app_insights.group(
+                "resource_group"
+            ),
+            application_insights_name=app_insights.group("app_insights"),
+        )
+
+
+@dataclass(frozen=True)
+class KeyVaultSecretReference:
+    uri: str
+    name: str
+    resource_id: str
+
+
+def _key_vault_secret_reference(
+    parameter: str, uri: str, vault_name: str, vault_resource_id: str
+) -> KeyVaultSecretReference:
+    parsed = urllib.parse.urlparse(uri)
+    allowed_hosts = {
+        f"{vault_name}.vault.azure.net",
+        f"{vault_name}.vault.azure.cn",
+        f"{vault_name}.vault.usgovcloudapi.net",
+        f"{vault_name}.vault.microsoftazure.de",
+    }
+    if (
+        parsed.scheme.casefold() != "https"
+        or (parsed.hostname or "").casefold()
+        not in {host.casefold() for host in allowed_hosts}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise DeploymentError(f"Parameter {parameter} must be a Key Vault secret URI")
+    segments = [urllib.parse.unquote(item) for item in parsed.path.split("/") if item]
+    if (
+        len(segments) not in {2, 3}
+        or segments[0].casefold() != "secrets"
+        or not re.fullmatch(r"[A-Za-z0-9-]+", segments[1])
+    ):
+        raise DeploymentError(f"Parameter {parameter} must identify one Key Vault secret")
+    return KeyVaultSecretReference(
+        uri=uri,
+        name=segments[1],
+        resource_id=f"{vault_resource_id}/secrets/{segments[1]}",
+    )
+
+
+@dataclass(frozen=True)
+class ExistingKeyVault:
+    resource_id: str
+    resource_group_name: str
+    name: str
+    database_url: KeyVaultSecretReference
+    credential_encryption_key: KeyVaultSecretReference
+    management_api_key: KeyVaultSecretReference
+    apim_subscription_key: KeyVaultSecretReference
+    apim_probe_subscription_key: KeyVaultSecretReference
+
+    @classmethod
+    def from_parameters(
+        cls, parameters: Mapping[str, Any], subscription: str
+    ) -> ExistingKeyVault | None:
+        names = (
+            "existingKeyVaultResourceId",
+            "existingDatabaseUrlSecretUri",
+            "existingCredentialEncryptionKeySecretUri",
+            "existingManagementApiKeySecretUri",
+            "existingApimSubscriptionKeySecretUri",
+            "existingApimProbeSubscriptionKeySecretUri",
+        )
+        values = _adoption_values(parameters, names, "Existing Key Vault")
+        if values is None:
+            return None
+        resource_id = values["existingKeyVaultResourceId"]
+        match = _match_resource_id(
+            "existingKeyVaultResourceId",
+            resource_id,
+            subscription,
+            r"Microsoft\.KeyVault/vaults/(?P<vault>[^/]+)",
+        )
+        vault_name = match.group("vault")
+
+        def secret(parameter: str) -> KeyVaultSecretReference:
+            return _key_vault_secret_reference(
+                parameter, values[parameter], vault_name, resource_id
+            )
+
+        return cls(
+            resource_id=resource_id,
+            resource_group_name=match.group("resource_group"),
+            name=vault_name,
+            database_url=secret("existingDatabaseUrlSecretUri"),
+            credential_encryption_key=secret(
+                "existingCredentialEncryptionKeySecretUri"
+            ),
+            management_api_key=secret("existingManagementApiKeySecretUri"),
+            apim_subscription_key=secret("existingApimSubscriptionKeySecretUri"),
+            apim_probe_subscription_key=secret(
+                "existingApimProbeSubscriptionKeySecretUri"
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -101,6 +497,13 @@ class DeploymentInputs:
     postgres_tier: str
     observer_plan_sku_name: str
     observer_plan_worker_count: int
+    foundry_resource_id: str | None
+    existing_network: ExistingNetwork | None
+    existing_postgres: ExistingPostgres | None
+    existing_event_hub: ExistingEventHub | None
+    existing_observability: ExistingObservability | None
+    existing_key_vault: ExistingKeyVault | None
+    adopted_secrets: dict[str, str] | None
     owner_email: str
     state_path: Path
 
@@ -118,6 +521,28 @@ class DeploymentInputs:
             raise DeploymentError(f"Invalid ARM parameter file: {parameters_path}") from error
         if not isinstance(raw_parameters, dict):
             raise DeploymentError("The ARM parameter file must contain a parameters object")
+        raw_adopted_secrets = document.get("adoptedSecrets")
+        adopted_secrets: dict[str, str] | None = None
+        if raw_adopted_secrets is not None:
+            if not isinstance(raw_adopted_secrets, dict):
+                raise DeploymentError("adoptedSecrets must contain one JSON object")
+            expected_secret_fields = set(ADOPTED_SECRET_FIELDS.values())
+            configured_secret_fields = set(raw_adopted_secrets)
+            if configured_secret_fields != expected_secret_fields:
+                raise DeploymentError(
+                    "adoptedSecrets must contain exactly: "
+                    + ", ".join(sorted(expected_secret_fields))
+                )
+            if not all(
+                isinstance(raw_adopted_secrets[name], str)
+                and raw_adopted_secrets[name]
+                for name in expected_secret_fields
+            ):
+                raise DeploymentError("adoptedSecrets values must be non-empty strings")
+            _secure_private_file(parameters_path)
+            adopted_secrets = {
+                name: str(raw_adopted_secrets[name]) for name in expected_secret_fields
+            }
         parameters: JsonObject = {}
         for name, entry in raw_parameters.items():
             if not isinstance(entry, dict) or "value" not in entry:
@@ -152,6 +577,47 @@ class DeploymentInputs:
             minimum=1,
             maximum=30,
         )
+        raw_foundry_resource_id = parameters.get(
+            "foundryCognitiveServicesAccountResourceId", ""
+        )
+        if not isinstance(raw_foundry_resource_id, str):
+            raise DeploymentError(
+                "Parameter foundryCognitiveServicesAccountResourceId must be a string"
+            )
+        foundry_resource_id = raw_foundry_resource_id.strip().rstrip("/") or None
+        if foundry_resource_id is not None:
+            match = re.fullmatch(
+                r"/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/"
+                r"Microsoft\.CognitiveServices/accounts/([^/]+)",
+                foundry_resource_id,
+                re.IGNORECASE,
+            )
+            if match is None:
+                raise DeploymentError(
+                    "foundryCognitiveServicesAccountResourceId must identify an existing "
+                    "Microsoft.CognitiveServices/accounts resource"
+                )
+            if match.group(1).casefold() != subscription.casefold():
+                raise DeploymentError(
+                    "foundryCognitiveServicesAccountResourceId must be in the deployment "
+                    "subscription"
+                )
+        existing_network = ExistingNetwork.from_parameters(parameters, subscription)
+        existing_postgres = ExistingPostgres.from_parameters(parameters, subscription)
+        existing_event_hub = ExistingEventHub.from_parameters(parameters, subscription)
+        existing_observability = ExistingObservability.from_parameters(
+            parameters, subscription
+        )
+        existing_key_vault = ExistingKeyVault.from_parameters(parameters, subscription)
+        if (existing_postgres is None) != (existing_key_vault is None):
+            raise DeploymentError(
+                "Existing PostgreSQL and existing Key Vault must be adopted together so "
+                "database and platform credentials remain outside the public parameter file"
+            )
+        if adopted_secrets is not None and existing_key_vault is None:
+            raise DeploymentError(
+                "adoptedSecrets is valid only when adopting an existing Key Vault"
+            )
         owner_email = _required_string(parameters, "bootstrapOwnerEmail").strip().lower()
         if "@" not in owner_email:
             raise DeploymentError("bootstrapOwnerEmail must be an email address")
@@ -173,6 +639,13 @@ class DeploymentInputs:
             postgres_tier=postgres_tier,
             observer_plan_sku_name=observer_plan_sku_name,
             observer_plan_worker_count=observer_plan_worker_count,
+            foundry_resource_id=foundry_resource_id,
+            existing_network=existing_network,
+            existing_postgres=existing_postgres,
+            existing_event_hub=existing_event_hub,
+            existing_observability=existing_observability,
+            existing_key_vault=existing_key_vault,
+            adopted_secrets=adopted_secrets,
             owner_email=owner_email,
             state_path=resolved_state,
         )
@@ -182,6 +655,7 @@ class DeploymentInputs:
 class SecretMaterial:
     values: dict[str, str]
     owner_password: str | None
+    database_url_override: str | None = None
 
 
 @dataclass(frozen=True)
@@ -427,6 +901,38 @@ def load_or_create_secret_material(
     return SecretMaterial(values, owner_password if require_owner_password else None)
 
 
+def resolve_adopted_secret_material(
+    runner: CommandRunner,
+    inputs: DeploymentInputs,
+    material: SecretMaterial,
+) -> SecretMaterial:
+    key_vault = inputs.existing_key_vault
+    if key_vault is None:
+        return material
+    del runner, key_vault
+    if inputs.adopted_secrets is None:
+        raise DeploymentError(
+            "Adopted PostgreSQL and Key Vault require the top-level adoptedSecrets object"
+        )
+    resolved = {
+        parameter: inputs.adopted_secrets[field]
+        for parameter, field in ADOPTED_SECRET_FIELDS.items()
+    }
+
+    database_url = resolved.pop("databaseUrlOverride")
+    if not database_url.casefold().startswith(("postgresql://", "postgres://")):
+        raise DeploymentError("Existing database URL secret must contain a PostgreSQL URL")
+    try:
+        Fernet(resolved["credentialEncryptionKey"].encode("ascii"))
+    except (ValueError, UnicodeEncodeError) as error:
+        raise DeploymentError(
+            "Existing credential encryption key secret is not a valid Fernet key"
+        ) from error
+    values = dict(material.values)
+    values.update(resolved)
+    return SecretMaterial(values, material.owner_password, database_url)
+
+
 def deployment_parameters(
     inputs: DeploymentInputs,
     secrets_: SecretMaterial,
@@ -434,12 +940,13 @@ def deployment_parameters(
     observer: Mapping[str, str] | None = None,
     existing_core: ExistingCore | None = None,
     resume_existing_environment: bool = False,
+    saved_outputs: Mapping[str, Any] | None = None,
 ) -> JsonObject:
     values = dict(inputs.parameters)
     # The deployment target is selected by `az deployment group`; it is not a template
     # parameter now that the root template runs inside an existing resource group.
     values.pop("resourceGroupName", None)
-    for name in OBSERVER_ORCHESTRATOR_PARAMETERS:
+    for name in ORCHESTRATOR_PARAMETERS:
         values.pop(name, None)
     if existing_core is not None and not resume_existing_environment:
         isolated_apim_defaults = {
@@ -456,15 +963,141 @@ def deployment_parameters(
         for name, default in isolated_apim_defaults.items():
             if not str(values.get(name) or "").strip():
                 values[name] = default
-    values.update({name: secrets_.values[name] for name in SECRET_PARAMETER_NAMES})
+    values.update(
+        {name: secrets_.values[name] for name in GENERATED_SECRET_PARAMETER_NAMES}
+    )
+    network = inputs.existing_network
+    postgres = inputs.existing_postgres
+    event_hub = inputs.existing_event_hub
+    observability = inputs.existing_observability
+    key_vault = inputs.existing_key_vault
+    saved_key_vault = (
+        _dependency_resource(saved_outputs, "keyVault")
+        if saved_outputs is not None
+        else None
+    )
+    saved_dns_link_name = (
+        saved_key_vault.get("privateDnsLinkName")
+        if saved_key_vault is not None
+        else None
+    )
     values.update(
         bootstrapOwnerEmail=inputs.owner_email,
+        keyVaultPrivateDnsLinkName=(
+            str(values.get("keyVaultPrivateDnsLinkName") or "").strip()
+            or (
+                saved_dns_link_name
+                if isinstance(saved_dns_link_name, str) and saved_dns_link_name
+                else "finops-vnet"
+                if resume_existing_environment
+                else f"{inputs.resource_prefix}-vnet"
+            )
+        ),
         provisionControlPlane=True,
         gatewayApplicationKeyManagementEnabled=True,
         controlPlaneEnabled=observer is not None,
         gatewayReleaseWorkerEnabled=observer is not None,
         provisionApimService=existing_core is None,
-        provisionPostgres=not resume_existing_environment,
+        provisionPostgres=postgres is None and not resume_existing_environment,
+        postgresAdopted=postgres is not None,
+        existingPostgresServerResourceId=(
+            postgres.server_resource_id if postgres else ""
+        ),
+        existingPostgresServerName=postgres.server_name if postgres else "",
+        existingPostgresDatabaseName=postgres.database_name if postgres else "",
+        useDatabaseUrlOverride=postgres is not None,
+        databaseUrlOverride=secrets_.database_url_override or "",
+        provisionEventHub=event_hub is None,
+        existingEventHubNamespaceResourceGroupName=(
+            event_hub.resource_group_name if event_hub else ""
+        ),
+        existingEventHubNamespaceName=(event_hub.namespace_name if event_hub else ""),
+        existingEventHubName=event_hub.name if event_hub else "",
+        existingEventHubNamespaceResourceId=(
+            event_hub.namespace_resource_id if event_hub else ""
+        ),
+        existingEventHubResourceId=event_hub.resource_id if event_hub else "",
+        provisionObservability=observability is None,
+        existingLogAnalyticsWorkspaceResourceGroupName=(
+            observability.workspace_resource_group_name if observability else ""
+        ),
+        existingLogAnalyticsWorkspaceName=(
+            observability.workspace_name if observability else ""
+        ),
+        existingApplicationInsightsResourceGroupName=(
+            observability.application_insights_resource_group_name
+            if observability
+            else ""
+        ),
+        existingApplicationInsightsName=(
+            observability.application_insights_name if observability else ""
+        ),
+        provisionKeyVault=key_vault is None,
+        existingKeyVaultResourceGroupName=(
+            key_vault.resource_group_name if key_vault else ""
+        ),
+        existingKeyVaultName=key_vault.name if key_vault else "",
+        existingKeyVaultResourceId=key_vault.resource_id if key_vault else "",
+        existingDatabaseUrlSecretUri=(key_vault.database_url.uri if key_vault else ""),
+        existingDatabaseUrlResourceId=(
+            key_vault.database_url.resource_id if key_vault else ""
+        ),
+        existingCredentialEncryptionKeySecretUri=(
+            key_vault.credential_encryption_key.uri if key_vault else ""
+        ),
+        existingCredentialKeyResourceId=(
+            key_vault.credential_encryption_key.resource_id if key_vault else ""
+        ),
+        existingManagementApiKeySecretUri=(
+            key_vault.management_api_key.uri if key_vault else ""
+        ),
+        existingManagementKeyResourceId=(
+            key_vault.management_api_key.resource_id if key_vault else ""
+        ),
+        existingApimSubscriptionKeySecretUri=(
+            key_vault.apim_subscription_key.uri if key_vault else ""
+        ),
+        existingApimKeyResourceId=(
+            key_vault.apim_subscription_key.resource_id if key_vault else ""
+        ),
+        existingApimProbeSubscriptionKeySecretUri=(
+            key_vault.apim_probe_subscription_key.uri if key_vault else ""
+        ),
+        existingApimProbeKeyResourceId=(
+            key_vault.apim_probe_subscription_key.resource_id if key_vault else ""
+        ),
+        provisionNetwork=network is None,
+        existingVirtualNetworkResourceId=(
+            network.virtual_network_resource_id if network else ""
+        ),
+        existingTelemetryFunctionSubnetResourceId=(
+            network.telemetry_subnet_resource_id if network else ""
+        ),
+        existingControlFunctionSubnetResourceId=(
+            network.control_plane_subnet_resource_id if network else ""
+        ),
+        existingPrivateEndpointSubnetResourceId=(
+            network.private_endpoint_subnet_resource_id if network else ""
+        ),
+        existingApiSubnetResourceId=network.api_subnet_resource_id if network else "",
+        provisionKeyVaultPrivateDnsZone=(
+            network is None or network.private_dns_zone_resource_id is None
+        ),
+        existingKeyVaultPrivateDnsZoneResourceId=(
+            network.private_dns_zone_resource_id
+            if network and network.private_dns_zone_resource_id
+            else ""
+        ),
+        existingKeyVaultPrivateDnsZoneResourceGroupName=(
+            network.private_dns_zone_resource_group_name
+            if network and network.private_dns_zone_resource_group_name
+            else ""
+        ),
+        existingKeyVaultPrivateDnsZoneName=(
+            network.private_dns_zone_name
+            if network and network.private_dns_zone_name
+            else ""
+        ),
         deployApimBootstrap=not resume_existing_environment,
         existingApimName=existing_core.apim_name if existing_core else "",
         existingApimResourceGroupName=(
@@ -581,7 +1214,7 @@ def validate_flex_consumption_capabilities(
 def validate_postgres_capabilities(
     runner: CommandRunner, inputs: DeploymentInputs
 ) -> None:
-    if inputs.parameters.get("provisionPostgres", True) is False:
+    if inputs.existing_postgres is not None:
         return
     capabilities = runner.run_json(
         [
@@ -635,6 +1268,326 @@ def validate_postgres_capabilities(
             f"PostgreSQL {inputs.postgres_tier}/{inputs.postgres_sku_name} in zone "
             f"{POSTGRES_AVAILABILITY_ZONE} is unavailable in {inputs.postgres_location}"
         )
+
+
+def _resource_properties(resource: Mapping[str, Any]) -> Mapping[str, Any]:
+    properties = resource.get("properties")
+    return properties if isinstance(properties, dict) else resource
+
+
+def _show_existing_resource(
+    runner: CommandRunner,
+    inputs: DeploymentInputs,
+    resource_id: str,
+    expected_type: str,
+    label: str,
+) -> JsonObject:
+    api_version = EXISTING_RESOURCE_API_VERSIONS.get(expected_type.casefold())
+    if api_version is None:
+        raise DeploymentError(f"{label} has no reviewed Azure API version")
+    resource = runner.run_json(
+        [
+            "az",
+            "resource",
+            "show",
+            "--subscription",
+            inputs.subscription,
+            "--ids",
+            resource_id,
+            "--api-version",
+            api_version,
+            "--output",
+            "json",
+        ]
+    )
+    actual_id = str(resource.get("id") or "").rstrip("/")
+    if actual_id and actual_id.casefold() != resource_id.casefold():
+        raise DeploymentError(f"{label} resolved to an unexpected resource ID")
+    if str(resource.get("type") or "").casefold() != expected_type.casefold():
+        raise DeploymentError(f"{label} has an unexpected Azure resource type")
+    return resource
+
+
+def _subnet_prefixes(details: Mapping[str, Any]) -> list[str]:
+    properties = _resource_properties(details)
+    prefixes: list[str] = []
+    single = properties.get("addressPrefix")
+    if isinstance(single, str) and single:
+        prefixes.append(single)
+    multiple = properties.get("addressPrefixes")
+    if isinstance(multiple, list):
+        prefixes.extend(str(item) for item in multiple if isinstance(item, str) and item)
+    return prefixes
+
+
+def _validate_subnet_capacity(
+    details: Mapping[str, Any], label: str, minimum_free_addresses: int = 8
+) -> None:
+    prefixes = _subnet_prefixes(details)
+    if not prefixes:
+        raise DeploymentError(f"{label} has no address prefix")
+    usable = 0
+    try:
+        for prefix in prefixes:
+            network = ipaddress.ip_network(prefix, strict=False)
+            usable += max(0, network.num_addresses - 5)
+    except ValueError as error:
+        raise DeploymentError(f"{label} has an invalid address prefix") from error
+    properties = _resource_properties(details)
+    configurations = properties.get("ipConfigurations")
+    used = len(configurations) if isinstance(configurations, list) else 0
+    if usable - used < minimum_free_addresses:
+        raise DeploymentError(
+            f"{label} needs at least {minimum_free_addresses} free addresses"
+        )
+
+
+def _validate_subnet_delegation(
+    details: Mapping[str, Any], label: str, required_service: str
+) -> None:
+    properties = _resource_properties(details)
+    raw_delegations = properties.get("delegations")
+    delegations = raw_delegations if isinstance(raw_delegations, list) else []
+    services = {
+        str(item_properties.get("serviceName") or "").casefold()
+        for item in delegations
+        if isinstance(item, dict)
+        for item_properties in [_resource_properties(item)]
+    }
+    if required_service.casefold() not in services:
+        raise DeploymentError(f"{label} must be delegated to {required_service}")
+
+
+def validate_existing_network(
+    runner: CommandRunner, inputs: DeploymentInputs
+) -> None:
+    network = inputs.existing_network
+    if network is None:
+        return
+    vnet = _show_existing_resource(
+        runner,
+        inputs,
+        network.virtual_network_resource_id,
+        "Microsoft.Network/virtualNetworks",
+        "Existing VNet",
+    )
+    location = str(vnet.get("location") or "")
+    if location and location.casefold() != inputs.location.casefold():
+        raise DeploymentError(
+            f"Existing VNet must be in the deployment region {inputs.location}"
+        )
+
+    subnet_requirements = (
+        (
+            network.telemetry_subnet_resource_id,
+            "Telemetry Function subnet",
+            "Microsoft.App/environments",
+        ),
+        (
+            network.control_plane_subnet_resource_id,
+            "Control-plane Function subnet",
+            "Microsoft.App/environments",
+        ),
+        (
+            network.api_subnet_resource_id,
+            "API subnet",
+            "Microsoft.Web/serverFarms",
+        ),
+    )
+    for resource_id, label, delegation in subnet_requirements:
+        details = runner.run_json(
+            [
+                "az",
+                "network",
+                "vnet",
+                "subnet",
+                "show",
+                "--subscription",
+                inputs.subscription,
+                "--ids",
+                resource_id,
+                "--output",
+                "json",
+            ]
+        )
+        _validate_subnet_delegation(details, label, delegation)
+        _validate_subnet_capacity(details, label)
+
+    private_endpoint = runner.run_json(
+        [
+            "az",
+            "network",
+            "vnet",
+            "subnet",
+            "show",
+            "--subscription",
+            inputs.subscription,
+            "--ids",
+            network.private_endpoint_subnet_resource_id,
+            "--output",
+            "json",
+        ]
+    )
+    private_properties = _resource_properties(private_endpoint)
+    if str(private_properties.get("privateEndpointNetworkPolicies") or "").casefold() != (
+        "disabled"
+    ):
+        raise DeploymentError(
+            "Private Endpoint subnet must disable private endpoint network policies"
+        )
+    _validate_subnet_capacity(private_endpoint, "Private Endpoint subnet")
+
+    if network.private_dns_zone_resource_id is not None:
+        _show_existing_resource(
+            runner,
+            inputs,
+            network.private_dns_zone_resource_id,
+            "Microsoft.Network/privateDnsZones",
+            "Existing Key Vault Private DNS zone",
+        )
+        links = runner.run(
+            [
+                "az",
+                "network",
+                "private-dns",
+                "link",
+                "vnet",
+                "list",
+                "--subscription",
+                inputs.subscription,
+                "--resource-group",
+                network.private_dns_zone_resource_group_name or "",
+                "--zone-name",
+                network.private_dns_zone_name or "",
+                "--output",
+                "json",
+            ],
+            capture=True,
+        )
+        try:
+            raw_links = json.loads(links.stdout)
+        except json.JSONDecodeError as error:
+            raise DeploymentError("Azure CLI returned invalid Private DNS links") from error
+        if not isinstance(raw_links, list) or not any(
+            str(_resource_properties(item).get("virtualNetwork", {}).get("id") or "")
+            .rstrip("/")
+            .casefold()
+            == network.virtual_network_resource_id.casefold()
+            for item in raw_links
+            if isinstance(item, dict)
+            and isinstance(_resource_properties(item).get("virtualNetwork"), dict)
+        ):
+            raise DeploymentError(
+                "Existing Key Vault Private DNS zone must already be linked to the VNet"
+            )
+
+
+def validate_existing_dependencies(
+    runner: CommandRunner, inputs: DeploymentInputs
+) -> None:
+    validate_existing_network(runner, inputs)
+
+    postgres = inputs.existing_postgres
+    if postgres is not None:
+        server = _show_existing_resource(
+            runner,
+            inputs,
+            postgres.server_resource_id,
+            "Microsoft.DBforPostgreSQL/flexibleServers",
+            "Existing PostgreSQL server",
+        )
+        state = str(_resource_properties(server).get("state") or "")
+        if state and state.casefold() != "ready":
+            raise DeploymentError(f"Existing PostgreSQL server is not Ready: {state}")
+        runner.run_json(
+            [
+                "az",
+                "postgres",
+                "flexible-server",
+                "db",
+                "show",
+                "--subscription",
+                inputs.subscription,
+                "--resource-group",
+                postgres.resource_group_name,
+                "--server-name",
+                postgres.server_name,
+                "--name",
+                postgres.database_name,
+                "--output",
+                "json",
+            ]
+        )
+
+    event_hub = inputs.existing_event_hub
+    if event_hub is not None:
+        _show_existing_resource(
+            runner,
+            inputs,
+            event_hub.namespace_resource_id,
+            "Microsoft.EventHub/namespaces",
+            "Existing Event Hub namespace",
+        )
+        _show_existing_resource(
+            runner,
+            inputs,
+            event_hub.resource_id,
+            "Microsoft.EventHub/namespaces/eventhubs",
+            "Existing Event Hub",
+        )
+
+    observability = inputs.existing_observability
+    if observability is not None:
+        _show_existing_resource(
+            runner,
+            inputs,
+            observability.workspace_resource_id,
+            "Microsoft.OperationalInsights/workspaces",
+            "Existing Log Analytics workspace",
+        )
+        app_insights = _show_existing_resource(
+            runner,
+            inputs,
+            observability.application_insights_resource_id,
+            "Microsoft.Insights/components",
+            "Existing Application Insights",
+        )
+        app_insights_properties = _resource_properties(app_insights)
+        linked_workspace = str(
+            app_insights_properties.get("WorkspaceResourceId")
+            or app_insights_properties.get("workspaceResourceId")
+            or ""
+        ).rstrip("/")
+        if linked_workspace.casefold() != observability.workspace_resource_id.casefold():
+            raise DeploymentError(
+                "Existing Application Insights must be linked to the configured "
+                "Log Analytics workspace"
+            )
+
+    key_vault = inputs.existing_key_vault
+    if key_vault is not None:
+        vault = _show_existing_resource(
+            runner,
+            inputs,
+            key_vault.resource_id,
+            "Microsoft.KeyVault/vaults",
+            "Existing Key Vault",
+        )
+        properties = _resource_properties(vault)
+        if properties.get("enableRbacAuthorization") is not True:
+            raise DeploymentError("Existing Key Vault must use Azure RBAC authorization")
+        if (
+            str(properties.get("publicNetworkAccess") or "Enabled").casefold()
+            == "disabled"
+            and (
+                inputs.existing_network is None
+                or inputs.existing_network.private_dns_zone_resource_id is None
+            )
+        ):
+            raise DeploymentError(
+                "A private existing Key Vault requires an adopted VNet and linked "
+                "privatelink.vaultcore.azure.net zone"
+            )
 
 
 def shared_storage_configuration(inputs: DeploymentInputs) -> tuple[str, str, str, str, str]:
@@ -749,49 +1702,55 @@ def ensure_shared_storage_resources(runner: CommandRunner, inputs: DeploymentInp
     )
 
 
-def verify_shared_storage_roles(
+def _managed_role_assignment_name(scope: str, principal_id: str, role_id: str) -> str:
+    digest = hashlib.sha256(
+        f"turnstile|{scope.casefold()}|{principal_id.casefold()}|{role_id.casefold()}".encode()
+    ).hexdigest()
+    return (
+        f"{digest[:8]}-{digest[8:12]}-{digest[12:16]}-"
+        f"{digest[16:20]}-{digest[20:32]}"
+    )
+
+
+def _managed_role_assignment_id(scope: str, principal_id: str, role_id: str) -> str:
+    name = _managed_role_assignment_name(scope, principal_id, role_id)
+    return f"{scope.rstrip('/')}/providers/Microsoft.Authorization/roleAssignments/{name}"
+
+
+def _role_assignment_covers(
+    assignment: Mapping[str, Any], role_name: str, role_id: str, scope: str
+) -> bool:
+    assigned_role_id = str(assignment.get("roleDefinitionId") or "").rstrip("/").rsplit(
+        "/", maxsplit=1
+    )[-1]
+    role_matches = (
+        str(assignment.get("roleDefinitionName") or "").casefold()
+        == role_name.casefold()
+        or assigned_role_id.casefold() == role_id.casefold()
+    )
+    assigned_scope = str(assignment.get("scope") or "").rstrip("/").casefold()
+    required_scope = scope.rstrip("/").casefold()
+    return bool(assigned_scope) and role_matches and (
+        required_scope == assigned_scope
+        or required_scope.startswith(f"{assigned_scope}/")
+    )
+
+
+def ensure_role_assignments(
     runner: CommandRunner,
     inputs: DeploymentInputs,
-    outputs: Mapping[str, Any],
-) -> None:
-    resource_group, account, _, _, ledger_table = shared_storage_configuration(inputs)
-    account_id = _output_string(outputs, "storageAccountId")
-    ledger_table_id = _output_string(outputs, "ledgerTableId")
-    required = (
-        (
-            _output_string(outputs, "telemetryPrincipalId"),
-            "Storage Blob Data Owner",
-            account_id,
-        ),
-        (
-            _output_string(outputs, "controlPlanePrincipalId"),
-            "Storage Blob Data Owner",
-            account_id,
-        ),
-        (
-            _output_string(outputs, "telemetryPrincipalId"),
-            "Storage Table Data Contributor",
-            ledger_table_id,
-        ),
-        (
-            _output_string(outputs, "apiPrincipalId"),
-            "Storage Table Data Contributor",
-            ledger_table_id,
-        ),
-        (
-            _output_string(outputs, "controlPlanePrincipalId"),
-            "Storage Table Data Contributor",
-            ledger_table_id,
-        ),
-        (
-            _output_string(outputs, "apimPrincipalId"),
-            "Storage Table Data Contributor",
-            ledger_table_id,
-        ),
-    )
-    missing: list[tuple[str, str, str]] = []
+    requirements: Sequence[tuple[str, str, str, str]],
+) -> set[str]:
+    """Create missing runtime RBAC grants and return exact Turnstile-owned IDs.
+
+    Existing assignments at the requested or a parent scope are reused. New assignments
+    receive deterministic IDs, so a retry after interruption adopts only assignments that
+    this deployment command could have created; unrelated grants are never claimed for
+    cleanup.
+    """
     assignments_by_principal: dict[str, list[Mapping[str, Any]]] = {}
-    for principal_id, role, scope in required:
+    managed_ids: set[str] = set()
+    for principal_id, role_name, role_id, scope in requirements:
         assignments = assignments_by_principal.get(principal_id)
         if assignments is None:
             result = runner.run(
@@ -805,42 +1764,240 @@ def verify_shared_storage_roles(
                     "--assignee-object-id",
                     principal_id,
                     "--all",
+                    "--fill-principal-name",
+                    "false",
                     "--output",
                     "json",
                 ],
                 capture=True,
             )
             raw = json.loads(result.stdout)
-            assignments = raw if isinstance(raw, list) else []
+            if not isinstance(raw, list):
+                raise DeploymentError("Azure CLI returned invalid role assignments")
+            assignments = [item for item in raw if isinstance(item, dict)]
             assignments_by_principal[principal_id] = assignments
-        covered = any(
-            assignment.get("roleDefinitionName") == role
-            and (
-                scope.casefold() == str(assignment.get("scope", "")).casefold()
-                or scope.casefold().startswith(
-                    str(assignment.get("scope", "")).rstrip("/").casefold() + "/"
+
+        expected_id = _managed_role_assignment_id(scope, principal_id, role_id)
+        covering = next(
+            (
+                assignment
+                for assignment in assignments
+                if _role_assignment_covers(assignment, role_name, role_id, scope)
+            ),
+            None,
+        )
+        if covering is not None:
+            if str(covering.get("id") or "").casefold() == expected_id.casefold():
+                managed_ids.add(expected_id)
+            continue
+
+        assignment_name = expected_id.rsplit("/", maxsplit=1)[-1]
+        try:
+            created = runner.run_json(
+                [
+                    "az",
+                    "role",
+                    "assignment",
+                    "create",
+                    "--subscription",
+                    inputs.subscription,
+                    "--assignee-object-id",
+                    principal_id,
+                    "--assignee-principal-type",
+                    "ServicePrincipal",
+                    "--role",
+                    role_id,
+                    "--scope",
+                    scope,
+                    "--name",
+                    assignment_name,
+                    "--output",
+                    "json",
+                ]
+            )
+        except (DeploymentError, subprocess.CalledProcessError) as error:
+            raise DeploymentError(
+                f"Unable to grant {role_name} at {scope}. The deployment identity needs "
+                "Role Based Access Control Administrator at that scope."
+            ) from error
+        created_id = str(created.get("id") or "")
+        if created_id.casefold() != expected_id.casefold():
+            raise DeploymentError(
+                f"Azure returned an unexpected role assignment ID for {role_name}"
+            )
+        assignments.append(created)
+        managed_ids.add(expected_id)
+        print(f"Granted {role_name} to {principal_id} at {scope}")
+    return managed_ids
+
+
+def ensure_shared_storage_roles(
+    runner: CommandRunner,
+    inputs: DeploymentInputs,
+    outputs: Mapping[str, Any],
+) -> set[str]:
+    resource_group, account, _, _, _ = shared_storage_configuration(inputs)
+    account_id = _output_string(outputs, "storageAccountId")
+    ledger_table_id = _output_string(outputs, "ledgerTableId")
+    required = (
+        (
+            _output_string(outputs, "telemetryPrincipalId"),
+            "Storage Blob Data Owner",
+            STORAGE_BLOB_DATA_OWNER_ROLE_ID,
+            account_id,
+        ),
+        (
+            _output_string(outputs, "controlPlanePrincipalId"),
+            "Storage Blob Data Owner",
+            STORAGE_BLOB_DATA_OWNER_ROLE_ID,
+            account_id,
+        ),
+        (
+            _output_string(outputs, "telemetryPrincipalId"),
+            "Storage Table Data Contributor",
+            STORAGE_TABLE_DATA_CONTRIBUTOR_ROLE_ID,
+            ledger_table_id,
+        ),
+        (
+            _output_string(outputs, "apiPrincipalId"),
+            "Storage Table Data Contributor",
+            STORAGE_TABLE_DATA_CONTRIBUTOR_ROLE_ID,
+            ledger_table_id,
+        ),
+        (
+            _output_string(outputs, "controlPlanePrincipalId"),
+            "Storage Table Data Contributor",
+            STORAGE_TABLE_DATA_CONTRIBUTOR_ROLE_ID,
+            ledger_table_id,
+        ),
+        (
+            _output_string(outputs, "apimPrincipalId"),
+            "Storage Table Data Contributor",
+            STORAGE_TABLE_DATA_CONTRIBUTOR_ROLE_ID,
+            ledger_table_id,
+        ),
+    )
+    managed = ensure_role_assignments(runner, inputs, required)
+    if managed:
+        print(f"Shared storage RBAC ready: {resource_group}/{account}")
+    return managed
+
+
+def ensure_foundry_role(
+    runner: CommandRunner,
+    inputs: DeploymentInputs,
+    outputs: Mapping[str, Any],
+) -> set[str]:
+    if inputs.foundry_resource_id is None:
+        return set()
+    return ensure_role_assignments(
+        runner,
+        inputs,
+        (
+            (
+                _output_string(outputs, "apimPrincipalId"),
+                "Cognitive Services User",
+                COGNITIVE_SERVICES_USER_ROLE_ID,
+                inputs.foundry_resource_id,
+            ),
+        ),
+    )
+
+
+def ensure_adopted_dependency_roles(
+    runner: CommandRunner,
+    inputs: DeploymentInputs,
+    outputs: Mapping[str, Any],
+) -> set[str]:
+    requirements: list[tuple[str, str, str, str]] = []
+    event_hub = inputs.existing_event_hub
+    if event_hub is not None:
+        requirements.extend(
+            (
+                (
+                    _output_string(outputs, "telemetryPrincipalId"),
+                    "Azure Event Hubs Data Receiver",
+                    EVENT_HUB_DATA_RECEIVER_ROLE_ID,
+                    event_hub.resource_id,
+                ),
+                (
+                    _output_string(outputs, "apimPrincipalId"),
+                    "Azure Event Hubs Data Sender",
+                    EVENT_HUB_DATA_SENDER_ROLE_ID,
+                    event_hub.resource_id,
+                ),
+            )
+        )
+    observability = inputs.existing_observability
+    if observability is not None:
+        requirements.append(
+            (
+                _output_string(outputs, "telemetryPrincipalId"),
+                "Log Analytics Reader",
+                LOG_ANALYTICS_READER_ROLE_ID,
+                observability.workspace_resource_id,
+            )
+        )
+    key_vault = inputs.existing_key_vault
+    if key_vault is not None:
+        principal_id = _output_string(outputs, "controlPlanePrincipalId")
+        for reference in (
+            key_vault.database_url,
+            key_vault.credential_encryption_key,
+            key_vault.apim_probe_subscription_key,
+        ):
+            requirements.append(
+                (
+                    principal_id,
+                    "Key Vault Secrets User",
+                    KEY_VAULT_SECRETS_USER_ROLE_ID,
+                    reference.resource_id,
                 )
             )
-            for assignment in assignments
-        )
-        if not covered:
-            missing.append((principal_id, role, scope))
-    if not missing:
-        return
+    return ensure_role_assignments(runner, inputs, requirements)
 
-    print(
-        f"Shared storage {resource_group}/{account} needs these managed-identity grants:"
+
+def ensure_adopted_apim_prerequisite_role(
+    runner: CommandRunner,
+    inputs: DeploymentInputs,
+    existing_core: ExistingCore | None,
+) -> set[str]:
+    event_hub = inputs.existing_event_hub
+    if event_hub is None or existing_core is None:
+        return set()
+    return ensure_role_assignments(
+        runner,
+        inputs,
+        (
+            (
+                existing_core.apim_principal_id,
+                "Azure Event Hubs Data Sender",
+                EVENT_HUB_DATA_SENDER_ROLE_ID,
+                event_hub.resource_id,
+            ),
+        ),
     )
-    for principal_id, role, scope in missing:
-        print(
-            "az role assignment create "
-            f"--assignee-object-id {principal_id} "
-            "--assignee-principal-type ServicePrincipal "
-            f"--role \"{role}\" --scope \"{scope}\""
-        )
-    raise DeploymentError(
-        "Shared storage role assignments are incomplete. Ask a storage administrator "
-        "to run the commands above, wait for RBAC propagation, and rerun deployment."
+
+
+def ensure_observer_event_hub_role(
+    runner: CommandRunner,
+    inputs: DeploymentInputs,
+    observer_outputs: Mapping[str, Any],
+) -> set[str]:
+    event_hub = inputs.existing_event_hub
+    if event_hub is None:
+        return set()
+    return ensure_role_assignments(
+        runner,
+        inputs,
+        (
+            (
+                _output_string(observer_outputs, "webAppPrincipalId"),
+                "Azure Event Hubs Data Sender",
+                EVENT_HUB_DATA_SENDER_ROLE_ID,
+                event_hub.resource_id,
+            ),
+        ),
     )
 
 
@@ -870,7 +2027,17 @@ def _deployment_command(
         "json",
     ]
     if action == "what-if":
-        command.extend(["--no-pretty-print", "--result-format", "FullResourcePayloads"])
+        command.extend(
+            [
+                "--no-pretty-print",
+                "--result-format",
+                "ResourceIdOnly",
+                "--validation-level",
+                "ProviderNoRbac",
+            ]
+        )
+    elif action == "create":
+        command.extend(["--validation-level", "ProviderNoRbac"])
     return command
 
 
@@ -901,7 +2068,17 @@ def _resource_group_deployment_command(
         "json",
     ]
     if action == "what-if":
-        command.extend(["--no-pretty-print", "--result-format", "FullResourcePayloads"])
+        command.extend(
+            [
+                "--no-pretty-print",
+                "--result-format",
+                "ResourceIdOnly",
+                "--validation-level",
+                "ProviderNoRbac",
+            ]
+        )
+    elif action == "create":
+        command.extend(["--validation-level", "ProviderNoRbac"])
     return command
 
 
@@ -1163,105 +2340,38 @@ def deploy_webapp_package(
     app_name: str,
     package: Path,
 ) -> None:
-    token_result = runner.run_json(
+    deployment = runner.run_json(
         [
             "az",
-            "account",
-            "get-access-token",
+            "webapp",
+            "deploy",
             "--subscription",
             inputs.subscription,
-            "--resource",
-            "https://management.azure.com/",
-            "--query",
-            "{accessToken:accessToken}",
+            "--resource-group",
+            inputs.resource_group_name,
+            "--name",
+            app_name,
+            "--src-path",
+            str(package),
+            "--type",
+            "zip",
+            "--async",
+            "true",
+            "--restart",
+            "true",
+            "--clean",
+            "true",
             "--output",
             "json",
         ]
     )
-    access_token = _output_string(token_result, "accessToken")
-    deployment_url = f"https://{app_name}.scm.azurewebsites.net/api/deployments/latest"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    previous = json.loads(
-        _open_without_proxy(
-            urllib.request.Request(deployment_url, headers=headers), 30
-        )
-    )
-    previous_id = previous.get("id") if isinstance(previous, dict) else None
-    publish_url = (
-        f"https://{app_name}.scm.azurewebsites.net/api/publish"
-        "?type=zip&clean=true&restart=true&isAsync=true"
-    )
-    try:
-        payload = package.read_bytes()
-        request = urllib.request.Request(
-            publish_url,
-            data=payload,
-            headers={
-                **headers,
-                "Content-Type": "application/zip",
-            },
-            method="POST",
-        )
-        print(f"$ POST {publish_url} (Microsoft Entra authentication)")
-        _open_without_proxy(request, 120)
-        deadline = time.monotonic() + 1800
-        last_status = "deployment did not appear"
-        while time.monotonic() < deadline:
-            raw = _open_without_proxy(
-                urllib.request.Request(deployment_url, headers=headers), 30
-            )
-            deployment = json.loads(raw)
-            if not isinstance(deployment, dict):
-                raise DeploymentError("Kudu returned an invalid deployment status")
-            deployment_id = deployment.get("id")
-            status = deployment.get("status")
-            complete = deployment.get("complete") is True
-            last_status = f"id={deployment_id}, status={status}, complete={complete}"
-            if deployment_id != previous_id and complete:
-                if status != 4:
-                    raise DeploymentError(
-                        f"Kudu package deployment failed for {app_name}: {last_status}"
-                    )
-                print(f"Kudu package deployment completed: {app_name}")
-                return
-            if deployment_id != previous_id and isinstance(deployment_id, str):
-                log_url = (
-                    f"https://{app_name}.scm.azurewebsites.net/api/deployments/"
-                    f"{deployment_id}/log"
-                )
-                log_raw = _open_without_proxy(
-                    urllib.request.Request(log_url, headers=headers), 30
-                )
-                log_entries = json.loads(log_raw)
-                if isinstance(log_entries, list):
-                    messages = [
-                        str(entry.get("message", ""))
-                        for entry in log_entries
-                        if isinstance(entry, dict)
-                    ]
-                    if any(
-                        int(entry.get("type", 0)) > 0
-                        for entry in log_entries
-                        if isinstance(entry, dict)
-                    ):
-                        raise DeploymentError(
-                            f"Kudu package deployment failed for {app_name}: "
-                            + "; ".join(messages[-5:])
-                        )
-                    if (
-                        "Finished deployment pipeline." in messages
-                        and "[Kudu-SyncTriggerStep] completed." in messages
-                    ):
-                        print(f"Kudu package deployment completed: {app_name}")
-                        return
-            time.sleep(3)
+    properties = deployment.get("properties")
+    status = properties.get("status") if isinstance(properties, dict) else None
+    if status not in {None, "RuntimeSuccessful", "BuildSuccessful"}:
         raise DeploymentError(
-            f"Kudu package deployment timed out for {app_name}: {last_status}"
+            f"Web App package deployment failed for {app_name}: {status}"
         )
-    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
-        raise DeploymentError(
-            f"Microsoft Entra package deployment failed for {app_name}: {error}"
-        ) from error
+    print(f"Web App package deployment completed: {app_name}")
 
 
 def deploy_packages(
@@ -1297,9 +2407,32 @@ def deploy_function_package(
 ) -> None:
     for attempt in range(1, 4):
         try:
-            deploy_webapp_package(runner, inputs, function_name, package)
+            runner.run(
+                [
+                    "az",
+                    "functionapp",
+                    "deployment",
+                    "source",
+                    "config-zip",
+                    "--subscription",
+                    inputs.subscription,
+                    "--resource-group",
+                    resource_group,
+                    "--name",
+                    function_name,
+                    "--src",
+                    str(package),
+                    "--build-remote",
+                    "false",
+                    "--timeout",
+                    "1800",
+                    "--output",
+                    "json",
+                ]
+            )
+            print(f"Function package deployment completed: {function_name}")
             return
-        except DeploymentError:
+        except (DeploymentError, subprocess.CalledProcessError):
             if attempt == 3:
                 raise
             print(
@@ -1365,6 +2498,34 @@ def _output_string(outputs: Mapping[str, Any], name: str) -> str:
     return value
 
 
+def _dependency_resource(
+    outputs: Mapping[str, Any], name: str
+) -> Mapping[str, Any] | None:
+    resources = outputs.get("dependencyResources")
+    if not isinstance(resources, dict):
+        return None
+    value = resources.get(name)
+    return value if isinstance(value, dict) else None
+
+
+def _dependency_string(
+    outputs: Mapping[str, Any], resource_name: str, field: str, fallback: str
+) -> str:
+    resource = _dependency_resource(outputs, resource_name)
+    value = resource.get(field) if resource is not None else None
+    if isinstance(value, str) and value:
+        return value
+    return _output_string(outputs, fallback)
+
+
+def _dependency_provisioned(
+    outputs: Mapping[str, Any], resource_name: str, *, default: bool = True
+) -> bool:
+    resource = _dependency_resource(outputs, resource_name)
+    value = resource.get("provisioned") if resource is not None else None
+    return value if isinstance(value, bool) else default
+
+
 def observer_names(inputs: DeploymentInputs) -> tuple[str, str]:
     digest = hashlib.sha256(
         f"{inputs.subscription}:{inputs.resource_group_name}".encode()
@@ -1377,7 +2538,8 @@ def observer_plan_name(inputs: DeploymentInputs) -> str:
     digest = hashlib.sha256(
         f"{inputs.subscription}:{inputs.resource_group_name}".encode()
     ).hexdigest()[:12]
-    return f"plan-obs-{digest}"
+    compact_prefix = re.sub(r"[^a-z0-9-]", "", inputs.resource_prefix.lower())
+    return f"plan-obs-{compact_prefix}-{digest}"[:40]
 
 
 def observer_parameters(
@@ -1418,10 +2580,20 @@ def observer_parameters(
             "acrResourceGroupName": acr_resource_group_name,
             "provisionAcr": existing_observer is None,
             "imageTag": version,
-            "eventHubNamespaceName": _output_string(
-                platform_outputs, "eventHubNamespaceName"
+            "eventHubNamespaceName": _dependency_string(
+                platform_outputs,
+                "eventHub",
+                "namespaceName",
+                "eventHubNamespaceName",
             ),
-            "eventHubName": "token-usage",
+            "eventHubName": (
+                str((_dependency_resource(platform_outputs, "eventHub") or {}).get("name"))
+                if (_dependency_resource(platform_outputs, "eventHub") or {}).get("name")
+                else "token-usage"
+            ),
+            "manageEventHubRoleAssignment": _dependency_provisioned(
+                platform_outputs, "eventHub"
+            ),
             "apimName": _output_string(platform_outputs, "apimName"),
             "adapterKeyNamedValueName": adapter_key_named_value_name,
             "adapterSharedKey": secrets_.values["observerAdapterSharedKey"],
@@ -1700,6 +2872,101 @@ def load_saved_outputs(inputs: DeploymentInputs) -> dict[str, Any] | None:
     return outputs
 
 
+def validate_adoption_context(
+    inputs: DeploymentInputs, outputs: Mapping[str, Any]
+) -> None:
+    resources = outputs.get("dependencyResources")
+    configured = any(
+        value is not None
+        for value in (
+            inputs.existing_network,
+            inputs.existing_postgres,
+            inputs.existing_event_hub,
+            inputs.existing_observability,
+            inputs.existing_key_vault,
+        )
+    )
+    if not isinstance(resources, dict):
+        if configured:
+            raise DeploymentError(
+                "Existing deployment outputs predate resource adoption metadata; keep the "
+                "original managed dependencies or deploy a new environment"
+            )
+        return
+
+    def require(name: str, adopted: bool, expected: Mapping[str, str]) -> None:
+        raw = resources.get(name)
+        if not isinstance(raw, dict):
+            raise DeploymentError(f"Saved dependency metadata is missing {name}")
+        provisioned = raw.get("provisioned")
+        if provisioned is not (not adopted):
+            raise DeploymentError(
+                f"Saved {name} ownership does not match the current parameter file"
+            )
+        for field, value in expected.items():
+            actual = raw.get(field)
+            if not isinstance(actual, str) or actual.rstrip("/").casefold() != value.rstrip(
+                "/"
+            ).casefold():
+                raise DeploymentError(
+                    f"Saved {name} resource {field} does not match the current parameter file"
+                )
+
+    postgres = inputs.existing_postgres
+    require(
+        "postgres",
+        postgres is not None,
+        {"resourceId": postgres.server_resource_id} if postgres else {},
+    )
+    event_hub = inputs.existing_event_hub
+    require(
+        "eventHub",
+        event_hub is not None,
+        {"resourceId": event_hub.resource_id} if event_hub else {},
+    )
+    observability = inputs.existing_observability
+    require(
+        "observability",
+        observability is not None,
+        (
+            {
+                "workspaceResourceId": observability.workspace_resource_id,
+                "applicationInsightsResourceId": (
+                    observability.application_insights_resource_id
+                ),
+            }
+            if observability
+            else {}
+        ),
+    )
+    key_vault = inputs.existing_key_vault
+    require(
+        "keyVault",
+        key_vault is not None,
+        {"resourceId": key_vault.resource_id} if key_vault else {},
+    )
+    network = inputs.existing_network
+    require(
+        "network",
+        network is not None,
+        (
+            {
+                "virtualNetworkResourceId": network.virtual_network_resource_id,
+                "telemetryFunctionSubnetResourceId": network.telemetry_subnet_resource_id,
+                "controlFunctionSubnetResourceId": (
+                    network.control_plane_subnet_resource_id
+                ),
+                "privateEndpointSubnetResourceId": (
+                    network.private_endpoint_subnet_resource_id
+                ),
+                "apiSubnetResourceId": network.api_subnet_resource_id,
+            }
+            if network
+            else {}
+        ),
+    )
+
+
 def load_existing_core(inputs: DeploymentInputs) -> ExistingCore | None:
     outputs = load_saved_outputs(inputs)
     return ExistingCore.from_outputs(outputs) if outputs is not None else None
@@ -1716,7 +2983,9 @@ def _write_private_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary = tempfile.mkstemp(prefix="upgrade-", dir=path.parent)
     try:
-        os.fchmod(descriptor, 0o600)
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
             json.dump(value, output, indent=2)
             output.flush()
@@ -1748,7 +3017,10 @@ def _upgrade_lock(directory: Path) -> Iterator[None]:
             import fcntl
 
             try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(  # type: ignore[attr-defined]
+                    lock,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,  # type: ignore[attr-defined]
+                )
             except BlockingIOError as error:
                 raise DeploymentError("Another process owns this APIM upgrade") from error
         try:
@@ -1758,7 +3030,7 @@ def _upgrade_lock(directory: Path) -> Iterator[None]:
                 lock.seek(0)
                 msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
             else:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+                fcntl.flock(lock, fcntl.LOCK_UN)  # type: ignore[attr-defined]
 
 
 def gateway_upgrade(
@@ -1956,14 +3228,27 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     if not args.allow_dirty:
         validate_source_snapshot(REPOSITORY_ROOT)
     saved_outputs = load_saved_outputs(inputs)
+    if args.skip_platform_deployment and saved_outputs is None:
+        raise DeploymentError(
+            "--skip-platform-deployment requires reviewed saved deployment outputs"
+        )
+    if args.skip_platform_deployment and not args.skip_what_if:
+        raise DeploymentError(
+            "--skip-platform-deployment requires --skip-what-if"
+        )
+    if saved_outputs is not None:
+        validate_adoption_context(inputs, saved_outputs)
     if args.action in {"plan-upgrade", "upgrade", "rollback-upgrade"}:
         if saved_outputs is None:
             raise DeploymentError("An incremental upgrade requires the original deployment outputs")
         gateway_upgrade(runner, inputs, saved_outputs, args.action, assume_yes=args.yes)
         return
-    if saved_outputs is not None:
+    if saved_outputs is not None and not args.skip_platform_deployment:
         gateway_upgrade(runner, inputs, saved_outputs, "check")
+    elif saved_outputs is not None:
+        print("WARNING: APIM upgrade precheck skipped during reviewed platform recovery")
     validate_shared_storage_account(runner, inputs)
+    validate_existing_dependencies(runner, inputs)
     if saved_outputs is None:
         validate_flex_consumption_capabilities(runner, inputs)
         validate_postgres_capabilities(runner, inputs)
@@ -1982,16 +3267,23 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         read_password=password_reader,
         require_owner_password=args.action == "deploy",
     )
+    secrets_ = resolve_adopted_secret_material(runner, inputs, secrets_)
     existing_core = (
         ExistingCore.from_outputs(saved_outputs)
         if saved_outputs is not None
         else ExistingCore.from_parameters(inputs.parameters)
+    )
+    pre_platform_role_assignment_ids = (
+        ensure_adopted_apim_prerequisite_role(runner, inputs, existing_core)
+        if args.action == "deploy" and saved_outputs is None
+        else set()
     )
     base_parameters = deployment_parameters(
         inputs,
         secrets_,
         existing_core=existing_core,
         resume_existing_environment=saved_outputs is not None,
+        saved_outputs=saved_outputs,
     )
     main_template = REPOSITORY_ROOT / "infra" / "main.bicep"
     release_template = REPOSITORY_ROOT / "infra" / "runtime-release.bicep"
@@ -2000,13 +3292,16 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         saved_outputs
     )
     if saved_outputs is None:
-        what_if_resource_group(
-            runner,
-            inputs,
-            main_template,
-            base_parameters,
-            f"{inputs.resource_prefix}-platform",
-        )
+        if not args.skip_what_if:
+            what_if_resource_group(
+                runner,
+                inputs,
+                main_template,
+                base_parameters,
+                f"{inputs.resource_prefix}-platform",
+            )
+        else:
+            print("WARNING: platform What-if skipped by explicit operator request")
         if args.action == "plan":
             return
         _confirm_deployment(args.yes)
@@ -2022,13 +3317,16 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         _write_outputs(inputs, platform_outputs)
     else:
         platform_outputs = saved_outputs
-        what_if_resource_group(
-            runner,
-            inputs,
-            main_template,
-            base_parameters,
-            f"{inputs.resource_prefix}-platform",
-        )
+        if not args.skip_what_if:
+            what_if_resource_group(
+                runner,
+                inputs,
+                main_template,
+                base_parameters,
+                f"{inputs.resource_prefix}-platform",
+            )
+        else:
+            print("WARNING: platform What-if skipped by explicit operator request")
         if observer_deployed:
             api_settings = current_app_settings(
                 runner, inputs, _output_string(platform_outputs, "apiName")
@@ -2070,19 +3368,36 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
             return
         _confirm_deployment(args.yes)
         ensure_shared_storage_resources(runner, inputs)
-        base_result = deploy_resource_group_template(
-            runner,
-            inputs,
-            main_template,
-            base_parameters,
-            f"{inputs.resource_prefix}-platform",
-        )
-        platform_outputs = {
-            **saved_outputs,
-            **deployment_outputs(base_result),
-        }
-        _write_outputs(inputs, platform_outputs)
-    verify_shared_storage_roles(runner, inputs, platform_outputs)
+        if args.skip_platform_deployment:
+            print("WARNING: platform deployment replay skipped; using reviewed saved outputs")
+        else:
+            base_result = deploy_resource_group_template(
+                runner,
+                inputs,
+                main_template,
+                base_parameters,
+                f"{inputs.resource_prefix}-platform",
+            )
+            platform_outputs = {
+                **saved_outputs,
+                **deployment_outputs(base_result),
+            }
+            _write_outputs(inputs, platform_outputs)
+    managed_role_assignment_ids = set(pre_platform_role_assignment_ids)
+    managed_role_assignment_ids.update(
+        ensure_shared_storage_roles(runner, inputs, platform_outputs)
+    )
+    managed_role_assignment_ids.update(
+        ensure_foundry_role(runner, inputs, platform_outputs)
+    )
+    managed_role_assignment_ids.update(
+        ensure_adopted_dependency_roles(runner, inputs, platform_outputs)
+    )
+    platform_outputs = {
+        **platform_outputs,
+        "managedRoleAssignmentIds": sorted(managed_role_assignment_ids),
+    }
+    _write_outputs(inputs, platform_outputs)
     version = source_version(runner)
     observer_version = observer_source_version(runner)
     packages = build_packages(runner, inputs, version)
@@ -2111,6 +3426,14 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         f"{inputs.resource_prefix}-observer",
     )
     observer_outputs = deployment_outputs(observer_result)
+    managed_role_assignment_ids.update(
+        ensure_observer_event_hub_role(runner, inputs, observer_outputs)
+    )
+    platform_outputs = {
+        **platform_outputs,
+        "managedRoleAssignmentIds": sorted(managed_role_assignment_ids),
+    }
+    _write_outputs(inputs, platform_outputs)
     build_and_start_observer(runner, inputs, observer_outputs, observer_version)
     wait_for_observer_health(_output_string(observer_outputs, "webAppUrl"))
 
@@ -2178,6 +3501,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional private 0600 JSON file containing the Owner email and password.",
     )
     parser.add_argument("--yes", action="store_true")
+    parser.add_argument(
+        "--skip-what-if",
+        action="store_true",
+        help=(
+            "Emergency validation only: skip the platform What-if after a separately "
+            "reviewed ARM provider validation. Never use for routine or production deploys."
+        ),
+    )
+    parser.add_argument(
+        "--skip-platform-deployment",
+        action="store_true",
+        help=(
+            "Recovery only: continue runtime rollout from reviewed saved outputs without "
+            "replaying the platform ARM deployment. Requires --skip-what-if."
+        ),
+    )
     parser.add_argument(
         "--allow-dirty",
         action="store_true",

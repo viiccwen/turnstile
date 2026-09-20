@@ -8,9 +8,9 @@ param storageBlobEndpoint string
 param storageQueueEndpoint string
 param storageTableEndpoint string
 param deploymentContainerName string
-param virtualNetworkName string = 'vnet-turnstile-${suffix}'
-param functionSubnetName string = 'snet-flex-control'
+param functionSubnetResourceId string
 param keyVaultName string
+param manageKeyVaultRoleAssignments bool = true
 param databaseUrlSecretUri string
 param apimProbeSubscriptionKeySecretUri string
 param credentialEncryptionKeySecretUri string
@@ -60,15 +60,6 @@ resource plan 'Microsoft.Web/serverfarms@2024-11-01' = {
   properties: {
     reserved: true
   }
-}
-
-resource virtualNetwork 'Microsoft.Network/virtualNetworks@2024-05-01' existing = {
-  name: virtualNetworkName
-}
-
-resource functionSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' existing = {
-  parent: virtualNetwork
-  name: functionSubnetName
 }
 
 resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
@@ -158,31 +149,31 @@ resource functionVnetIntegration 'Microsoft.Web/sites/networkConfig@2024-11-01' 
   parent: functionApp
   name: 'virtualNetwork'
   properties: {
-    subnetResourceId: functionSubnet.id
+    subnetResourceId: functionSubnetResourceId
     swiftSupported: true
   }
 }
 
-resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
+resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = if (manageKeyVaultRoleAssignments) {
   name: keyVaultName
 }
 
-resource databaseUrlSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = {
+resource databaseUrlSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = if (manageKeyVaultRoleAssignments) {
   parent: keyVault
   name: 'database-url'
 }
 
-resource credentialEncryptionKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = {
+resource credentialEncryptionKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = if (manageKeyVaultRoleAssignments) {
   parent: keyVault
   name: 'credential-encryption-key'
 }
 
-resource apimProbeSubscriptionKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = {
+resource apimProbeSubscriptionKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = if (manageKeyVaultRoleAssignments) {
   parent: keyVault
   name: 'apim-probe-subscription-key'
 }
 
-resource functionDatabaseSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource functionDatabaseSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (manageKeyVaultRoleAssignments) {
   name: guid(databaseUrlSecret.id, functionApp.id, 'key-vault-secrets-user')
   scope: databaseUrlSecret
   properties: {
@@ -192,7 +183,7 @@ resource functionDatabaseSecretReader 'Microsoft.Authorization/roleAssignments@2
   }
 }
 
-resource functionCredentialSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource functionCredentialSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (manageKeyVaultRoleAssignments) {
   name: guid(credentialEncryptionKeySecret.id, functionApp.id, 'key-vault-secrets-user')
   scope: credentialEncryptionKeySecret
   properties: {
@@ -202,7 +193,7 @@ resource functionCredentialSecretReader 'Microsoft.Authorization/roleAssignments
   }
 }
 
-resource functionProbeSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource functionProbeSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (manageKeyVaultRoleAssignments) {
   name: guid(apimProbeSubscriptionKeySecret.id, functionApp.id, 'key-vault-secrets-user')
   scope: apimProbeSubscriptionKeySecret
   properties: {

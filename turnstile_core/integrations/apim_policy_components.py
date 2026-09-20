@@ -20,7 +20,8 @@ POOL_MEMBER_HEADER = "x-turnstile-pool-member"
 POOL_RUNTIME_HEADER = "x-turnstile-pool-runtime"
 CACHE_READ_WITHOUT_FALLBACK = '?? (long?)usage?["cache_read_input_tokens"] ?? 0;'
 CACHE_READ_WITH_FALLBACK = (
-    '?? (long?)usage?["cache_read_input_tokens"]\n          ?? (long?)usage?["cached_tokens"] ?? 0;'
+    '?? (long?)usage?["cache_read_input_tokens"]\n'
+    '          ?? (long?)usage?["cached_tokens"] ?? 0;'
 )
 _TOKENS = re.compile(
     r'//[^\r\n]*|/\*.*?\*/|@"(?:""|[^"])*"|"(?:\\.|[^"\\])*"|'
@@ -196,7 +197,10 @@ def adopt_pool_runtime_scrub(inbound: ET.Element) -> None:
         )
     inbound.insert(
         list(inbound).index(member) + 1,
-        ET.Element("set-header", {"name": POOL_RUNTIME_HEADER, "exists-action": "delete"}),
+        ET.Element(
+            "set-header",
+            {"name": POOL_RUNTIME_HEADER, "exists-action": "delete"},
+        ),
     )
 
 
@@ -277,18 +281,6 @@ def compose_image_parent_policy(source: str, profiles: Sequence[ImageGenerationP
     usage = _one(
         root.findall("./outbound/choose/otherwise/set-variable[@name='usagePayload']"), "usage"
     )
-    prior_cache_fallback = (
-        '?? (long?)usage?["cache_read_input_tokens"] ?? 0;'
-    )
-    current_cache_fallback = (
-        '?? (long?)usage?["cache_read_input_tokens"]\n'
-        '          ?? (long?)usage?["cached_tokens"] ?? 0;'
-    )
-    usage_value = usage.get("value", "")
-    if current_cache_fallback not in usage_value:
-        if usage_value.count(prior_cache_fallback) != 1:
-            raise PolicyCompilationError("Legacy cache usage fallback is not recognized")
-        usage.set("value", usage_value.replace(prior_cache_fallback, current_cache_fallback))
     _replace(root, usage, _branch(usage, _image_usage()))
     burst = max(
         (validate_image_profile(profile).burst_reservation_tokens for profile in profiles),

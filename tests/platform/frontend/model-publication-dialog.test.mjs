@@ -2,14 +2,14 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import { createRequire, stripTypeScriptTypes } from "node:module"
 import test from "node:test"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { runInNewContext } from "node:vm"
 
 import * as connections from "../../../frontend/src/components/model-management/model-publication-connections.ts"
 import * as compatible from "../../../frontend/src/components/model-management/openai-compatible.ts"
 
 const frontendRequire = createRequire(new URL("../../../frontend/package.json", import.meta.url))
-const { rolldown } = await import(frontendRequire.resolve("rolldown"))
+const { rolldown } = await import(pathToFileURL(frontendRequire.resolve("rolldown")))
 const entry = fileURLToPath(new URL("../../../frontend/src/components/model-management/model-publication-dialog.tsx", import.meta.url))
 const bundle = await rolldown({ input: entry, external: id => id !== entry, transform: { jsx: { runtime: "automatic" } }, treeshake: false })
 let compiled

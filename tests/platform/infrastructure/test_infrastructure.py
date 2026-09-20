@@ -277,18 +277,18 @@ def test_public_runtime_resources_are_exempt_from_network_modify_policy() -> Non
 
 
 def test_vnet_subnets_are_created_serially() -> None:
-    telemetry_subnet = DATA_PLANE.split("resource telemetryFunctionSubnet", 1)[1].split(
-        "resource controlFunctionSubnet", 1
+    telemetry_subnet = DATA_PLANE.split("resource managedTelemetryFunctionSubnet", 1)[1].split(
+        "resource managedControlFunctionSubnet", 1
     )[0]
-    control_subnet = DATA_PLANE.split("resource controlFunctionSubnet", 1)[1].split(
-        "resource privateEndpointSubnet", 1
+    control_subnet = DATA_PLANE.split("resource managedControlFunctionSubnet", 1)[1].split(
+        "resource managedPrivateEndpointSubnet", 1
     )[0]
-    private_endpoint_subnet = DATA_PLANE.split("resource privateEndpointSubnet", 1)[
+    private_endpoint_subnet = DATA_PLANE.split("resource managedPrivateEndpointSubnet", 1)[
         1
     ].split("module keyVaultPrivateEndpoint", 1)[0]
-    assert "virtualNetwork" in telemetry_subnet.split("dependsOn:", 1)[1]
-    assert "telemetryFunctionSubnet" in control_subnet.split("dependsOn:", 1)[1]
-    assert "controlFunctionSubnet" in private_endpoint_subnet.split("dependsOn:", 1)[1]
+    assert "parent: managedVirtualNetwork" in telemetry_subnet
+    assert "managedTelemetryFunctionSubnet" in control_subnet.split("dependsOn:", 1)[1]
+    assert "managedControlFunctionSubnet" in private_endpoint_subnet.split("dependsOn:", 1)[1]
 
 
 def test_functions_use_shared_storage_service_endpoints_without_private_links() -> None:
@@ -354,14 +354,18 @@ def test_deployment_bootstraps_only_owned_shared_storage_children() -> None:
     assert "output ledgerTableId string = resourceId(" in MAIN
 
 
-def test_shared_storage_roles_are_verified_outside_arm_deployment() -> None:
+def test_shared_storage_roles_are_granted_outside_arm_deployment() -> None:
     assert "Storage Blob Data Owner" in DEPLOY_SCRIPT
     assert "Storage Table Data Contributor" in DEPLOY_SCRIPT
     assert "Storage Queue Data Contributor" not in DEPLOY_SCRIPT
     assert '_output_string(outputs, "apiPrincipalId")' in DEPLOY_SCRIPT
     assert '_output_string(outputs, "controlPlanePrincipalId")' in DEPLOY_SCRIPT
     assert "module storageRbac" not in MAIN
-    assert "name: guid(workspace.id, functionApp.id, 'log-analytics-reader')" in DATA_PLANE
+    assert (
+        "name: guid(managedWorkspace!.id, functionApp.id, 'log-analytics-reader')"
+        in DATA_PLANE
+    )
+    assert "if (provisionObservability)" in DATA_PLANE
 
 
 def test_api_projects_model_access_using_its_exact_ledger_and_identity() -> None:
@@ -406,19 +410,29 @@ def test_existing_api_model_access_upgrade_reuses_ledger_and_preserves_settings(
 
 def test_api_ledger_network_supports_shared_public_storage() -> None:
     upgrade = (ROOT / "infra/model-access-network-upgrade.bicep").read_text(encoding="utf-8")
-    for template in (DATA_PLANE, upgrade):
-        subnet = template.split("resource apiSubnet ", 1)[1].split("\nresource ", 1)[0]
-        assert "parent: virtualNetwork" in subnet
-        assert "serviceName: 'Microsoft.Web/serverFarms'" in subnet
-        integration = template.split("resource apiVnetIntegration ", 1)[1].split(
-            "\nresource ", 1,
-        )[0]
-        assert "parent: api" in integration
-        assert "name: 'virtualNetwork'" in integration
-        assert "subnetResourceId: apiSubnet.id" in integration
-        assert "swiftSupported: true" in integration
+    subnet = DATA_PLANE.split("resource managedApiSubnet ", 1)[1].split(
+        "\n  dependsOn:", 1
+    )[0]
+    assert "parent: managedVirtualNetwork" in subnet
+    assert "serviceName: 'Microsoft.Web/serverFarms'" in subnet
+    integration = DATA_PLANE.split("resource apiVnetIntegration ", 1)[1].split(
+        "\nresource ", 1,
+    )[0]
+    assert "parent: api" in integration
+    assert "name: 'virtualNetwork'" in integration
+    assert "subnetResourceId: effectiveApiSubnetResourceId" in integration
+    assert "swiftSupported: true" in integration
+    upgrade_subnet = upgrade.split("resource apiSubnet ", 1)[1].split(
+        "\nresource ", 1
+    )[0]
+    assert "parent: virtualNetwork" in upgrade_subnet
+    assert "serviceName: 'Microsoft.Web/serverFarms'" in upgrade_subnet
+    upgrade_integration = upgrade.split("resource apiVnetIntegration ", 1)[1].split(
+        "\nresource ", 1,
+    )[0]
+    assert "subnetResourceId: apiSubnet.id" in upgrade_integration
     assert "addressPrefix: '10.42.3.64/27'" in DATA_PLANE
-    assert "dependsOn: [\n    privateEndpointSubnet\n  ]" in DATA_PLANE
+    assert "dependsOn: [\n    managedPrivateEndpointSubnet\n  ]" in DATA_PLANE
     assert "resource ledgerTablePrivateEndpoint" not in DATA_PLANE
     assert "resource storageBlobPrivateEndpoint" not in DATA_PLANE
     assert "Microsoft.Storage/" not in upgrade
@@ -501,7 +515,9 @@ def test_control_plane_uses_its_own_flex_plan_and_the_platform_vnet() -> None:
         "module controlPlaneApimRbac", 1
     )[0]
     assert "resourcePrefix: resourcePrefix" in MAIN
-    assert "virtualNetworkName: 'vnet-${resourcePrefix}-${suffix}'" in MAIN
+    assert "functionSubnetResourceId: dataPlane.outputs.controlFunctionSubnetResourceId" in MAIN
+    assert "param functionSubnetResourceId string" in CONTROL_PLANE
+    assert "subnetResourceId: functionSubnetResourceId" in CONTROL_PLANE
     assert "apimGatewayUrl: effectiveGatewayApiPath" in MAIN
     assert (
         "var storageName = 'st${take(compactResourcePrefix, 12)}cp${take(suffix, 8)}'"
@@ -512,6 +528,43 @@ def test_control_plane_uses_its_own_flex_plan_and_the_platform_vnet() -> None:
     assert "var planName = 'plan-${resourcePrefix}-control-${suffix}'" in CONTROL_PLANE
     assert "plan-finops" not in CONTROL_PLANE
     assert "vnet-finops" not in CONTROL_PLANE
+
+
+def test_existing_dependency_contracts_are_conditional_and_output_ownership() -> None:
+    for name in (
+        "existingVirtualNetworkResourceId",
+        "existingTelemetryFunctionSubnetResourceId",
+        "existingControlPlaneFunctionSubnetResourceId",
+        "existingPrivateEndpointSubnetResourceId",
+        "existingApiSubnetResourceId",
+        "existingPostgresServerResourceId",
+        "existingEventHubResourceId",
+        "existingLogAnalyticsWorkspaceResourceId",
+        "existingApplicationInsightsResourceId",
+        "existingKeyVaultResourceId",
+    ):
+        assert name in MAIN or name in DEPLOY_SCRIPT
+        assert name in PARAMETERS
+    for switch in (
+        "provisionNetwork",
+        "provisionEventHub",
+        "provisionObservability",
+        "provisionKeyVault",
+    ):
+        assert f"param {switch} bool = true" in MAIN
+        assert f"param {switch} bool = true" in DATA_PLANE
+    assert "output dependencyResources object" in MAIN
+    assert "param keyVaultPrivateDnsLinkName string = 'finops-vnet'" in MAIN
+    assert "privateDnsLinkName: keyVaultPrivateDnsLinkName" in DATA_PLANE
+    for resource in ("postgres", "eventHub", "observability", "keyVault", "network"):
+        assert f"  {resource}: {{" in MAIN
+        assert "provisioned:" in MAIN.split(f"  {resource}: {{", 1)[1].split("  }", 1)[0]
+    assert "if (provisionNetwork)" in DATA_PLANE
+    assert "if (provisionEventHub)" in DATA_PLANE
+    assert "if (provisionObservability)" in DATA_PLANE
+    assert "if (provisionKeyVault)" in DATA_PLANE
+    assert "manageEventHubRoleAssignment" in OBSERVER_APP
+    assert "manageKeyVaultRoleAssignments" in CONTROL_PLANE
 
 
 def test_only_existing_storage_reference_targets_the_storage_resource_group() -> None:

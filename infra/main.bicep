@@ -68,6 +68,59 @@ param provisionApimService bool = true
 @description('Create the PostgreSQL server, database, and Azure-services firewall rule. Set false only when adopting the deterministic database in an existing Turnstile environment.')
 param provisionPostgres bool = true
 
+@description('Existing PostgreSQL server resource ID when provisionPostgres is false for an adopted dependency.')
+param postgresAdopted bool = false
+param existingPostgresServerResourceId string = ''
+param existingPostgresServerName string = ''
+param existingPostgresDatabaseName string = ''
+param useDatabaseUrlOverride bool = false
+@secure()
+param databaseUrlOverride string = ''
+
+@description('Create the Event Hub namespace and token-usage hub.')
+param provisionEventHub bool = true
+param existingEventHubNamespaceResourceGroupName string = ''
+param existingEventHubNamespaceName string = ''
+param existingEventHubName string = ''
+param existingEventHubNamespaceResourceId string = ''
+param existingEventHubResourceId string = ''
+
+@description('Create Log Analytics and workspace-based Application Insights.')
+param provisionObservability bool = true
+param existingLogAnalyticsWorkspaceResourceGroupName string = ''
+param existingLogAnalyticsWorkspaceName string = ''
+param existingApplicationInsightsResourceGroupName string = ''
+param existingApplicationInsightsName string = ''
+
+@description('Create the Turnstile Key Vault and its secrets.')
+param provisionKeyVault bool = true
+param existingKeyVaultResourceGroupName string = ''
+param existingKeyVaultName string = ''
+param existingKeyVaultResourceId string = ''
+param existingDatabaseUrlSecretUri string = ''
+param existingDatabaseUrlResourceId string = ''
+param existingCredentialEncryptionKeySecretUri string = ''
+param existingCredentialKeyResourceId string = ''
+param existingManagementApiKeySecretUri string = ''
+param existingManagementKeyResourceId string = ''
+param existingApimSubscriptionKeySecretUri string = ''
+param existingApimKeyResourceId string = ''
+param existingApimProbeSubscriptionKeySecretUri string = ''
+param existingApimProbeKeyResourceId string = ''
+
+@description('Create the Turnstile VNet and four dedicated subnets.')
+param provisionNetwork bool = true
+param existingVirtualNetworkResourceId string = ''
+param existingTelemetryFunctionSubnetResourceId string = ''
+param existingControlFunctionSubnetResourceId string = ''
+param existingPrivateEndpointSubnetResourceId string = ''
+param existingApiSubnetResourceId string = ''
+param provisionKeyVaultPrivateDnsZone bool = true
+param keyVaultPrivateDnsLinkName string = 'finops-vnet'
+param existingKeyVaultPrivateDnsZoneResourceId string = ''
+param existingKeyVaultPrivateDnsZoneResourceGroupName string = ''
+param existingKeyVaultPrivateDnsZoneName string = ''
+
 @description('Deploy the bootstrap API, operations, and policies. Disable after the first model publication so infrastructure reruns cannot overwrite a live gateway revision.')
 param deployApimBootstrap bool = true
 
@@ -229,7 +282,7 @@ param suffix string = uniqueString(subscription().id, resourceGroup().name)
 var effectiveApimResourceGroupName = provisionApimService ? resourceGroup().name : existingApimResourceGroupName
 
 module apim 'modules/apim-service.bicep' = if (provisionApimService) {
-  name: 'turnstile-apim'
+  name: '${resourcePrefix}-apim-service'
   params: {
     name: 'apim-${resourcePrefix}-${suffix}'
     location: location
@@ -251,7 +304,7 @@ resource sharedStorage 'Microsoft.Storage/storageAccounts@2023-05-01' existing =
 }
 
 module dataPlane 'modules/data-plane.bicep' = {
-  name: 'turnstile-data-plane'
+  name: '${resourcePrefix}-data-plane'
   params: {
     location: location
     postgresLocation: postgresLocation
@@ -269,6 +322,48 @@ module dataPlane 'modules/data-plane.bicep' = {
     postgresSkuName: postgresSkuName
     postgresTier: postgresTier
     provisionPostgres: provisionPostgres
+    postgresAdopted: postgresAdopted
+    existingPostgresServerResourceId: existingPostgresServerResourceId
+    existingPostgresServerName: existingPostgresServerName
+    existingPostgresDatabaseName: existingPostgresDatabaseName
+    useDatabaseUrlOverride: useDatabaseUrlOverride
+    databaseUrlOverride: databaseUrlOverride
+    provisionEventHub: provisionEventHub
+    existingEventHubNamespaceResourceGroupName: existingEventHubNamespaceResourceGroupName
+    existingEventHubNamespaceName: existingEventHubNamespaceName
+    existingEventHubName: existingEventHubName
+    existingEventHubNamespaceResourceId: existingEventHubNamespaceResourceId
+    existingEventHubResourceId: existingEventHubResourceId
+    provisionObservability: provisionObservability
+    existingLogAnalyticsWorkspaceResourceGroupName: existingLogAnalyticsWorkspaceResourceGroupName
+    existingLogAnalyticsWorkspaceName: existingLogAnalyticsWorkspaceName
+    existingApplicationInsightsResourceGroupName: existingApplicationInsightsResourceGroupName
+    existingApplicationInsightsName: existingApplicationInsightsName
+    provisionKeyVault: provisionKeyVault
+    existingKeyVaultResourceGroupName: existingKeyVaultResourceGroupName
+    existingKeyVaultName: existingKeyVaultName
+    existingKeyVaultResourceId: existingKeyVaultResourceId
+    existingDatabaseUrlSecretUri: existingDatabaseUrlSecretUri
+    existingDatabaseUrlResourceId: existingDatabaseUrlResourceId
+    existingCredentialEncryptionKeySecretUri: existingCredentialEncryptionKeySecretUri
+    existingCredentialKeyResourceId: existingCredentialKeyResourceId
+    existingManagementApiKeySecretUri: existingManagementApiKeySecretUri
+    existingManagementKeyResourceId: existingManagementKeyResourceId
+    existingApimSubscriptionKeySecretUri: existingApimSubscriptionKeySecretUri
+    existingApimKeyResourceId: existingApimKeyResourceId
+    existingApimProbeSubscriptionKeySecretUri: existingApimProbeSubscriptionKeySecretUri
+    existingApimProbeKeyResourceId: existingApimProbeKeyResourceId
+    provisionNetwork: provisionNetwork
+    existingVirtualNetworkResourceId: existingVirtualNetworkResourceId
+    existingTelemetryFunctionSubnetResourceId: existingTelemetryFunctionSubnetResourceId
+    existingControlFunctionSubnetResourceId: existingControlFunctionSubnetResourceId
+    existingPrivateEndpointSubnetResourceId: existingPrivateEndpointSubnetResourceId
+    existingApiSubnetResourceId: existingApiSubnetResourceId
+    provisionKeyVaultPrivateDnsZone: provisionKeyVaultPrivateDnsZone
+    keyVaultPrivateDnsLinkName: keyVaultPrivateDnsLinkName
+    existingKeyVaultPrivateDnsZoneResourceId: existingKeyVaultPrivateDnsZoneResourceId
+    existingKeyVaultPrivateDnsZoneResourceGroupName: existingKeyVaultPrivateDnsZoneResourceGroupName
+    existingKeyVaultPrivateDnsZoneName: existingKeyVaultPrivateDnsZoneName
     credentialEncryptionKey: credentialEncryptionKey
     managementApiKey: managementApiKey
     apimSubscriptionKey: apimSubscriptionKey
@@ -294,7 +389,7 @@ module dataPlane 'modules/data-plane.bicep' = {
 }
 
 module apimIntegration 'modules/apim-integration.bicep' = if (deployApimBootstrap) {
-  name: 'turnstile-apim-integration-${take(suffix, 13)}'
+  name: '${resourcePrefix}-apim-integration-${take(suffix, 8)}'
   scope: resourceGroup(effectiveApimResourceGroupName)
   params: {
     apimName: effectiveApimName
@@ -328,12 +423,12 @@ module apimIntegration 'modules/apim-integration.bicep' = if (deployApimBootstra
     employeeSurfaceMap: employeeSurfaceMap
     subscriptionAgentMap: subscriptionAgentMap
     appInsightsName: dataPlane.outputs.applicationInsightsName
-    appInsightsResourceGroupName: resourceGroup().name
+    appInsightsResourceGroupName: dataPlane.outputs.applicationInsightsResourceGroupName
   }
 }
 
 module controlPlane 'modules/control-plane-function.bicep' = if (provisionControlPlane) {
-  name: 'turnstile-control-plane-function'
+  name: '${resourcePrefix}-control-plane-function'
   params: {
     location: location
     resourcePrefix: resourcePrefix
@@ -343,9 +438,9 @@ module controlPlane 'modules/control-plane-function.bicep' = if (provisionContro
     storageQueueEndpoint: sharedStorage.properties.primaryEndpoints.queue
     storageTableEndpoint: sharedStorage.properties.primaryEndpoints.table
     deploymentContainerName: controlPlaneDeploymentContainerName
-    virtualNetworkName: 'vnet-${resourcePrefix}-${suffix}'
-    functionSubnetName: 'snet-flex-control'
+    functionSubnetResourceId: dataPlane.outputs.controlFunctionSubnetResourceId
     keyVaultName: dataPlane.outputs.keyVaultName
+    manageKeyVaultRoleAssignments: dataPlane.outputs.keyVaultProvisioned
     databaseUrlSecretUri: dataPlane.outputs.databaseUrlSecretUri
     apimProbeSubscriptionKeySecretUri: dataPlane.outputs.apimProbeSubscriptionKeySecretUri
     credentialEncryptionKeySecretUri: dataPlane.outputs.credentialEncryptionKeySecretUri
@@ -372,7 +467,7 @@ module controlPlane 'modules/control-plane-function.bicep' = if (provisionContro
 }
 
 module controlPlaneApimRbac 'modules/control-plane-apim-rbac.bicep' = if (provisionControlPlane) {
-  name: 'turnstile-control-plane-apim-rbac-${take(suffix, 13)}'
+  name: '${resourcePrefix}-control-plane-apim-rbac-${take(suffix, 8)}'
   scope: resourceGroup(effectiveApimResourceGroupName)
   params: {
     apimName: effectiveApimName
@@ -382,7 +477,7 @@ module controlPlaneApimRbac 'modules/control-plane-apim-rbac.bicep' = if (provis
 }
 
 module applicationKeyManagementRbac 'modules/application-key-management-rbac.bicep' = if (gatewayApplicationKeyManagementEnabled) {
-  name: 'turnstile-application-key-management-rbac-${take(suffix, 13)}'
+  name: '${resourcePrefix}-application-key-rbac-${take(suffix, 8)}'
   scope: resourceGroup(effectiveApimResourceGroupName)
   params: {
     apimName: effectiveApimName
@@ -412,6 +507,62 @@ output observerAdapterKeyNamedValueName string = observerAdapterKeyNamedValueNam
 output postgresServerName string = dataPlane.outputs.postgresServerName
 output eventHubNamespaceName string = dataPlane.outputs.eventHubNamespaceName
 output applicationInsightsName string = dataPlane.outputs.applicationInsightsName
+output dependencyResources object = {
+  postgres: {
+    resourceId: dataPlane.outputs.postgresServerResourceId
+    serverName: dataPlane.outputs.postgresServerName
+    databaseName: dataPlane.outputs.databaseName
+    provisioned: dataPlane.outputs.postgresProvisioned
+  }
+  eventHub: {
+    namespaceResourceId: dataPlane.outputs.eventHubNamespaceResourceId
+    resourceId: dataPlane.outputs.eventHubResourceId
+    resourceGroupName: dataPlane.outputs.eventHubNamespaceResourceGroupName
+    namespaceName: dataPlane.outputs.eventHubNamespaceName
+    name: dataPlane.outputs.eventHubName
+    provisioned: dataPlane.outputs.eventHubProvisioned
+  }
+  observability: {
+    workspaceResourceId: dataPlane.outputs.logAnalyticsWorkspaceResourceId
+    workspaceResourceGroupName: dataPlane.outputs.logAnalyticsWorkspaceResourceGroupName
+    workspaceName: dataPlane.outputs.logAnalyticsWorkspaceName
+    applicationInsightsResourceId: dataPlane.outputs.applicationInsightsResourceId
+    applicationInsightsResourceGroupName: dataPlane.outputs.applicationInsightsResourceGroupName
+    applicationInsightsName: dataPlane.outputs.applicationInsightsName
+    provisioned: dataPlane.outputs.observabilityProvisioned
+  }
+  keyVault: {
+    resourceId: dataPlane.outputs.keyVaultResourceId
+    resourceGroupName: dataPlane.outputs.keyVaultResourceGroupName
+    name: dataPlane.outputs.keyVaultName
+    provisioned: dataPlane.outputs.keyVaultProvisioned
+    databaseUrlSecretUri: dataPlane.outputs.databaseUrlSecretUri
+    databaseUrlSecretResourceId: dataPlane.outputs.databaseUrlSecretResourceId
+    credentialEncryptionKeySecretUri: dataPlane.outputs.credentialEncryptionKeySecretUri
+    credentialEncryptionKeySecretResourceId: dataPlane.outputs.credentialEncryptionKeySecretResourceId
+    managementApiKeySecretUri: dataPlane.outputs.managementApiKeySecretUri
+    managementApiKeySecretResourceId: dataPlane.outputs.managementApiKeySecretResourceId
+    apimSubscriptionKeySecretUri: dataPlane.outputs.apimSubscriptionKeySecretUri
+    apimSubscriptionKeySecretResourceId: dataPlane.outputs.apimSubscriptionKeySecretResourceId
+    apimProbeSubscriptionKeySecretUri: dataPlane.outputs.apimProbeSubscriptionKeySecretUri
+    apimProbeSubscriptionKeySecretResourceId: dataPlane.outputs.apimProbeSubscriptionKeySecretResourceId
+    privateEndpointId: dataPlane.outputs.keyVaultPrivateEndpointId
+    privateDnsZoneId: dataPlane.outputs.keyVaultPrivateDnsZoneId
+    privateDnsZoneName: dataPlane.outputs.keyVaultPrivateDnsZoneName
+    privateDnsZoneProvisioned: dataPlane.outputs.keyVaultPrivateDnsZoneProvisioned
+    privateDnsLinkName: dataPlane.outputs.keyVaultPrivateDnsLinkName
+    privateDnsLinkId: dataPlane.outputs.keyVaultPrivateDnsLinkId
+    privateDnsLinkProvisioned: dataPlane.outputs.keyVaultPrivateDnsLinkProvisioned
+  }
+  network: {
+    virtualNetworkResourceId: dataPlane.outputs.virtualNetworkResourceId
+    telemetryFunctionSubnetResourceId: dataPlane.outputs.telemetryFunctionSubnetResourceId
+    controlFunctionSubnetResourceId: dataPlane.outputs.controlFunctionSubnetResourceId
+    privateEndpointSubnetResourceId: dataPlane.outputs.privateEndpointSubnetResourceId
+    apiSubnetResourceId: dataPlane.outputs.apiSubnetResourceId
+    provisioned: dataPlane.outputs.networkProvisioned
+  }
+}
 output appServicePlanName string = dataPlane.outputs.appServicePlanName
 output telemetryFunctionPlanName string = dataPlane.outputs.telemetryFunctionPlanName
 output telemetryDeploymentContainerName string = dataPlane.outputs.telemetryDeploymentContainerName

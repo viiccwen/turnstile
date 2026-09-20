@@ -30,7 +30,7 @@ class StubAuthStore:
                 "role": "owner",
                 "method": "password",
                 "created_at": datetime(2026, 8, 10, tzinfo=UTC),
-                "expires_at": datetime(2026, 8, 17, tzinfo=UTC),
+                "expires_at": datetime(2099, 8, 17, tzinfo=UTC),
             },
             hash_session_token(MEMBER_SESSION): {
                 "id": "00000000-0000-4000-8000-000000000002",
@@ -39,7 +39,7 @@ class StubAuthStore:
                 "role": "member",
                 "method": "password",
                 "created_at": datetime(2026, 8, 10, tzinfo=UTC),
-                "expires_at": datetime(2026, 8, 17, tzinfo=UTC),
+                "expires_at": datetime(2099, 8, 17, tzinfo=UTC),
             },
         }
         return sessions.get(token_sha256)

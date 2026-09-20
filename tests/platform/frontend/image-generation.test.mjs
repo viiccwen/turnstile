@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs"
 import { createRequire, stripTypeScriptTypes } from "node:module"
 import test from "node:test"
 import { setImmediate as nextTurn } from "node:timers/promises"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { runInNewContext } from "node:vm"
 
 import { generatedImageBlob, imageDownloadFilename } from "../../../frontend/src/data-sources/apim/image-generation.ts"
@@ -16,7 +16,7 @@ const normalizeRegistry = runInNewContext(`${stripTypeScriptTypes(apiSource.slic
 const emptyRegistry = { gateways: [], providers: [], runtimes: [], models: [] }
 
 const frontendRequire = createRequire(new URL("../../../frontend/package.json", import.meta.url))
-const { rolldown } = await import(frontendRequire.resolve("rolldown"))
+const { rolldown } = await import(pathToFileURL(frontendRequire.resolve("rolldown")))
 const invocationEntry = fileURLToPath(new URL("../../../frontend/src/data-sources/apim/pages/dashboard-invocation.tsx", import.meta.url))
 const invocationBundle = await rolldown({ input: invocationEntry, external: id => id !== invocationEntry, transform: { jsx: { runtime: "automatic" } }, treeshake: false })
 let invocationComponent

@@ -35,9 +35,49 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$adoptedSecretFields = @(
+    'databaseUrl',
+    'credentialEncryptionKey',
+    'managementApiKey',
+    'apimSubscriptionKey',
+    'apimProbeSubscriptionKey'
+)
+$unsupportedAdoptedEnvironmentNames = @(
+    'TURNSTILE_ADOPTED_DATABASE_URL',
+    'TURNSTILE_ADOPTED_CREDENTIAL_ENCRYPTION_KEY',
+    'TURNSTILE_ADOPTED_MANAGEMENT_API_KEY',
+    'TURNSTILE_ADOPTED_APIM_SUBSCRIPTION_KEY',
+    'TURNSTILE_ADOPTED_APIM_PROBE_SUBSCRIPTION_KEY'
+)
+$directSecretEnvironmentNames = [System.Collections.Generic.List[string]]::new()
+foreach ($name in $unsupportedAdoptedEnvironmentNames) {
+    $item = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+    if ($null -ne $item -and [string]$item.Value) {
+        $directSecretEnvironmentNames.Add($name)
+    }
+}
+if ($directSecretEnvironmentNames.Count) {
+    throw 'Direct TURNSTILE_ADOPTED_* environment input is unsupported. Use the top-level adoptedSecrets object in the Parameters JSON.'
+}
+
 function Require-Command([string]$Name) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
         throw "Required command is unavailable: $Name"
+    }
+}
+
+function Protect-PrivateFile([string]$Path) {
+    Require-Command 'icacls'
+    $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    & icacls `
+        $Path `
+        '/inheritance:r' `
+        '/grant:r' `
+        "*$currentSid`:(F)" `
+        '*S-1-5-18:(F)' `
+        '*S-1-5-32-544:(F)' | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to secure private file ACL: $Path"
     }
 }
 
@@ -51,12 +91,60 @@ $parameterPath = (Resolve-Path $Parameters).Path
 
 $statePath = $null
 if ($State) {
-    $statePath = (Resolve-Path $State).Path
+    $statePath = if ([System.IO.Path]::IsPathRooted($State)) {
+        [System.IO.Path]::GetFullPath($State)
+    } else {
+        [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot $State))
+    }
 }
 
 $ownerCredentialPath = $null
 if ($OwnerCredentials) {
     $ownerCredentialPath = (Resolve-Path $OwnerCredentials).Path
+}
+
+$parameterDocument = Get-Content -LiteralPath $parameterPath -Raw -Encoding UTF8 |
+    ConvertFrom-Json
+$adoptedSecretsProperty = $parameterDocument.PSObject.Properties['adoptedSecrets']
+if ($null -ne $adoptedSecretsProperty) {
+    Protect-PrivateFile $parameterPath
+    $adoptedSecretDocument = $adoptedSecretsProperty.Value
+    if ($null -eq $adoptedSecretDocument -or $adoptedSecretDocument -isnot [pscustomobject]) {
+        throw 'adoptedSecrets must contain one JSON object.'
+    }
+    $configuredNames = @($adoptedSecretDocument.PSObject.Properties.Name)
+    $expectedNames = @($adoptedSecretFields)
+    $missingNames = @($expectedNames | Where-Object { $_ -notin $configuredNames })
+    $unexpectedNames = @($configuredNames | Where-Object { $_ -notin $expectedNames })
+    if ($missingNames.Count -or $unexpectedNames.Count) {
+        throw 'adoptedSecrets must contain exactly the five documented JSON keys.'
+    }
+    foreach ($field in $expectedNames) {
+        $value = [string]$adoptedSecretDocument.PSObject.Properties[$field].Value
+        if (-not $value) {
+            throw "adoptedSecrets contains an empty value: $field"
+        }
+    }
+}
+$resourceGroup = [string]$parameterDocument.parameters.resourceGroupName.value
+if (-not $resourceGroup) {
+    throw 'resourceGroupName is required for deployment lifecycle operations.'
+}
+$existingKeyVault = $parameterDocument.parameters.PSObject.Properties['existingKeyVaultResourceId']
+$existingKeyVaultResourceId = if ($null -eq $existingKeyVault) {
+    ''
+} else {
+    [string]$existingKeyVault.Value.value
+}
+if ($null -ne $adoptedSecretsProperty -and -not $existingKeyVaultResourceId) {
+    throw 'adoptedSecrets is valid only when adopting an existing Key Vault.'
+}
+if (
+    $Action -ne 'manifest' -and
+    $existingKeyVaultResourceId -and
+    $null -eq $adoptedSecretsProperty
+) {
+    throw 'Adopted plan and deploy require the top-level adoptedSecrets object.'
 }
 
 Push-Location $repositoryRoot
@@ -84,12 +172,6 @@ try {
         }
     }
 
-    $parameterDocument = Get-Content -LiteralPath $parameterPath -Raw -Encoding UTF8 |
-        ConvertFrom-Json
-    $resourceGroup = [string]$parameterDocument.parameters.resourceGroupName.value
-    if (-not $resourceGroup) {
-        throw 'resourceGroupName is required for deployment lifecycle operations.'
-    }
     $outputsPath = if ($statePath) {
         Join-Path `
             (Split-Path $statePath -Parent) `
@@ -111,9 +193,7 @@ try {
         return
     }
 
-    $deployArguments = @(
-        'run',
-        'python',
+    $orchestratorArguments = @(
         '-m',
         'scripts.deploy',
         $Action,
@@ -124,22 +204,23 @@ try {
     )
 
     if ($statePath) {
-        $deployArguments += @('--state', $statePath)
+        $orchestratorArguments += @('--state', $statePath)
     }
     if ($ownerCredentialPath) {
-        $deployArguments += @('--owner-credentials', $ownerCredentialPath)
+        $orchestratorArguments += @('--owner-credentials', $ownerCredentialPath)
     }
     if ($Yes) {
-        $deployArguments += '--yes'
+        $orchestratorArguments += '--yes'
     }
     if ($AllowDirty) {
-        $deployArguments += '--allow-dirty'
+        $orchestratorArguments += '--allow-dirty'
     }
 
     Write-Host "Running Turnstile $Action from $repositoryRoot"
-    & uv @deployArguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "Turnstile $Action failed with exit code $LASTEXITCODE"
+    & uv run python @orchestratorArguments
+    $deployExitCode = $LASTEXITCODE
+    if ($deployExitCode -ne 0) {
+        throw "Turnstile $Action failed with exit code $deployExitCode"
     }
 
     if ($Action -eq 'deploy') {
