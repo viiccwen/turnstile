@@ -58,6 +58,7 @@ resource publisherRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
           'Microsoft.ApiManagement/service/products/read'
           'Microsoft.ApiManagement/service/read'
           'Microsoft.ApiManagement/service/subscriptions/read'
+          'Microsoft.ApiManagement/service/subscriptions/listSecrets/action'
           'Microsoft.ApiManagement/service/subscriptions/write'
         ], oauthActions)
         notActions: []

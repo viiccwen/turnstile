@@ -2501,6 +2501,7 @@ def test_repository_parameter_example_and_generated_documents_match_bicep(
     root_document = deployment_parameters(inputs, material)
     observer_document = observer_parameters(inputs, platform_outputs, material, "abc123")
     release_document = runtime_release_parameters(
+        inputs,
         material,
         {
             "apiName": "api-turnstile-test",

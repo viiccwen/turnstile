@@ -63,6 +63,8 @@ def test_bootstrap_initial_apim_target_registers_seeded_profile_when_empty() -> 
         apim_service_name="unit-apim",
         apim_api_id="turnstile-llm",
         apim_gateway_url="https://unit-apim.azure-api.net/turnstile/llm",
+        apim_dashboard_subscription_id="unit-dashboard",
+        apim_probe_subscription_id="unit-probe",
     )
     with patch("backend.bootstrap.register_existing_apim_target") as register:
         created = bootstrap_initial_apim_target(
@@ -77,6 +79,8 @@ def test_bootstrap_initial_apim_target_registers_seeded_profile_when_empty() -> 
     assert registration.name == "unit-apim"
     assert registration.tenant_id == UUID("00000000-0000-4000-8000-000000000020")
     assert str(registration.gateway_endpoint) == "https://unit-apim.azure-api.net/turnstile/llm"
+    assert registration.dashboard_subscription_id == "unit-dashboard"
+    assert registration.probe_subscription_id == "unit-probe"
 
 
 @pytest.mark.parametrize("case", [

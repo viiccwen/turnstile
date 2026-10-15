@@ -97,6 +97,7 @@ def bootstrap_initial_apim_target(
             "api_id": api_id,
             "management_endpoint": f"https://management.azure.com{arm_resource_id}",
             "gateway_endpoint": gateway_url,
+            "dashboard_subscription_id": settings.apim_dashboard_subscription_id,
             "probe_subscription_id": settings.apim_probe_subscription_id,
         }
     )
