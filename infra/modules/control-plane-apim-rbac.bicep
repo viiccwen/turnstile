@@ -33,6 +33,7 @@ resource publisherRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
           'Microsoft.ApiManagement/service/apis/operations/policies/read'
           'Microsoft.ApiManagement/service/apis/operations/policies/write'
           'Microsoft.ApiManagement/service/apis/operations/read'
+          'Microsoft.ApiManagement/service/apis/operations/write'
           'Microsoft.ApiManagement/service/apis/policies/read'
           'Microsoft.ApiManagement/service/apis/policies/write'
           'Microsoft.ApiManagement/service/apis/products/read'
