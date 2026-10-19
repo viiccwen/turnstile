@@ -48,6 +48,8 @@ resource publisherRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
           'Microsoft.ApiManagement/service/gateways/certificateAuthorities/read'
           'Microsoft.ApiManagement/service/gateways/hostnameConfigurations/read'
           'Microsoft.ApiManagement/service/gateways/read'
+          'Microsoft.ApiManagement/service/loggers/read'
+          'Microsoft.ApiManagement/service/loggers/write'
           'Microsoft.ApiManagement/service/namedValues/read'
           'Microsoft.ApiManagement/service/namedValues/write'
           'Microsoft.ApiManagement/service/policies/read'

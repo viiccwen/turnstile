@@ -59,6 +59,7 @@ resource inventoryReaderRole 'Microsoft.Authorization/roleDefinitions@2022-04-01
           'Microsoft.ApiManagement/service/apis/operations/read'
           'Microsoft.ApiManagement/service/apis/policies/read'
           'Microsoft.ApiManagement/service/apis/operations/policies/read'
+          'Microsoft.ApiManagement/service/namedValues/read'
           'Microsoft.ApiManagement/service/gateways/read'
           'Microsoft.ApiManagement/service/gateways/apis/read'
           'Microsoft.ApiManagement/service/gateways/hostnameConfigurations/read'
