@@ -458,8 +458,11 @@ def test_initialized_parent_matches_the_public_rendered_policy(
     settings = settings.model_copy(update={
         "budget_execution_target_ids": [request.gateway_profile_id],
     })
-    with pytest.raises(ValueError, match="manual parent override"):
-        function_app._parent_policy_overrides(policy_path, repository)
+    monkeypatch.setattr(function_app, "get_settings", lambda: settings)
+    parents = function_app._parent_policy_overrides(policy_path, repository)
+    validate_parent_policy(
+        render_onboarding_parent(request, config, source), parents[request.gateway_profile_id],
+    )
 
 
 @pytest.mark.parametrize("enrollment", ["valid", "missing", "other_epoch", "other_target"])

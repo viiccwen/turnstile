@@ -239,6 +239,12 @@ def _parent_policy_overrides(
 ) -> dict[UUID, str]:
     settings = get_settings()
     overrides = {}
+    initialized = (
+        initialized_apim_targets(repository)
+        if repository is not None
+        and getattr(settings, "apim_target_registry_enabled", False)
+        else {}
+    )
     if getattr(settings, "apim_legacy_target_compatibility_enabled", False):
         if repository is not None:
             settings = resolve_apim_target_settings(repository, settings)
@@ -254,15 +260,17 @@ def _parent_policy_overrides(
         )
         source = policy_path.read_text(encoding="utf-8")
         for target in targets:
+            if target in initialized:
+                continue
             if target in overrides:
                 raise RuntimeError("Execution cannot silently replace a schema-one target")
             overrides[target] = compose_budget_execution_parent(
                 source, source, enabled=True,
                 delegation=settings.budget_delegation_trust.get(target),
             )
-    if repository is not None and getattr(settings, "apim_target_registry_enabled", False):
+    if initialized:
         source = policy_path.read_text(encoding="utf-8")
-        for target, request in initialized_apim_targets(repository).items():
+        for target, request in initialized.items():
             if target in overrides:
                 raise ValueError("Initialized APIM cannot use a manual parent override")
             overrides[target] = onboarding_canonical_parent(source, request.api_id)
