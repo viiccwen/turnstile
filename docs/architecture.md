@@ -2,6 +2,18 @@
 
 Turnstile separates the inference data plane from management and analytics.
 
+The [editable Visio component diagram](assets/turnstile-architecture.vdx) shows the
+inference, management, telemetry, and shared-service flows. Open the VDX in Visio
+and save it as VSDX if needed. Its colored regions are logical groupings, not
+network isolation or private-endpoint claims. Azure service nodes contain
+[official Microsoft Azure architecture icons](https://learn.microsoft.com/azure/architecture/icons/)
+embedded as separate picture shapes; labels and arrows remain editable. Non-Azure
+components use text cards so that no Azure icon misrepresents their identity. The
+official icon files are distributed by Microsoft for architectural diagrams and
+documentation; do not reuse them as product branding. To regenerate, run
+`npm ci --prefix scripts` and `node scripts/generate_architecture_diagram.mjs`
+from the repository root. Generation downloads and verifies the pinned icon archive.
+
 ## Components
 
 | Component | Responsibility |

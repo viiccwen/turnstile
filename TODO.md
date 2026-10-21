@@ -39,12 +39,61 @@
 
 1. 盤點哪些功能尚未開發 / Mock
 
-- **企業目錄仍為 Mock**：Organization、Department、Project、Agent 與 20 個 Person 仍是 Contoso 固定資料，尚無 CRUD 或 Entra Directory 同步。
+- **企業目錄仍為 Mock**：Organization、Department、Project、Agent 與 20 個 Person 仍是 Contoso 固定資料，尚無 CRUD 或 Entra Directory 同步；**Entra ID 使用者不會在首次登入後立即出現在 Budget 管控畫面**：使用者必須先產生具有有效部門歸屬的 Gateway 流量，系統才會將其納入 Budget Management。
 - **Application 歸屬未完成**：自 APIM 匯入的 Application 沒有 Owner／Department；新建項目仍不設定 Department，成本無法完整歸屬。
 - **Budget 功能未完整**：目前只有 Token Budget／Admission，尚無 USD Budget／Admission。
-- **Model Intelligent Router 未開發**：目前只有 APIM failover／balanced／weighted pool，沒有依 Prompt、成本或模型能力自動選模。
+- **尚無 Model Intelligent Router**：目前只有 APIM failover／balanced／weighted pool，沒有依 Prompt、成本或模型能力自動選模，但在會議中有看到，所以是還沒推上開源版。
 - **GitHub Copilot 尚未 Production-ready**：功能已接線，但用量、成本與治理資料仍需真實組織的端對端驗證。
-- **仍有硬編碼資料**：Runtime Health Check 固定寫入 Contoso 歸屬資訊，且前端會將 legacy `user-XX` 改寫為測試信箱。
-- **Live E2E 尚未完成**：Clean-clone 自助部署、APIM 升級／回滾、圖片生成及 PostgreSQL／Table Storage／Event Hub／Log Analytics，目前主要只有 Mock／Fixture 測試。
 - **FinOps Assistant 尚待驗證**：工具查詢已實作，但最終文字與圖表中的數字尚未逐項確認皆來自工具結果。
-- **部署彈性已完成實機驗收**：Managed／Adopted 的部署、健康、登入、ownership、真實模型 publication、BFF→APIM 推論、Event Hub persisted telemetry 與安全清理均通過；最終 validation resources／APIM children 為 0，Live Health 為 HTTP 200。
+
+# 2026/09/23 TODO
+
+1. owner 只能使用帳密設定嘛?
+2. managedmentApiKey 是甚麼
+3. 補上那些參數要去哪裡取得
+
+# 2026/10/02 TODO
+
+1. 為何要在參數綁定 Foundry? 只能指定一個 Foundry?
+2. Fernet Key 如何產生?
+3. credential 每個都要講清楚如何填寫
+4. 申請 app registration (entra client ID), 要如何設定 / permission?
+5. Subnet 可以填一樣的嗎? 或是限制?
+6. 建置好後哪些設定
+
+# 2026/10/07 TODO
+
+1. `credentialEncryptionKey` 補上定義，產生的連結網址
+2. `managementApiKey` 補上定義，產生的連結網址
+3. `apimSubscriptionKey` 補上定義，產生的連結網址
+4. "若要依部門歸屬 telemetry，可新增 department-* App Roles，例如 department-platform，再於 Enterprise applications 將 users/groups 指派至該 role。這些 roles 是選填。" -> 移除他
+
+# 2026/10/21 TODO
+
+## 討論內容
+1. Turnstile v1.2 更新
+2. GitHub Copilot Changelog (近三個月)
+3. 下個月的 AI credit
+
+## pre
+
+1. organization, department 仍是 Mock data
+2. Member 仍未解決完整的成員歸戶管理: Entra ID 使用者不會在首次登入後立即出現在 Budget 管控畫面：使用者必須先打過帶有部門的 request，系統才會偵測到並將其納入 Budget Management
+3. Model Intelligent Router 不包含在 v1.2
+4. 新增 APIM, self-hosted Gateway 管理頁面
+5. Foundry 現在不需放入平台部署公開參數檔 (Sync 後會 migrate 這部分)
+7. 新增 Atomic 美元預算與成本 (Sync 後會 migrate 這部分)
+8. 加上模型價格管理預填入 (GPT 5.6+ 相關模型皆不支援)
+9. 多 APIM 模型發布 (目前僅支援 API, UI 尚未支援)
+
+
+## Notes
+
+組織部門:
+1. add user by Entra
+2. import group 時是否會帶 user list
+3. 確認如何取得模型價格
+4. * 目前若透過 Azure Portal 手動修改 Policy、權限，或部分 Gateway 未同步更新，可能導致平台顯示的設定與實際執行狀態不一致 -> 證實
+5. 哪些問題在 v1.2 已經被解決了
+
+6. 查一下 Copilot CLI limits soft-cap
