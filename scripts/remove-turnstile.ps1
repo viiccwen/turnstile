@@ -1214,6 +1214,18 @@ foreach ($spec in $outputResourceSpecs) {
     }
     $resource = Invoke-AzJson @('resource', 'show', '--ids', $resourceId, '--output', 'json') -AllowFailure
     if ($null -eq $resource) {
+        # Partial cleanup may already have removed this exact resource. Confirm
+        # absence with a successful scoped list; do not hide authorization errors
+        # or transient show failures for resources that are still present.
+        $remainingIds = @(Invoke-AzJson @(
+            'resource', 'list', '--subscription', $Subscription,
+            '--resource-group', $platformResourceGroup,
+            '--query', '[].id', '--output', 'json'
+        ))
+        if ($resourceId -notin $remainingIds) {
+            Write-Warning "Skipping already absent Azure resource: $resourceId"
+            continue
+        }
         throw "Deployment output references a missing Azure resource: $resourceId"
     }
     $ownedById[$resourceId] = [pscustomobject]@{
@@ -1330,6 +1342,15 @@ foreach ($spec in $dependencyResourceSpecs) {
     }
     $resource = Invoke-AzJson @('resource', 'show', '--ids', $resourceId, '--output', 'json') -AllowFailure
     if ($null -eq $resource) {
+        $remainingIds = @(Invoke-AzJson @(
+            'resource', 'list', '--subscription', $Subscription,
+            '--resource-group', $platformResourceGroup,
+            '--query', '[].id', '--output', 'json'
+        ))
+        if ($resourceId -notin $remainingIds) {
+            Write-Warning "Skipping already absent Azure resource: $resourceId"
+            continue
+        }
         throw "Deployment output references a missing Azure resource: $resourceId"
     }
     $ownedById[$resourceId] = [pscustomobject]@{
@@ -1435,7 +1456,8 @@ foreach ($resource in $ownedResources) {
             $siteCommand, 'delete',
             '--subscription', $Subscription,
             '--resource-group', $platformResourceGroup,
-            '--name', [string]$resource.name
+            '--name', [string]$resource.name,
+            '--keep-empty-plan'
         )
     } elseif ([string]$resource.type -ieq 'Microsoft.Web/serverFarms') {
         Add-AzAction "Delete Azure resource $($resource.type)/$($resource.name)" @(
