@@ -16,6 +16,14 @@ group in the same subscription. The templates publish `ledgerTableResourceId`,
 `routeTableResourceId` (also `routeTableId`), and both Table endpoints from that exact account;
 platform governance must reference those IDs, not a dedicated or platform-group account.
 
+Cleanup ownership is recorded only when the Entra-authenticated storage create command
+explicitly returns `created=true`. Exact child IDs are checkpointed beside secret state in
+the `.storage-children.json` journal after each creation, then merged with prior evidence
+into the flat `managedStorageChildResourceIds` array in deployment outputs. Keep this journal
+when resuming after a partial bootstrap or failed ARM deployment. Existing children, including
+`ModelRoutes`, and legacy children without creation evidence are preserved by removal;
+an idempotent create alone never transfers ownership. Other adopted resources remain untouched.
+
 The lifecycle must verify these exact-scope grants before package deployment and before enabling
 publication, Application provisioning, or Gateway Release workers; stop with actionable missing
 permissions rather than declaring the environment ready:

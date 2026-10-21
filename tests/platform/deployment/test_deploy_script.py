@@ -12,8 +12,10 @@ import tomllib
 import urllib.error
 import zipfile
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
+from typing import cast
 
 import httpx
 import pytest
@@ -38,6 +40,7 @@ from scripts.deploy import (
     _write_private_json,
     build_and_start_observer,
     build_parser,
+    deploy_function_package,
     deploy_packages,
     deploy_webapp_package,
     deployment_parameters,
@@ -1021,6 +1024,147 @@ def test_shared_storage_bootstrap_creates_only_owned_children(
     assert all(command[command.index("--account-name") + 1] == "geoliangdatalake" for command in commands)
     assert all("--auth-mode" in command and "login" in command for command in commands)
     assert all("queue" not in command for command in commands)
+
+
+@pytest.mark.parametrize(
+    ("responses", "owned_indexes"),
+    [
+        (["false", "false", "false", "false"], []),
+        (["true", "false", "true", "false"], [0, 2]),
+        (["true", "true", "true", "true"], [0, 1, 2, 3]),
+        (["", "null", "{}", '"true"'], []),
+    ],
+)
+def test_storage_child_ownership_requires_explicit_creation_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    responses: list[str], owned_indexes: list[int],
+) -> None:
+    from scripts import deploy
+
+    inputs = DeploymentInputs.load(
+        "subscription", _parameters(tmp_path / "parameters.json"), tmp_path / "state.json"
+    )
+    account_id = _shared_storage_outputs()["storageAccountId"]
+    children = [
+        f"{account_id}/blobServices/default/containers/victurnstile-telemetry-deploy",
+        f"{account_id}/blobServices/default/containers/victurnstile-control-deploy",
+        f"{account_id}/tableServices/default/tables/VicturnstileLedger",
+        f"{account_id}/tableServices/default/tables/ModelRoutes",
+    ]
+    runner = CommandRunner()
+    results = iter(responses)
+
+    def run(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert kwargs["capture"] is True
+        assert command[command.index("--query") + 1] == "created"
+        assert command[command.index("--output") + 1] == "json"
+        return subprocess.CompletedProcess(command, 0, stdout=next(results))
+
+    monkeypatch.setattr(runner, "run", run)
+    ensure_shared_storage_resources(runner, inputs)
+    checkpoint = inputs.state_path.with_suffix(".storage-children.json")
+    expected = sorted(children[index] for index in owned_indexes)
+    assert checkpoint.exists() is bool(expected)
+    if expected:
+        assert json.loads(checkpoint.read_text(encoding="utf-8")) == {
+            "managedStorageChildResourceIds": expected,
+        }
+    # ARM outputs and later observer/runtime output rewrites must retain evidence.
+    deploy._write_outputs(inputs, {"resourceGroupName": "turnstile-test"})
+    deploy._write_outputs(inputs, {"resourceGroupName": "turnstile-test", "apiName": "api"})
+    saved = deploy.load_saved_outputs(inputs)
+    assert saved is not None
+    assert saved.get("managedStorageChildResourceIds", []) == expected
+
+
+def test_storage_child_ownership_resumes_partial_bootstrap_without_claiming_existing_route_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import deploy
+
+    inputs = DeploymentInputs.load(
+        "subscription", _parameters(tmp_path / "parameters.json"), tmp_path / "state.json"
+    )
+    runner = CommandRunner()
+    calls = 0
+
+    def interrupted(command: Sequence[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise DeploymentError("bootstrap interrupted")
+        return subprocess.CompletedProcess(command, 0, stdout="true\n")
+
+    monkeypatch.setattr(runner, "run", interrupted)
+    with pytest.raises(DeploymentError, match="bootstrap interrupted"):
+        ensure_shared_storage_resources(runner, inputs)
+    assert deploy.load_saved_outputs(inputs) is None  # ARM has not returned outputs yet.
+    checkpoint = inputs.state_path.with_suffix(".storage-children.json")
+    first = json.loads(checkpoint.read_text(encoding="utf-8"))["managedStorageChildResourceIds"]
+    assert len(first) == 1
+
+    results = iter(("false", "true", "false", "false"))
+    monkeypatch.setattr(
+        runner, "run", lambda command, **_: subprocess.CompletedProcess(
+            command, 0, stdout=next(results)
+        ),
+    )
+    ensure_shared_storage_resources(runner, inputs)
+    deploy._write_outputs(inputs, {"resourceGroupName": "turnstile-test"})
+    saved = deploy.load_saved_outputs(inputs)
+    assert saved is not None
+    owned = saved["managedStorageChildResourceIds"]
+    assert len(owned) == 2
+    assert set(first) <= set(owned)
+    assert all("/containers/" in resource_id for resource_id in owned)
+
+    # A later resume can recover from outputs alone, without inferring ownership
+    # from resource names or successfully re-running idempotent create commands.
+    checkpoint.unlink()
+    monkeypatch.setattr(
+        runner, "run", lambda command, **_: subprocess.CompletedProcess(command, 0, stdout="false"),
+    )
+    ensure_shared_storage_resources(runner, inputs)
+    deploy._write_outputs(inputs, {"apiName": "api"})
+    assert deploy.load_saved_outputs(inputs)["managedStorageChildResourceIds"] == owned
+
+
+def test_storage_child_creation_merges_prior_outputs_before_later_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import deploy
+
+    inputs = DeploymentInputs.load(
+        "subscription", _parameters(tmp_path / "parameters.json"), tmp_path / "state.json"
+    )
+    account_id = _shared_storage_outputs()["storageAccountId"]
+    ledger_id = _shared_storage_outputs()["ledgerTableId"]
+    unrelated = f"{account_id}/tableServices/default/tables/Unrelated"
+    dependencies = {"postgres": {"provisioned": False, "resourceId": "adopted-postgres"}}
+    outputs_path = inputs.state_path.with_suffix(".outputs.json")
+    outputs_path.write_text(json.dumps({
+        "managedStorageChildResourceIds": [ledger_id, unrelated],
+        "dependencyResources": dependencies,
+        "managedRoleAssignmentIds": ["prior-role"],
+    }), encoding="utf-8")
+    runner = CommandRunner()
+
+    def run(command: Sequence[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if command[command.index("--name") + 1] == "victurnstile-control-deploy":
+            raise DeploymentError("later creation failed")
+        return subprocess.CompletedProcess(command, 0, stdout="true")
+
+    monkeypatch.setattr(runner, "run", run)
+    with pytest.raises(DeploymentError, match="later creation failed"):
+        ensure_shared_storage_resources(runner, inputs)
+    saved = deploy.load_saved_outputs(inputs)
+    assert saved is not None
+    assert saved["managedStorageChildResourceIds"] == sorted([
+        ledger_id, f"{account_id}/blobServices/default/containers/victurnstile-telemetry-deploy",
+    ])
+    assert saved["dependencyResources"] == dependencies
+    assert saved["managedRoleAssignmentIds"] == ["prior-role"]
+    assert _shared_storage_outputs()["routeTableId"] not in saved["managedStorageChildResourceIds"]
 
 
 def _shared_storage_outputs() -> dict[str, str]:
@@ -3510,7 +3654,7 @@ def test_deploy_packages_uses_webapp_and_function_cli_with_health_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     commands: list[list[str]] = []
-    api_deployments: list[tuple[str, Path]] = []
+    api_deployments: list[tuple[str, str, Path]] = []
     health_calls: list[tuple[str, int]] = []
 
     class Runner:
@@ -3529,8 +3673,8 @@ def test_deploy_packages_uses_webapp_and_function_cli_with_health_gate(
     )
     monkeypatch.setattr(
         "scripts.deploy.deploy_webapp_package",
-        lambda _runner, _inputs, app_name, package: api_deployments.append(
-            (app_name, package)
+        lambda _runner, _inputs, app_name, app_url, package: api_deployments.append(
+            (app_name, app_url, package)
         ),
     )
     deploy_packages(
@@ -3550,7 +3694,9 @@ def test_deploy_packages_uses_webapp_and_function_cli_with_health_gate(
         },
     )
 
-    assert api_deployments == [("api", Path("api.zip"))]
+    assert api_deployments == [
+        ("api", "https://api.example.test", Path("api.zip"))
+    ]
     assert [
         command[command.index("--name") + 1]
         for command in commands
@@ -3574,8 +3720,12 @@ def test_webapp_package_deployment_uses_async_zip_cli(
 
     deploy_webapp_package(
         Runner(),  # type: ignore[arg-type]
-        type("Inputs", (), {"subscription": "sub", "resource_group_name": "rg"})(),
+        cast(
+            DeploymentInputs,
+            type("Inputs", (), {"subscription": "sub", "resource_group_name": "rg"})(),
+        ),
         "api",
+        "https://api.example.test",
         package,
     )
 
@@ -3604,6 +3754,8 @@ def test_webapp_package_deployment_uses_async_zip_cli(
             "json",
         ]
     ]
+
+
 def test_webapp_package_rejects_failed_cli_deployment(tmp_path: Path) -> None:
     package = tmp_path / "api.zip"
     package.write_bytes(b"package-bytes")
@@ -3615,10 +3767,62 @@ def test_webapp_package_rejects_failed_cli_deployment(tmp_path: Path) -> None:
     with pytest.raises(DeploymentError, match="RuntimeFailed"):
         deploy_webapp_package(
             Runner(),  # type: ignore[arg-type]
-            type("Inputs", (), {"subscription": "sub", "resource_group_name": "rg"})(),
+            cast(
+                DeploymentInputs,
+                type(
+                    "Inputs", (), {"subscription": "sub", "resource_group_name": "rg"}
+                )(),
+            ),
             "api",
+            "https://api.example.test",
             package,
         )
+
+
+def test_webapp_package_accepts_recent_success_after_cli_startup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "api.zip"
+    package.write_bytes(b"package-bytes")
+    commands: list[list[str]] = []
+
+    class Runner:
+        def run_json(self, command: Sequence[str], **_: object) -> dict[str, object]:
+            commands.append(list(command))
+            if command[1:4] == ["webapp", "deploy", "--subscription"]:
+                raise subprocess.CalledProcessError(1, command)
+            assert command[1:5] == ["webapp", "log", "deployment", "list"]
+            return {
+                "status": 4,
+                "complete": True,
+                "receivedTime": datetime.now(UTC).isoformat(),
+            }
+
+    health_calls: list[tuple[str, int]] = []
+
+    def healthy(url: str, timeout_seconds: int) -> str:
+        health_calls.append((url, timeout_seconds))
+        return "ok"
+
+    monkeypatch.setattr(
+        "scripts.deploy.wait_for_health",
+        healthy,
+    )
+
+    deploy_webapp_package(
+        Runner(),  # type: ignore[arg-type]
+        cast(
+            DeploymentInputs,
+            type("Inputs", (), {"subscription": "sub", "resource_group_name": "rg"})(),
+        ),
+        "api",
+        "https://api.example.test",
+        package,
+    )
+
+    assert len(commands) == 2
+    assert health_calls == [("https://api.example.test", 180)]
 
 
 def test_function_package_deployment_restarts_and_retries_after_failure(
@@ -3637,7 +3841,11 @@ def test_function_package_deployment_restarts_and_retries_after_failure(
                 commands.append(list(command))
 
     def deploy_api(
-        _runner: object, _inputs: object, _app_name: str, _package: Path
+        _runner: object,
+        _inputs: object,
+        _app_name: str,
+        _app_url: str,
+        _package: Path,
     ) -> None:
         return
 
@@ -3727,6 +3935,40 @@ def test_runtime_readiness_requires_the_expected_frontend_within_one_deadline(
         assert attempts["/"] >= 1
     assert elapsed[0] <= 6
     assert all(0 < timeout <= 6 for timeout in timeouts)
+
+
+def test_function_package_retry_continues_when_restart_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployments = 0
+    sleeps: list[int] = []
+
+    class Runner:
+        def run(self, command: Sequence[str], **_: object) -> None:
+            nonlocal deployments
+            if command[1:5] == ["functionapp", "deployment", "source", "config-zip"]:
+                deployments += 1
+                if deployments == 1:
+                    raise subprocess.CalledProcessError(1, command)
+                return
+            assert command[1:3] == ["functionapp", "restart"]
+            raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr("scripts.deploy.time.sleep", sleeps.append)
+
+    deploy_function_package(
+        Runner(),  # type: ignore[arg-type]
+        cast(
+            DeploymentInputs,
+            type("Inputs", (), {"subscription": "sub"})(),
+        ),
+        "rg",
+        "function",
+        Path("function.zip"),
+    )
+
+    assert deployments == 2
+    assert sleeps == [15]
 
 
 def test_health_gate_accepts_successful_empty_response(
@@ -4063,6 +4305,22 @@ def test_repository_parameter_example_and_generated_documents_match_bicep(
         release_document["parameters"]["currentApiSettings"]["value"]
         == {"EXISTING_API_SETTING": "preserved"}
     )
+
+
+def test_repository_parameter_examples_expose_the_same_supported_fields() -> None:
+    tracked_example = REPOSITORY_ROOT / "infra" / "main.parameters.example.json"
+    expected = set(json.loads(tracked_example.read_text(encoding="utf-8"))["parameters"])
+    assert {
+        "employeeAdditionalClientIds", "employeeAudience",
+        "foundryCognitiveServicesAccountResourceId", "keyVaultPrivateDnsLinkName",
+        *_adopted_dependency_values("subscription"),
+    } <= expected
+    for path in (
+        REPOSITORY_ROOT / ".turnstile" / "handoff" / "managed.parameters.example.json",
+        REPOSITORY_ROOT / ".turnstile" / "handoff" / "adopted.parameters.example.json",
+    ):
+        if path.exists():
+            assert set(json.loads(path.read_text(encoding="utf-8"))["parameters"]) == expected
 
 
 class WhatIfRunner(CommandRunner):

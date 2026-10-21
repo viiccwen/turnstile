@@ -155,7 +155,8 @@ function Assert-ManifestAction(
     [string]$TelemetryContainerName,
     [string]$ControlContainerName,
     [string]$LedgerTableName,
-    [string[]]$ManagedRoleAssignmentIds
+    [string[]]$ManagedRoleAssignmentIds,
+    [string[]]$ApprovedAppServiceNames
 ) {
     $arguments = @($Action.Arguments | ForEach-Object { [string]$_ })
     if ($arguments.Count -lt 2) {
@@ -213,7 +214,7 @@ function Assert-ManifestAction(
         if (
             $groupIndex -lt 0 -or $nameIndex -lt 0 -or
             $arguments[$groupIndex + 1] -cne $PlatformResourceGroup -or
-            $arguments[$nameIndex + 1] -notlike "*$Prefix*"
+            $arguments[$nameIndex + 1] -notin $ApprovedAppServiceNames
         ) {
             throw "Manifest App Service action targets an unexpected resource: $($Action.Description)"
         }
@@ -401,6 +402,7 @@ function Invoke-RecordedCleanup(
     [string]$LedgerTableName,
     [string]$FoundryResourceId,
     [string[]]$ManagedRoleAssignmentIds,
+    [string[]]$ApprovedAppServiceNames,
     [bool]$ExecuteActions,
     [bool]$SkipConfirmation,
     [bool]$DeleteLocalSecretState
@@ -454,7 +456,7 @@ function Invoke-RecordedCleanup(
         Assert-ManifestAction `
             $action $PlatformResourceGroup $Prefix $StorageResourceGroup $apimId `
             $StorageAccountName $TelemetryContainerName $ControlContainerName `
-            $LedgerTableName $ManagedRoleAssignmentIds
+            $LedgerTableName $ManagedRoleAssignmentIds $ApprovedAppServiceNames
         $recordedActions.Add([pscustomobject]@{
             Description = [string]$action.description
             Arguments = @($action.arguments | ForEach-Object { [string]$_ })
@@ -675,6 +677,21 @@ $managedStorageChildResourceIds = @(
     @(Get-ObjectValue $outputDocument 'managedStorageChildResourceIds' @()) |
         ForEach-Object { [string]$_ } | Where-Object { $_ }
 )
+$approvedAppServiceNames = @(
+    @(
+        'apiName',
+        'telemetryFunctionName',
+        'controlPlaneFunctionName',
+        'webAppName',
+        'appServicePlanName',
+        'telemetryFunctionPlanName',
+        'controlPlaneFunctionPlanName',
+        'observerAppServicePlanName'
+    ) |
+        ForEach-Object { [string](Get-ObjectValue $outputDocument $_ '') } |
+        Where-Object { $_ } |
+        Sort-Object -Unique
+)
 if (-not $Manifest) {
     $Manifest = $outputPath -replace '\.outputs\.json$', '.resources.json'
 }
@@ -735,6 +752,7 @@ if (-not $CaptureManifest) {
         -LedgerTableName $ledgerTableName `
         -FoundryResourceId $foundryResourceId `
         -ManagedRoleAssignmentIds $managedRoleAssignmentIds `
+        -ApprovedAppServiceNames $approvedAppServiceNames `
         -ExecuteActions ([bool]$Execute) `
         -SkipConfirmation ([bool]$Force) `
         -DeleteLocalSecretState ([bool]$RemoveLocalSecretState)
@@ -790,13 +808,16 @@ foreach ($subscriptionId in @($dashboardSubscriptionId, $probeSubscriptionId)) {
     }
 }
 
-$productSubscriptionIds = @(
-    & az rest --method get `
-        --url "https://management.azure.com$apimId/products/$productId/subscriptions?api-version=2024-05-01" `
-        --query 'value[].name' -o tsv
-)
-if ($LASTEXITCODE -ne 0) {
-    throw "Unable to list subscriptions for APIM product $productId"
+$productSubscriptionIds = @()
+if ($apimProducts.name -contains $productId) {
+    $productSubscriptionIds = @(
+        & az rest --method get `
+            --url "https://management.azure.com$apimId/products/$productId/subscriptions?api-version=2024-05-01" `
+            --query 'value[].name' -o tsv
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to list subscriptions for APIM product $productId"
+    }
 }
 foreach ($subscriptionId in $productSubscriptionIds) {
     $subscriptionId = [string]$subscriptionId
@@ -1202,6 +1223,92 @@ foreach ($spec in $outputResourceSpecs) {
     }
 }
 
+$dependencyMetadata = Get-ObjectValue $outputDocument 'dependencyResources'
+if ($null -eq $dependencyMetadata) {
+    # Legacy outputs predate dependencyResources. Recover only exact resources linked from
+    # already verified deployment outputs; never infer ownership from a broad name search.
+    $apiResourceId = "/subscriptions/$Subscription/resourceGroups/$platformResourceGroup/providers/Microsoft.Web/sites/$([string]$outputDocument.apiName)"
+    $apiResource = Invoke-AzJson @('resource', 'show', '--ids', $apiResourceId, '--output', 'json')
+    $apiSubnetId = [string](Get-ObjectValue $apiResource.properties 'virtualNetworkSubnetId' '')
+    if ($apiSubnetId) {
+        $vnetMatch = [regex]::Match(
+            $apiSubnetId,
+            '^(?<vnet>/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Network/virtualNetworks/[^/]+)/subnets/[^/]+$',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        if (-not $vnetMatch.Success) {
+            throw "Legacy API VNet integration has an unexpected subnet ID: $apiSubnetId"
+        }
+        $vnetId = $vnetMatch.Groups['vnet'].Value
+        if ($vnetId -notlike "$platformIdPrefix*") {
+            throw "Legacy API VNet integration is outside the platform resource group: $vnetId"
+        }
+        $vnetResource = Invoke-AzJson @('resource', 'show', '--ids', $vnetId, '--output', 'json')
+        $ownedById[$vnetId] = [pscustomobject]@{
+            id = $vnetId
+            name = [string]$vnetResource.name
+            type = 'Microsoft.Network/virtualNetworks'
+        }
+    }
+
+    $appInsightsName = [string](Get-ObjectValue $outputDocument 'applicationInsightsName' '')
+    if ($appInsightsName) {
+        $appInsightsId = "/subscriptions/$Subscription/resourceGroups/$platformResourceGroup/providers/Microsoft.Insights/components/$appInsightsName"
+        $appInsights = Invoke-AzJson @('resource', 'show', '--ids', $appInsightsId, '--output', 'json')
+        $workspaceId = [string](Get-ObjectValue $appInsights.properties 'WorkspaceResourceId' '')
+        if ($workspaceId) {
+            if ($workspaceId -notlike "$platformIdPrefix*") {
+                throw "Legacy Application Insights links outside the platform resource group: $workspaceId"
+            }
+            $workspace = Invoke-AzJson @('resource', 'show', '--ids', $workspaceId, '--output', 'json')
+            $ownedById[$workspaceId] = [pscustomobject]@{
+                id = $workspaceId
+                name = [string]$workspace.name
+                type = 'Microsoft.OperationalInsights/workspaces'
+            }
+        }
+    }
+
+    $controlPlaneFunctionName = [string](Get-ObjectValue $outputDocument 'controlPlaneFunctionName' '')
+    if ($controlPlaneFunctionName) {
+        $settingsUrl = "https://management.azure.com/subscriptions/$Subscription/resourceGroups/$platformResourceGroup/providers/Microsoft.Web/sites/$controlPlaneFunctionName/config/appsettings/list?api-version=2024-11-01"
+        $keyVaultSetting = Invoke-AzJson @(
+            'rest', '--method', 'post', '--url', $settingsUrl,
+            '--query', '{probe:properties.APIM_PROBE_SUBSCRIPTION_KEY}', '--output', 'json'
+        ) -AllowFailure
+        $keyVaultMatch = [regex]::Match(
+            [string](Get-ObjectValue $keyVaultSetting 'probe' ''),
+            '^@Microsoft\.KeyVault\(SecretUri=https://(?<vault>[A-Za-z0-9-]+)\.vault\.(?:azure\.net|azure\.cn|usgovcloudapi\.net|microsoftazure\.de)/secrets/[A-Za-z0-9-]+(?:/[^)]+)?\)$',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        if ($keyVaultMatch.Success) {
+            $keyVaultName = $keyVaultMatch.Groups['vault'].Value
+            $keyVaultId = "/subscriptions/$Subscription/resourceGroups/$platformResourceGroup/providers/Microsoft.KeyVault/vaults/$keyVaultName"
+            $keyVault = Invoke-AzJson @('resource', 'show', '--ids', $keyVaultId, '--output', 'json')
+            $ownedById[$keyVaultId] = [pscustomobject]@{
+                id = $keyVaultId
+                name = $keyVaultName
+                type = 'Microsoft.KeyVault/vaults'
+            }
+            foreach ($connection in @(Get-ObjectValue $keyVault.properties 'privateEndpointConnections' @())) {
+                $privateEndpointId = [string]$connection.properties.privateEndpoint.id
+                if (-not $privateEndpointId) { continue }
+                if ($privateEndpointId -notlike "$platformIdPrefix*") {
+                    throw "Legacy Key Vault private endpoint is outside the platform resource group: $privateEndpointId"
+                }
+                $privateEndpoint = Invoke-AzJson @(
+                    'resource', 'show', '--ids', $privateEndpointId, '--output', 'json'
+                )
+                $ownedById[$privateEndpointId] = [pscustomobject]@{
+                    id = $privateEndpointId
+                    name = [string]$privateEndpoint.name
+                    type = 'Microsoft.Network/privateEndpoints'
+                }
+            }
+        }
+    }
+}
+
 $dependencyResourceSpecs = @(
     @{ dependency = 'network'; field = 'virtualNetworkResourceId'; type = 'Microsoft.Network/virtualNetworks' },
     @{ dependency = 'observability'; field = 'workspaceResourceId'; type = 'Microsoft.OperationalInsights/workspaces' },
@@ -1261,6 +1368,7 @@ $zones = @(
     'privatelink.vaultcore.azure.net'
 )
 $dnsLinkIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+# Also initialize here so the DNS planning block can be evaluated independently.
 $dependencyMetadata = Get-ObjectValue $outputDocument 'dependencyResources'
 $dnsVnetId = if ($null -ne $vnet) {
     [string]$vnet.id
@@ -1392,9 +1500,12 @@ if ($CaptureManifest) {
         Assert-ManifestAction `
             $action $platformResourceGroup $prefix $storageResourceGroup $apimId `
             $storageAccountName $telemetryContainerName $controlContainerName `
-            $ledgerTableName $managedRoleAssignmentIds
+            $ledgerTableName $managedRoleAssignmentIds $approvedAppServiceNames
     }
-    $productApiLinks = @(Get-ApimCollection $apimId "products/$productId/apiLinks")
+    $productApiLinks = @()
+    if ($apimProducts.name -contains $productId) {
+        $productApiLinks = @(Get-ApimCollection $apimId "products/$productId/apiLinks")
+    }
     $apimResourceIds = @(
         foreach ($environmentApi in $environmentApis) {
             [string]$environmentApi.id

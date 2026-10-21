@@ -33,12 +33,14 @@ from turnstile_core.integrations.apim_policy_components import (
     POOL_RUNTIME_HEADER,
     TEXT_CONDITION,
     parse_policy,
+    render_parent_client_ids,
     serialize_policy,
 )
 
-CANONICAL_PARENT = (
-    REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml"
-).read_text()
+CANONICAL_PARENT = render_parent_client_ids(
+    (REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml").read_text(encoding="utf-8"),
+    ["00000000-0000-0000-0000-000000000000"],
+)
 IMAGE_DENIAL = (REPOSITORY_ROOT / "infra/policies/provider-neutral-images-policy.xml").read_text()
 API_ID = (
     "/subscriptions/unit/resourceGroups/customer/providers/"

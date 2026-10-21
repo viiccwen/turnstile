@@ -25,6 +25,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import distributions
 from pathlib import Path
 from typing import Any, cast
@@ -79,6 +80,7 @@ from turnstile_core.integrations.apim_storage_routes import (
     fixed_policy_digest,
     fixed_program_digest,
 )
+from turnstile_core.integrations.apim_policy_components import render_parent_client_ids
 from turnstile_core.persistence.repository_support import _registered_program_installation
 
 JsonObject = dict[str, Any]
@@ -1708,50 +1710,84 @@ def validate_shared_storage_account(runner: CommandRunner, inputs: DeploymentInp
         )
 
 
-def ensure_shared_storage_resources(runner: CommandRunner, inputs: DeploymentInputs) -> None:
-    _, account, telemetry_container, control_container, ledger_table = (
+def _managed_storage_child_ids(inputs: DeploymentInputs) -> set[str]:
+    group, account, telemetry_container, control_container, ledger_table = (
         shared_storage_configuration(inputs)
     )
-    for container in (telemetry_container, control_container):
-        runner.run(
+    account_id = (
+        f"/subscriptions/{inputs.subscription}/resourceGroups/{group}/providers/"
+        f"Microsoft.Storage/storageAccounts/{account}"
+    )
+    allowed = {
+        f"{account_id}/blobServices/default/containers/{name}"
+        for name in (telemetry_container, control_container)
+    } | {
+        f"{account_id}/tableServices/default/tables/{name}"
+        for name in (ledger_table, DEFAULT_ROUTE_TABLE_NAME)
+    }
+    canonical = {resource_id.casefold(): resource_id for resource_id in allowed}
+    owned: set[str] = set()
+    for path in (_outputs_path(inputs), inputs.state_path.with_suffix(".storage-children.json")):
+        if not path.exists():
+            continue
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise DeploymentError(f"Invalid storage ownership checkpoint: {path}") from error
+        evidence = document.get("managedStorageChildResourceIds", []) if isinstance(document, dict) else None
+        if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence):
+            raise DeploymentError(f"Invalid storage ownership checkpoint: {path}")
+        owned.update(canonical[item.casefold()] for item in evidence if item.casefold() in canonical)
+    return owned
+
+
+def ensure_shared_storage_resources(runner: CommandRunner, inputs: DeploymentInputs) -> None:
+    group, account, telemetry_container, control_container, ledger_table = (
+        shared_storage_configuration(inputs)
+    )
+    owned = _managed_storage_child_ids(inputs)
+    children = (
+        ("container", "blobServices/default/containers", telemetry_container),
+        ("container", "blobServices/default/containers", control_container),
+        ("table", "tableServices/default/tables", ledger_table),
+        ("table", "tableServices/default/tables", DEFAULT_ROUTE_TABLE_NAME),
+    )
+    for kind, child_path, name in children:
+        result = runner.run(
             [
                 "az",
                 "storage",
-                "container",
+                kind,
                 "create",
                 "--subscription",
                 inputs.subscription,
                 "--account-name",
                 account,
                 "--name",
-                container,
+                name,
                 "--auth-mode",
                 "login",
                 "--only-show-errors",
+                "--query",
+                "created",
                 "--output",
-                "none",
-            ]
+                "json",
+            ],
+            capture=True,
         )
-    for table in dict.fromkeys((ledger_table, DEFAULT_ROUTE_TABLE_NAME)):
-        runner.run(
-            [
-                "az",
-                "storage",
-                "table",
-                "create",
-                "--subscription",
-                inputs.subscription,
-                "--account-name",
-                account,
-                "--name",
-                table,
-                "--auth-mode",
-                "login",
-                "--only-show-errors",
-                "--output",
-                "none",
-            ]
-        )
+        # An idempotent create (or missing output) is not ownership evidence.
+        if result.returncode == 0 and result.stdout.strip() == "true":
+            owned.add(
+                f"/subscriptions/{inputs.subscription}/resourceGroups/{group}/providers/"
+                f"Microsoft.Storage/storageAccounts/{account}/{child_path}/{name}"
+            )
+            _write_private_json(
+                inputs.state_path.with_suffix(".storage-children.json"),
+                {"managedStorageChildResourceIds": sorted(owned)},
+            )
+            saved = load_saved_outputs(inputs)
+            if saved is not None:
+                _write_outputs(inputs, saved)
 
 
 def _managed_role_assignment_name(scope: str, principal_id: str, role_id: str) -> str:
@@ -2544,37 +2580,100 @@ def build_packages(
     return packages
 
 
+def _webapp_deployment_recovered(
+    runner: CommandRunner,
+    inputs: DeploymentInputs,
+    app_name: str,
+    app_url: str,
+    started_at: datetime,
+) -> bool:
+    try:
+        latest = runner.run_json(
+            [
+                "az",
+                "webapp",
+                "log",
+                "deployment",
+                "list",
+                "--subscription",
+                inputs.subscription,
+                "--resource-group",
+                inputs.resource_group_name,
+                "--name",
+                app_name,
+                "--query",
+                "sort_by(@, &received_time)[-1]."
+                "{status:status,complete:complete,receivedTime:received_time}",
+                "--output",
+                "json",
+            ]
+        )
+    except (DeploymentError, subprocess.CalledProcessError):
+        return False
+    received_raw = latest.get("receivedTime")
+    try:
+        received_at = datetime.fromisoformat(str(received_raw).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if received_at.tzinfo is None:
+        received_at = received_at.replace(tzinfo=UTC)
+    if (
+        str(latest.get("status")) != "4"
+        or latest.get("complete") is not True
+        or received_at < started_at - timedelta(minutes=1)
+    ):
+        return False
+    try:
+        wait_for_health(app_url, timeout_seconds=180)
+    except DeploymentError:
+        return False
+    return True
+
+
 def deploy_webapp_package(
     runner: CommandRunner,
     inputs: DeploymentInputs,
     app_name: str,
+    app_url: str,
     package: Path,
 ) -> None:
-    deployment = runner.run_json(
-        [
-            "az",
-            "webapp",
-            "deploy",
-            "--subscription",
-            inputs.subscription,
-            "--resource-group",
-            inputs.resource_group_name,
-            "--name",
-            app_name,
-            "--src-path",
-            str(package),
-            "--type",
-            "zip",
-            "--async",
-            "true",
-            "--restart",
-            "true",
-            "--clean",
-            "true",
-            "--output",
-            "json",
-        ]
-    )
+    started_at = datetime.now(UTC)
+    try:
+        deployment = runner.run_json(
+            [
+                "az",
+                "webapp",
+                "deploy",
+                "--subscription",
+                inputs.subscription,
+                "--resource-group",
+                inputs.resource_group_name,
+                "--name",
+                app_name,
+                "--src-path",
+                str(package),
+                "--type",
+                "zip",
+                "--async",
+                "true",
+                "--restart",
+                "true",
+                "--clean",
+                "true",
+                "--output",
+                "json",
+            ]
+        )
+    except (DeploymentError, subprocess.CalledProcessError):
+        if not _webapp_deployment_recovered(
+            runner, inputs, app_name, app_url, started_at
+        ):
+            raise
+        print(
+            f"Web App package deployment recovered after a transient startup failure: "
+            f"{app_name}"
+        )
+        return
     properties = deployment.get("properties")
     status = properties.get("status") if isinstance(properties, dict) else None
     if status not in {None, "RuntimeSuccessful", "BuildSuccessful"}:
@@ -2592,8 +2691,9 @@ def deploy_packages(
 ) -> None:
     resource_group = _output_string(outputs, "resourceGroupName")
     api_name = _output_string(outputs, "apiName")
-    deploy_webapp_package(runner, inputs, api_name, packages["api"])
-    wait_for_health(_output_string(outputs, "apiUrl"), timeout_seconds=1800)
+    api_url = _output_string(outputs, "apiUrl")
+    deploy_webapp_package(runner, inputs, api_name, api_url, packages["api"])
+    wait_for_health(api_url, timeout_seconds=1800)
     for output_name, package_name in (
         ("telemetryFunctionName", "telemetry"),
         ("controlPlaneFunctionName", "control-plane"),
@@ -2649,19 +2749,25 @@ def deploy_function_package(
                 f"Function package deployment failed for {function_name}; "
                 f"restarting before retry {attempt + 1}/3."
             )
-            runner.run(
-                [
-                    "az",
-                    "functionapp",
-                    "restart",
-                    "--subscription",
-                    inputs.subscription,
-                    "--resource-group",
-                    resource_group,
-                    "--name",
-                    function_name,
-                ]
-            )
+            try:
+                runner.run(
+                    [
+                        "az",
+                        "functionapp",
+                        "restart",
+                        "--subscription",
+                        inputs.subscription,
+                        "--resource-group",
+                        resource_group,
+                        "--name",
+                        function_name,
+                    ]
+                )
+            except (DeploymentError, subprocess.CalledProcessError):
+                print(
+                    f"Function restart failed for {function_name}; "
+                    "continuing with the deployment retry."
+                )
             time.sleep(15)
 
 
@@ -3317,6 +3423,9 @@ def load_existing_core(inputs: DeploymentInputs) -> ExistingCore | None:
 
 def _write_outputs(inputs: DeploymentInputs, outputs: Mapping[str, Any]) -> None:
     destination = _outputs_path(inputs)
+    owned = _managed_storage_child_ids(inputs)
+    if owned or "managedStorageChildResourceIds" in outputs:
+        outputs = {**outputs, "managedStorageChildResourceIds": sorted(owned)}
     _write_private_json(destination, outputs)
     print(f"Deployment outputs: {destination}")
 
@@ -3492,7 +3601,26 @@ def gateway_upgrade(
     template = REPOSITORY_ROOT / "infra/apim-upgrade.bicep"
     parent_path = REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml"
     denial_path = REPOSITORY_ROOT / "infra/policies/provider-neutral-images-policy.xml"
-    canonical = parent_path.read_text(encoding="utf-8")
+    primary = inputs.parameters.get("employeeClientId", inputs.parameters.get("entraClientId", ""))
+    audience = inputs.parameters.get("employeeAudience", inputs.parameters.get("entraClientId", ""))
+    additional = inputs.parameters.get("employeeAdditionalClientIds", [])
+    if (
+        not isinstance(primary, str)
+        or not isinstance(audience, str)
+        or not isinstance(additional, list)
+    ):
+        raise DeploymentError("Employee client IDs and audience must have the expected types")
+    if not all(isinstance(value, str) for value in additional):
+        raise DeploymentError("Additional employee client IDs must be strings")
+    approved = (
+        [primary.strip(), *(value.strip() for value in additional)]
+        if primary.strip() and audience.strip()
+        else ["00000000-0000-0000-0000-000000000000"]
+    )
+    try:
+        canonical = render_parent_client_ids(parent_path.read_text(encoding="utf-8"), approved)
+    except ValueError as error:
+        raise DeploymentError("Invalid approved employee client IDs") from error
     denial = denial_path.read_text(encoding="utf-8")
     bindings = {
         "apiResourceId": resource_id,

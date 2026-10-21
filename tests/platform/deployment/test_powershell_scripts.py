@@ -97,6 +97,10 @@ def test_remove_script_deletes_only_environment_apim_children() -> None:
     assert "Delete APIM product subscription" in REMOVE
     assert "'apim', 'subscription', 'delete'" not in REMOVE
     assert 'subscriptions/$subscriptionId`?api-version=2024-05-01' in REMOVE
+    product_subscription_lookup = REMOVE.split(
+        "$productSubscriptionIds = @()", 1
+    )[1].split("foreach ($subscriptionId in $productSubscriptionIds)", 1)[0]
+    assert "if ($apimProducts.name -contains $productId)" in product_subscription_lookup
 
 
 def test_remove_script_records_exact_saved_output_resources() -> None:
@@ -122,6 +126,20 @@ def test_remove_script_records_exact_saved_output_resources() -> None:
     assert "Delete deployment-managed role assignment" in REMOVE
     assert "Get-ManagedRoleAssignmentName" in REMOVE
     assert "Deployment output contains an unexpected managed role assignment" in REMOVE
+    assert "$ApprovedAppServiceNames" in REMOVE
+    assert "$arguments[$nameIndex + 1] -notin $ApprovedAppServiceNames" in REMOVE
+    assert "'observerAppServicePlanName'" in REMOVE
+    assert "Legacy outputs predate dependencyResources" in REMOVE
+    assert "virtualNetworkSubnetId" in REMOVE
+    assert "WorkspaceResourceId" in REMOVE
+    assert "APIM_PROBE_SUBSCRIPTION_KEY" in REMOVE
+    assert "privateEndpointConnections" in REMOVE
+    assert "never infer ownership from a broad name search" in REMOVE
+    app_service_guard = REMOVE.split(
+        "if ($signature -in @('functionapp delete', 'webapp delete', 'appservice plan'))",
+        1,
+    )[1].split("if ($signature -like 'apim *')", 1)[0]
+    assert '$arguments[$nameIndex + 1] -notlike "*$Prefix*"' not in app_service_guard
 
 
 def test_remove_script_orders_dependent_resources() -> None:
@@ -364,3 +382,118 @@ function Invoke-AzJson([string[]]$Arguments, [switch]$AllowFailure) {{
     assert result["count"] == 1
     assert result["ids"] == [link]
     assert "env-vnet" in result["args"]
+
+
+@pytest.mark.parametrize("command", ["webapp", "functionapp", "appservice"])
+def test_remove_custom_app_service_names_require_exact_saved_outputs(command: str) -> None:
+    outputs = {"apiName": "custom-api", "observerAppServicePlanName": "custom-plan"}
+    block = "$approvedAppServiceNames = @(" + REMOVE.split(
+        "$approvedAppServiceNames = @(", 1
+    )[1].split("if (-not $Manifest)", 1)[0]
+    name = "custom-plan" if command == "appservice" else "custom-api"
+    arguments = [command, "plan", "delete"] if command == "appservice" else [command, "delete"]
+    arguments += ["--resource-group", "platform", "--name", name, "--yes"]
+    result = _powershell_json(f"""
+$Subscription = 'sub'; $managedStorageChildResourceIds = @()
+$outputDocument = {_ps_json(outputs)}
+""" + block + f"""
+$action = [pscustomobject]@{{ Description = 'custom deployment'; Arguments = @({_ps_json(arguments)}) }}
+Assert-ManifestAction $action 'platform' 'env' 'storage' '/apim' 'shared' 'telemetry' 'control' 'Ledger' @() $approvedAppServiceNames
+$action.Arguments[[Array]::IndexOf([string[]]$action.Arguments, '--name') + 1] = 'unrelated-env-app'
+$rejected = $false
+try {{
+    Assert-ManifestAction $action 'platform' 'env' 'storage' '/apim' 'shared' 'telemetry' 'control' 'Ledger' @() $approvedAppServiceNames
+}} catch {{ $rejected = $_.Exception.Message -like '*unexpected resource*' }}
+@{{ approved = @($approvedAppServiceNames); rejected = $rejected }} | ConvertTo-Json -Compress
+""")
+    assert set(result["approved"]) == set(outputs.values())
+    assert result["rejected"] is True
+
+
+@pytest.mark.parametrize("present", [False, True])
+def test_remove_product_subscription_lookup_skips_absent_product(present: bool) -> None:
+    block = "$productSubscriptionIds = @()" + REMOVE.split(
+        "$productSubscriptionIds = @()", 1
+    )[1].split("$policyText = ''", 1)[0]
+    result = _powershell_json(f"""
+$apimProducts = @([pscustomobject]@{{ name = '{"custom-product" if present else "other"}' }})
+$productId = 'custom-product'; $apimId = '/apim'
+$dashboardSubscriptionId = 'dashboard'; $probeSubscriptionId = 'probe'
+$script:queries = 0
+function az {{ $script:queries++; $global:LASTEXITCODE = 0; 'consumer' }}
+""" + block + """
+@{ queries = $script:queries; actions = $actions.Count } | ConvertTo-Json -Compress
+""")
+    assert result == {"queries": int(present), "actions": int(present)}
+    api_links = REMOVE.split("$productApiLinks = @()", 1)[1].split("$apimResourceIds =", 1)[0]
+    assert "if ($apimProducts.name -contains $productId)" in api_links
+
+
+@pytest.mark.parametrize("outside", [None, "vnet", "workspace", "endpoint"])
+def test_remove_legacy_dependency_discovery_uses_exact_linked_resources(outside: str | None) -> None:
+    prefix = "/subscriptions/sub/resourceGroups/platform/providers/"
+    other = "/subscriptions/sub/resourceGroups/unrelated/providers/"
+    vnet = (other if outside == "vnet" else prefix) + "Microsoft.Network/virtualNetworks/custom"
+    workspace = (other if outside == "workspace" else prefix) + "Microsoft.OperationalInsights/workspaces/custom"
+    endpoint = (other if outside == "endpoint" else prefix) + "Microsoft.Network/privateEndpoints/custom"
+    vault = prefix + "Microsoft.KeyVault/vaults/custom-vault"
+    api = prefix + "Microsoft.Web/sites/custom-api"
+    insights = prefix + "Microsoft.Insights/components/custom-insights"
+    resources = {
+        api: {"properties": {"virtualNetworkSubnetId": vnet + "/subnets/api"}},
+        insights: {"properties": {"WorkspaceResourceId": workspace}},
+        vault: {"properties": {"privateEndpointConnections": [
+            {"properties": {"privateEndpoint": {"id": endpoint}}},
+        ]}},
+        vnet: {"name": "custom"}, workspace: {"name": "custom"}, endpoint: {"name": "custom"},
+    }
+    outputs = {"apiName": "custom-api", "applicationInsightsName": "custom-insights", "controlPlaneFunctionName": "custom-control"}
+    block = "$dependencyMetadata = Get-ObjectValue" + REMOVE.split(
+        "$dependencyMetadata = Get-ObjectValue", 1
+    )[1].split("$dependencyResourceSpecs =", 1)[0]
+    result = _powershell_json(f"""
+$Subscription = 'sub'; $platformResourceGroup = 'platform'; $platformIdPrefix = '{prefix}'
+$outputDocument = {_ps_json(outputs)}; $resources = {_ps_json(resources)}; $ownedById = @{{}}
+function Invoke-AzJson([string[]]$Arguments, [switch]$AllowFailure) {{
+    if ($Arguments[0] -eq 'rest') {{
+        return [pscustomobject]@{{ probe = '@Microsoft.KeyVault(SecretUri=https://custom-vault.vault.azure.net/secrets/probe)' }}
+    }}
+    $id = $Arguments[[Array]::IndexOf($Arguments, '--ids') + 1]
+    $resource = Get-ObjectValue $resources $id
+    if ($null -eq $resource) {{ throw "Unexpected lookup: $id" }}
+    return $resource
+}}
+$rejected = $false
+try {{
+""" + block + """
+} catch { $rejected = $_.Exception.Message -like '*outside the platform resource group*' }
+@{ owned = @($ownedById.Keys); rejected = $rejected } | ConvertTo-Json -Compress
+""")
+    assert result["rejected"] is (outside is not None)
+    if outside is None:
+        assert set(result["owned"]) == {vnet, workspace, vault, endpoint}
+    else:
+        assert not any(resource.startswith(other) for resource in result["owned"])
+
+
+def test_remove_legacy_discovery_handles_missing_optional_properties() -> None:
+    block = "$dependencyMetadata = Get-ObjectValue" + REMOVE.split(
+        "$dependencyMetadata = Get-ObjectValue", 1
+    )[1].split("$dependencyResourceSpecs =", 1)[0]
+    result = _powershell_json("""
+$Subscription = 'sub'; $platformResourceGroup = 'platform'
+$platformIdPrefix = '/subscriptions/sub/resourceGroups/platform/providers/'
+$outputDocument = [pscustomobject]@{ apiName = 'api'; applicationInsightsName = 'insights'; controlPlaneFunctionName = 'control' }
+$ownedById = @{}
+function Invoke-AzJson([string[]]$Arguments, [switch]$AllowFailure) {
+    if ($Arguments[0] -eq 'rest') {
+        return [pscustomobject]@{ probe = '@Microsoft.KeyVault(SecretUri=https://custom-vault.vault.azure.net/secrets/probe)' }
+    }
+    return [pscustomobject]@{ properties = [pscustomobject]@{} }
+}
+""" + block + """
+@{ owned = @($ownedById.Keys) } | ConvertTo-Json -Compress
+""")
+    assert result["owned"] == [
+        "/subscriptions/sub/resourceGroups/platform/providers/Microsoft.KeyVault/vaults/custom-vault"
+    ]
