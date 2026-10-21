@@ -252,8 +252,7 @@ def policy_hash_matches(expected: object, *sources: str) -> bool:
 def render_parent_client_ids(template: str, client_ids: Sequence[str]) -> str:
     """Bind the deployment-approved clients before comparing the live parent contract."""
     primary = "<application-id>__EMPLOYEE_CLIENT_ID__</application-id>"
-    additional = "__EMPLOYEE_ADDITIONAL_CLIENT_IDS__"
-    if template.count(primary) != 1 or template.count(additional) != 1:
+    if template.count(primary) != 1:
         raise ValueError("Parent policy client ID slots are missing or ambiguous")
     if not client_ids:
         raise ValueError("At least one approved APIM client ID is required")
@@ -266,11 +265,9 @@ def render_parent_client_ids(template: str, client_ids: Sequence[str]) -> str:
         if value != normalized or normalized in approved:
             raise ValueError("Approved APIM client IDs must be unique canonical UUIDs")
         approved.append(normalized)
-    return template.replace(primary, f"<application-id>{approved[0]}</application-id>").replace(
-        additional,
-        "\n            ".join(
-            f"<application-id>{value}</application-id>" for value in approved[1:]
-        ),
+    return template.replace(
+        primary,
+        "\n            ".join(f"<application-id>{value}</application-id>" for value in approved),
     )
 
 

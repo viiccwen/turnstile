@@ -68,11 +68,8 @@ param usageObserver DisabledUsageObserver | EnabledUsageObserver = {
 @description('Entra tenant that issues employee tokens for interactive clients such as Claude Desktop.')
 param employeeTenantId string
 
-@description('Public client application ID used by employee desktop clients.')
+@description('Shared public client application ID used by employee desktop and CLI clients.')
 param employeeClientId string
-
-@description('Additional employee public client IDs permitted by the same gateway.')
-param employeeAdditionalClientIds string[]
 
 @description('Application ID of the model API that employee tokens are issued for.')
 param employeeAudience string
@@ -132,9 +129,6 @@ var legacyObserverEnabled = preserveLegacyProviderRouting && observerEnabled && 
 var employeeTokenEnabled = !empty(trim(employeeClientId)) && !empty(trim(employeeAudience))
 var disabledEmployeeApplicationId = '00000000-0000-0000-0000-000000000000'
 var effectiveEmployeeClientId = employeeTokenEnabled ? trim(employeeClientId) : disabledEmployeeApplicationId
-var effectiveAdditionalClientIds = employeeTokenEnabled
-  ? join(map(employeeAdditionalClientIds, id => '<application-id>${trim(id)}</application-id>'), '')
-  : ''
 var effectiveEmployeeAudience = employeeTokenEnabled ? trim(employeeAudience) : disabledEmployeeApplicationId
 
 resource apim 'Microsoft.ApiManagement/service@2024-05-01' existing = {
@@ -676,28 +670,24 @@ resource apiPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = 
                         replace(
                           replace(
                             replace(
-                              replace(
-                                policyWithObserverHeaders,
-                                '__LEGACY_PROVIDER_ROUTING__',
-                                preserveLegacyProviderRouting ? legacyProviderRouting : ''
-                              ),
-                              '__EMPLOYEE_TOKEN_ENABLED__',
-                              employeeTokenEnabled ? 'true' : 'false'
+                              policyWithObserverHeaders,
+                              '__LEGACY_PROVIDER_ROUTING__',
+                              preserveLegacyProviderRouting ? legacyProviderRouting : ''
                             ),
-                            '__LOGGER_ID__',
-                            logger.name
+                            '__EMPLOYEE_TOKEN_ENABLED__',
+                            employeeTokenEnabled ? 'true' : 'false'
                           ),
-                          '__TOKENS_PER_MINUTE__',
-                          string(tokensPerMinute)
+                          '__LOGGER_ID__',
+                          logger.name
                         ),
-                        '__EMPLOYEE_TENANT_ID__',
-                        employeeTenantId
+                        '__TOKENS_PER_MINUTE__',
+                        string(tokensPerMinute)
                       ),
-                      '__EMPLOYEE_CLIENT_ID__',
-                      effectiveEmployeeClientId
+                      '__EMPLOYEE_TENANT_ID__',
+                      employeeTenantId
                     ),
-                    '__EMPLOYEE_ADDITIONAL_CLIENT_IDS__',
-                    effectiveAdditionalClientIds
+                    '__EMPLOYEE_CLIENT_ID__',
+                    effectiveEmployeeClientId
                   ),
                   '__EMPLOYEE_AUDIENCE__',
                   effectiveEmployeeAudience

@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
 from typing import cast
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -294,6 +295,26 @@ def test_skip_what_if_is_explicit_and_defaults_off(tmp_path: Path) -> None:
     )
     assert recovery.skip_what_if is True
     assert recovery.skip_platform_deployment is True
+
+
+def test_foundry_parameter_can_be_omitted_without_azure_role_operations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = DeploymentInputs.load(
+        "subscription",
+        _parameters(tmp_path / "parameters.json"),
+        tmp_path / "state.json",
+    )
+    runner = CommandRunner()
+
+    def unexpected_command(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Omitting Foundry must not perform Azure role operations")
+
+    monkeypatch.setattr(runner, "run", unexpected_command)
+    monkeypatch.setattr(runner, "run_json", unexpected_command)
+
+    assert inputs.foundry_resource_id is None
+    assert ensure_foundry_role(runner, inputs, {}) == set()
 
 
 def test_foundry_resource_id_is_validated_and_not_forwarded_to_bicep(
@@ -4182,6 +4203,59 @@ def test_upgrade_files_are_private_and_concurrent_execution_is_rejected(tmp_path
         pass
 
 
+@pytest.mark.parametrize("values,expected_client", [
+    ({
+        "employeeClientId": " be989933-a2eb-42ef-9ae6-72024b01a997 ",
+        "employeeAudience": "model-api",
+    }, "be989933-a2eb-42ef-9ae6-72024b01a997"),
+    ({
+        "entraClientId": "be989933-a2eb-42ef-9ae6-72024b01a997",
+    }, "be989933-a2eb-42ef-9ae6-72024b01a997"),
+    ({
+        "employeeClientId": "",
+        "employeeAudience": "model-api",
+    }, "00000000-0000-0000-0000-000000000000"),
+    ({
+        "employeeClientId": "be989933-a2eb-42ef-9ae6-72024b01a997",
+        "employeeAudience": " ",
+    }, "00000000-0000-0000-0000-000000000000"),
+    ({}, "00000000-0000-0000-0000-000000000000"),
+])
+def test_gateway_upgrade_uses_only_the_shared_employee_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    values: dict[str, str], expected_client: str,
+) -> None:
+    from xml.etree import ElementTree
+
+    from scripts import deploy
+
+    inputs = DeploymentInputs.load(
+        "subscription",
+        _set_parameters(_parameters(tmp_path / "parameters.json"), values),
+        tmp_path / "state.json",
+    )
+    runner = MagicMock(spec=CommandRunner)
+    runner.run_json.return_value = {"accessToken": "unit-test-token"}
+    backend = MagicMock()
+    monkeypatch.setattr(deploy, "AzureUpgradeBackend", lambda *_: backend)
+    plan = MagicMock(return_value=MagicMock(required=False))
+    monkeypatch.setattr(deploy, "plan_image_upgrade", plan)
+
+    deploy.gateway_upgrade(runner, inputs, {
+        "resourceGroupName": "turnstile-test",
+        "apimName": "test-apim",
+        "apimPrincipalId": "test-principal",
+        "apimGatewayUrl": "https://test-apim.azure-api.net",
+        "apimApiId": "test-api",
+        "apiName": "test-web",
+        "controlPlaneFunctionName": "test-control",
+    }, "check")
+
+    plan.assert_called_once()
+    canonical = ElementTree.fromstring(plan.call_args.args[2])
+    assert [node.text for node in canonical.iter("application-id")] == [expected_client]
+
+
 @pytest.mark.parametrize("action", ["plan-upgrade", "upgrade", "rollback-upgrade"])
 def test_incremental_commands_do_not_recreate_secrets_or_deploy_packages(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str,
@@ -4245,6 +4319,7 @@ def test_repository_parameter_example_and_generated_documents_match_bicep(
         REPOSITORY_ROOT / "infra" / "main.parameters.example.json",
         tmp_path / "state.json",
     )
+    assert inputs.foundry_resource_id is None
     answers = iter(("a-secure-owner-password", "a-secure-owner-password"))
     material = load_or_create_secret_material(
         inputs,
@@ -4311,10 +4386,14 @@ def test_repository_parameter_examples_expose_the_same_supported_fields() -> Non
     tracked_example = REPOSITORY_ROOT / "infra" / "main.parameters.example.json"
     expected = set(json.loads(tracked_example.read_text(encoding="utf-8"))["parameters"])
     assert {
-        "employeeAdditionalClientIds", "employeeAudience",
-        "foundryCognitiveServicesAccountResourceId", "keyVaultPrivateDnsLinkName",
+        "employeeClientId", "employeeAudience",
+        "keyVaultPrivateDnsLinkName",
         *_adopted_dependency_values("subscription"),
     } <= expected
+    assert {
+        name for name in expected if name.startswith("employee") and "ClientId" in name
+    } == {"employeeClientId"}
+    assert not any("foundry" in name.casefold() for name in expected)
     for path in (
         REPOSITORY_ROOT / ".turnstile" / "handoff" / "managed.parameters.example.json",
         REPOSITORY_ROOT / ".turnstile" / "handoff" / "adopted.parameters.example.json",

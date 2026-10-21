@@ -3603,17 +3603,10 @@ def gateway_upgrade(
     denial_path = REPOSITORY_ROOT / "infra/policies/provider-neutral-images-policy.xml"
     primary = inputs.parameters.get("employeeClientId", inputs.parameters.get("entraClientId", ""))
     audience = inputs.parameters.get("employeeAudience", inputs.parameters.get("entraClientId", ""))
-    additional = inputs.parameters.get("employeeAdditionalClientIds", [])
-    if (
-        not isinstance(primary, str)
-        or not isinstance(audience, str)
-        or not isinstance(additional, list)
-    ):
-        raise DeploymentError("Employee client IDs and audience must have the expected types")
-    if not all(isinstance(value, str) for value in additional):
-        raise DeploymentError("Additional employee client IDs must be strings")
+    if not isinstance(primary, str) or not isinstance(audience, str):
+        raise DeploymentError("Employee client ID and audience must be strings")
     approved = (
-        [primary.strip(), *(value.strip() for value in additional)]
+        [primary.strip()]
         if primary.strip() and audience.strip()
         else ["00000000-0000-0000-0000-000000000000"]
     )

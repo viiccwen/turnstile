@@ -59,9 +59,6 @@
     "existingApimGatewayUrl": {
       "value": ""
     },
-    "foundryCognitiveServicesAccountResourceId": {
-      "value": ""
-    },
     "existingVirtualNetworkResourceId": {
       "value": ""
     },
@@ -151,9 +148,6 @@
     },
     "employeeClientId": {
       "value": ""
-    },
-    "employeeAdditionalClientIds": {
-      "value": []
     },
     "employeeAudience": {
       "value": ""

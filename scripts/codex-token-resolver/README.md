@@ -10,7 +10,7 @@
 
 ```powershell
 [string]$TenantId = '<tenant-id>'
-[string]$ClientId = '<codex-client-id>'
+[string]$ClientId = '<employee-client-id>'
 [string]$Audience = '<gateway-api-client-id>'
 [string]$Scope = 'api://<gateway-api-client-id>/Model.Invoke'
 [string]$GatewayBaseUrl = 'https://<gateway-host>/<api-path>'
@@ -38,5 +38,5 @@ Installer 會自動安裝和設定，根據指示啟動 Microsoft device-code �
 
 - `Missing resolver configuration`：確認 `install.ps1` 頂端的環境參數已填妥，再重新執行 installer 並重新啟動 Codex。
 - `Run the resolver with --login`：重新執行 `install.ps1 -Login`。
-- Claims 不符：確認 tenant、audience、scope 與 Codex App Registration client ID。
+- Claims 不符：確認 tenant、audience、scope 與共用 Employee App Registration 的 `employeeClientId`。
 - `403 model_not_assigned`：驗證已成功；Turnstile Owner 必須將已發布模型指派給使用者。

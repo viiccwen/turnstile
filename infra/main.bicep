@@ -191,11 +191,8 @@ param preserveLegacyProviderRouting bool = false
 @description('Entra tenant that issues employee tokens for interactive clients such as Claude Desktop.')
 param employeeTenantId string = subscription().tenantId
 
-@description('Public client application ID used by employee desktop clients.')
+@description('Shared public client application ID used by employee desktop and CLI clients.')
 param employeeClientId string = entraClientId
-
-@description('Additional permitted employee public client IDs, such as Codex, alongside employeeClientId.')
-param employeeAdditionalClientIds string[] = []
 
 @description('Application ID of the model API that employee tokens are issued for.')
 param employeeAudience string = entraClientId
@@ -302,7 +299,7 @@ var effectiveApimPrincipalId = provisionApimService ? apim!.outputs.principalId 
 var effectiveApimGatewayUrl = provisionApimService ? apim!.outputs.gatewayUrl : existingApimGatewayUrl
 var effectiveGatewayApiPath = '${effectiveApimGatewayUrl}/${gatewayApiRelativePath}'
 var approvedEmployeeClientIds = !empty(trim(employeeClientId)) && !empty(trim(employeeAudience))
-  ? concat([trim(employeeClientId)], map(employeeAdditionalClientIds, id => trim(id)))
+  ? [trim(employeeClientId)]
   : ['00000000-0000-0000-0000-000000000000']
 
 resource sharedStorage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
@@ -439,7 +436,6 @@ module apimIntegration 'modules/apim-integration.bicep' = if (deployApimBootstra
     legacyObserverRoutingEnabled: apimUsageObserverLegacyRoutingEnabled
     employeeTenantId: employeeTenantId
     employeeClientId: employeeClientId
-    employeeAdditionalClientIds: employeeAdditionalClientIds
     employeeAudience: employeeAudience
     employeeTokensPerMinute: employeeTokensPerMinute
     ledgerTableEndpoint: dataPlane.outputs.ledgerTableEndpoint

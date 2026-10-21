@@ -246,14 +246,29 @@ def test_employee_token_policy_is_disabled_without_entra_configuration() -> None
     ) in APIM_INTEGRATION
     assert "employeeTokenEnabled ? 'true' : 'false'" in APIM_INTEGRATION
     assert "employeeTokenEnabled ? trim(employeeClientId)" in APIM_INTEGRATION
-    assert "map(employeeAdditionalClientIds, id => '<application-id>" in APIM_INTEGRATION
-    assert "__EMPLOYEE_ADDITIONAL_CLIENT_IDS__" in (
-        ROOT / "infra/policies/foundry-finops-policy.xml"
-    ).read_text(encoding="utf-8")
     assert "employeeTokenEnabled ? trim(employeeAudience)" in APIM_INTEGRATION
     assert "@(__EMPLOYEE_TOKEN_ENABLED__ &amp;&amp;" in (
         ROOT / "infra/policies/foundry-finops-policy.xml"
     ).read_text(encoding="utf-8")
+
+
+def test_employee_clients_share_one_registration_across_gateway_and_control_plane() -> None:
+    for names in (
+        PARAMETERS,
+        re.findall(r"(?m)^param\s+(\w+)", MAIN),
+        re.findall(r"(?m)^param\s+(\w+)", APIM_INTEGRATION),
+    ):
+        assert {
+            name for name in names if name.startswith("employee") and "ClientId" in name
+        } == {"employeeClientId"}
+    assert (
+        "var approvedEmployeeClientIds = !empty(trim(employeeClientId)) "
+        "&& !empty(trim(employeeAudience))\n"
+        "  ? [trim(employeeClientId)]\n"
+        "  : ['00000000-0000-0000-0000-000000000000']"
+    ) in MAIN
+    assert "employeeClientId: employeeClientId" in MAIN
+    assert "employeeClientIds: approvedEmployeeClientIds" in MAIN
 
 
 def test_templates_create_platform_resources_without_foundry_projects_or_models() -> None:

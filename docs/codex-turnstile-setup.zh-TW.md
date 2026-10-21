@@ -24,7 +24,7 @@ Turnstile 提供統一的模型存取入口，負責身分驗證、模型授權�
 | Tenant ID | `b9bbf971-ad4d-4759-acf5-93dc3599c3f6` |
 | Gateway API / Audience | `7398a26d-832a-4a9d-889f-04b3c74218c4` |
 | Gateway Scope | `api://7398a26d-832a-4a9d-889f-04b3c74218c4/Model.Invoke` |
-| Codex Client ID | `249631a0-836d-40a9-b32a-92c5240902c6` |
+| 共用 Employee Client ID（Claude Code / Codex） | `be989933-a2eb-42ef-9ae6-72024b01a997` |
 | Gateway Base URL | `https://kurt-apim.azure-api.net/vicadopted/llm` |
 | Model Alias | `gpt-5.6-luna-foundry-6e35e30c` |
 | Codex Provider ID | `turnstile` |
@@ -33,12 +33,12 @@ Gateway Base URL 必須包含已發布的 API Path。Codex 使用 Responses API�
 
 ### 1.2 設定 Entra ID App Registration
 
-Codex 使用獨立的 Entra App Registration 取得 Gateway Access Token。
+Codex 與 Claude Code 共用同一個 Employee Public Client App Registration 取得 Gateway Access Token，不需要為不同工具建立獨立 registration。
 
 **設定步驟**
 
 1. 前往 **Microsoft Entra admin center → App registrations**
-2. 建立專用 App Registration
+2. 選擇 `employeeClientId` 對應的共用 App Registration；尚未建立時才新增
 3. 將應用程式配置為支援組織核准登入流程的 Public Client
 4. 在 **API permissions → Add a permission → My APIs** 中選擇 `Turnstile E2E Model API`
 5. 加入 Delegated Permission：`Model.Invoke`。
@@ -48,21 +48,20 @@ Codex 使用獨立的 Entra App Registration 取得 Gateway Access Token。
 
 | 驗證項目 | 預期值 |
 |---|---|
-| Client ID | `249631a0-836d-40a9-b32a-92c5240902c6` |
+| Client ID | `be989933-a2eb-42ef-9ae6-72024b01a997`（與 `employeeClientId` 相同） |
 | Permission | `Model.Invoke` |
 | Permission Type | Delegated |
 | Admin Consent | Granted |
 
 ### 1.3 設定 APIM Admission Policy
 
-Turnstile APIM 必須允許 Codex 的 Client ID，並驗證 Access Token 的必要 Claims。
+Turnstile APIM 只允許 `employeeClientId` 指定的共用 Client ID，並驗證 Access Token 的必要 Claims。Claude Code 與 Codex 的 Token Resolver 都必須使用此 Client ID。
 
-目前允許的 Client 包括：
+參考配置：
 
 | Application | Client ID |
 |---|---|
-| Claude | `be989933-a2eb-42ef-9ae6-72024b01a997` |
-| Codex | `249631a0-836d-40a9-b32a-92c5240902c6` |
+| Claude Code / Codex 共用 | `be989933-a2eb-42ef-9ae6-72024b01a997` |
 
 APIM Policy 應驗證：
 
@@ -71,9 +70,13 @@ APIM Policy 應驗證：
 - `scp`：包含 `Model.Invoke`。
 - `tid`：符合允許的 Entra Tenant。
 
-**注意：** 新增 Client ID 時，必須同步更新參數檔
-- `employeeAdditionalClientIds`：加入 Codex Client ID。
-- `employeeClientMap`：加入 Codex Client ID 與顯示名稱的對應。
+參數檔使用以下設定：
+- `employeeClientId`：填入共用 Employee Public Client 的 Client ID。
+- `employeeAudience`：維持 Gateway Model API 的 audience，不要改成共用 Client ID。
+- `employeeClientMap`：以共用 Client ID 對應同一個流量顯示名稱，例如 `Employee AI Tools`。
+- `employeeSurfaceMap`：不需要按工具區分時保持 `[]`。
+
+既有環境新增 Codex 時，只需讓其 Token Resolver 使用既有的 `employeeClientId`，不必新增允許的 Client ID。
 
 ### 1.4 發布模型與設定存取權限
 
@@ -109,9 +112,9 @@ Codex 使用的 Token Resolution Command 必須將純 Access Token 輸出至標�
 
 開放使用者連接前，應完成：
 
-- [ ] Codex App Registration 已取得 `Model.Invoke` Delegated Permission。
+- [ ] 共用 Employee Public Client App Registration 已取得 `Model.Invoke` Delegated Permission。
 - [ ] Entra Admin Consent 已完成。
-- [ ] APIM Policy 已允許 Codex Client ID。
+- [ ] Codex Token Resolver 與 APIM Policy 使用相同的共用 `employeeClientId`。
 - [ ] 模型已發布，且 Model Route 可正常使用。
 - [ ] 使用者已取得對應模型的指派權限。
 - [ ] Budget Admission 設定正確。
@@ -147,13 +150,13 @@ Installer 會自動完成：
 成功後，驗證資訊應符合：
 
 ```text
-azp = 249631a0-836d-40a9-b32a-92c5240902c6
+azp = be989933-a2eb-42ef-9ae6-72024b01a997
 aud = 7398a26d-832a-4a9d-889f-04b3c74218c4
 scp = Model.Invoke
 tid = b9bbf971-ad4d-4759-acf5-93dc3599c3f6
 ```
 
-若驗證結果不符，請確認使用的是 Codex 專用 App Registration，而非 Azure CLI 或 Claude 的 Client ID。
+若驗證結果不符，請確認 Codex Token Resolver 使用的是 `employeeClientId` 對應的共用 App Registration，而非 Azure CLI 的 Client ID；Claude Code 使用同一個 Client ID 是預期行為。
 
 > 不要複製其他使用者的 Token Cache，或將 Access Token 手動寫入設定檔。
 

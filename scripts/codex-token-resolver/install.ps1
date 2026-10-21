@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$TenantId = 'b9bbf971-ad4d-4759-acf5-93dc3599c3f6',
-    [string]$ClientId = '249631a0-836d-40a9-b32a-92c5240902c6',
+    [string]$ClientId = 'be989933-a2eb-42ef-9ae6-72024b01a997',
     [string]$Audience = '7398a26d-832a-4a9d-889f-04b3c74218c4',
     [string]$Scope = '',
     [string]$GatewayBaseUrl = 'https://kurt-apim.azure-api.net/vicadopted/llm',

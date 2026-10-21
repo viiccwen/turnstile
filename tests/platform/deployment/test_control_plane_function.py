@@ -513,7 +513,9 @@ def test_initialized_parent_matches_the_public_rendered_policy(
     monkeypatch.setattr(function_app, "get_settings", lambda: settings)
     parents = function_app._parent_policy_overrides(policy_path, repository)
     initialized_parent = parents[request.gateway_profile_id]
-    assert "__EMPLOYEE_ADDITIONAL_CLIENT_IDS__" not in initialized_parent
+    assert [node.text for node in ET.fromstring(initialized_parent).iter("application-id")] == [
+        "__EMPLOYEE_CLIENT_ID__",
+    ]
     assert all(
         client_id not in initialized_parent for client_id in settings.apim_employee_client_ids
     )

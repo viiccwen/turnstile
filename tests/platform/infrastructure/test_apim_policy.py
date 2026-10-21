@@ -49,17 +49,28 @@ def test_parent_contract_rejects_missing_invalid_or_duplicate_clients(ids: list[
         render_parent_client_ids(POLICY_PATH.read_text(encoding="utf-8"), ids)
 
 
-@pytest.mark.parametrize("slot", [
-    "<application-id>__EMPLOYEE_CLIENT_ID__</application-id>",
-    "__EMPLOYEE_ADDITIONAL_CLIENT_IDS__",
-])
 @pytest.mark.parametrize("replacement_count", [0, 2])
 def test_parent_client_renderer_rejects_missing_or_ambiguous_slots(
-    slot: str, replacement_count: int,
+    replacement_count: int,
 ) -> None:
+    slot = "<application-id>__EMPLOYEE_CLIENT_ID__</application-id>"
     source = POLICY_PATH.read_text(encoding="utf-8").replace(slot, slot * replacement_count)
     with pytest.raises(ValueError, match="missing or ambiguous"):
         render_parent_client_ids(source, ["be989933-a2eb-42ef-9ae6-72024b01a997"])
+
+
+def test_public_parent_uses_one_shared_employee_client() -> None:
+    template = POLICY_PATH.read_text(encoding="utf-8")
+    root = parse_policy(template)
+    clients = root.find(".//validate-azure-ad-token/client-application-ids")
+    assert clients is not None
+    assert [node.text for node in clients] == ["__EMPLOYEE_CLIENT_ID__"]
+    assert not (clients.text or "").strip()
+    assert not (clients[0].tail or "").strip()
+    shared = "be989933-a2eb-42ef-9ae6-72024b01a997"
+    rendered = render_parent_client_ids(template, [shared])
+    assert [node.text for node in parse_policy(rendered).iter("application-id")] == [shared]
+    assert validate_parent_policy(rendered, rendered) == rendered
 
 
 def test_public_parent_supports_images_without_using_text_token_policies() -> None:

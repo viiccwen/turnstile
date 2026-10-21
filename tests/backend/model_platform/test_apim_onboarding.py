@@ -538,15 +538,10 @@ def test_platform_governance_configuration_is_a_readonly_owned_resource(
     assert calls == [("GET", resource)]
 
 
-@pytest.mark.parametrize("additional_client_slot", [False, True])
-def test_initialization_renders_canonical_governance_without_legacy_accounting(
-    additional_client_slot: bool,
-) -> None:
+def test_initialization_renders_canonical_governance_without_legacy_accounting() -> None:
     source = (
         Path(__file__).resolve().parents[3] / "infra/policies/foundry-finops-policy.xml"
     ).read_text()
-    if not additional_client_slot:
-        source = source.replace("__EMPLOYEE_ADDITIONAL_CLIENT_IDS__", "")
     request = onboarding_plan().request
     configuration = onboarding_configuration()
     policy = render_onboarding_parent(request, configuration, source)
@@ -554,8 +549,6 @@ def test_initialization_renders_canonical_governance_without_legacy_accounting(
     assert [node.text for node in root.iter("application-id")] == [
         str(configuration.employee_client_id),
     ]
-    assert "__EMPLOYEE_ADDITIONAL_CLIENT_IDS__" not in policy
-    assert ("__EMPLOYEE_ADDITIONAL_CLIENT_IDS__" in source) is additional_client_slot
     assert root.find("inbound/set-variable[@name='budgetExecutionVersion']") is not None
     assert root.find("inbound/choose/when/set-variable[@name='budgetExecutionFence']") is not None
     assert request.api_id in policy
