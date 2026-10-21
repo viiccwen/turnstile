@@ -29,7 +29,7 @@ htmlcov/
 .python_packages/
 
 # Node and frontend output
-frontend/node_modules/
+node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
 frontend/vite.config.js

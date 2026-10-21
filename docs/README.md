@@ -24,6 +24,7 @@ describes the release workflows and operational boundaries.
 - [End-to-End Validation](e2e-validation.md)
 - [Security](security.md)
 - [Troubleshooting](troubleshooting.md)
+- [Codex 連接 Turnstile 教學](codex-turnstile-setup.zh-TW.md)
 
 The root [README](../README.md) is the primary onboarding document. The [website user manual](https://turn-stile.com/docs)
 provides task-oriented UI guidance. These repository pages contain maintainer and operator details;
