@@ -48,11 +48,13 @@ from ..integrations.apim_control_plane_contract import (
 )
 from ..integrations.apim_image_policy import IMAGE_OPERATION_ID
 from ..integrations.apim_model_availability import compose_availability_parent
+from ..integrations.apim_policy_compiler import compiled_policy_matches
 from ..integrations.apim_policy_components import (
     component_digest,
     compose_image_parent_policy,
     parse_policy,
     policy_document_digest,
+    policy_hash_matches,
     validate_parent_policy,
     validate_parent_readback,
 )
@@ -553,7 +555,7 @@ class GatewayPublicationWorker:
         client.verify_publication_permissions(compiled, recovery_only=already_promoted)
         if (
             status in {"verifying", "promoting"}
-            and publication.policy_sha256 != compiled.policy_sha256
+            and not compiled_policy_matches(compiled, publication.policy_sha256)
         ):
             raise PolicyCompilationError(
                 "Candidate policy no longer matches the active compiler"
@@ -646,16 +648,18 @@ class GatewayPublicationWorker:
                 raise RuntimeError("Publication is missing its APIM revision")
             base_revision, live_policy = client.current_api_policy()
             manifest = publication.resource_manifest
-            live_hash = policy_sha256(live_policy)
             expected_document = manifest.get("base_policy_document_sha256")
-            matching_document = (
+            # A recorded document digest is authoritative, never an optional fallback
+            # to the less strict (whitespace-normalizing) policy identity.
+            matching_policy = (
                 isinstance(expected_document, str)
-                and len(expected_document) == 64
                 and policy_document_digest(live_policy) == expected_document
+                if "base_policy_document_sha256" in manifest
+                else policy_hash_matches(manifest.get("base_policy_sha256"), live_policy)
             )
             if (
                 manifest.get("base_apim_revision") != base_revision
-                or (manifest.get("base_policy_sha256") != live_hash and not matching_document)
+                or not matching_policy
             ):
                 raise PolicyCompilationError(
                     "The current APIM policy changed after publication was queued"

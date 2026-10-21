@@ -94,11 +94,16 @@ from .apim_control_plane_contract import (
     RetryablePublicationError,
     missing_management_actions,
 )
-from .apim_policy_compiler import ApimPolicyCompiler, policy_sha256
+from .apim_policy_compiler import (
+    ApimPolicyCompiler,
+    compiled_policy_matches,
+    compiled_policy_sources,
+)
 from .apim_policy_components import (
     component_digest,
     parent_readback_matches,
     parse_policy,
+    policy_hash_matches,
     validate_policy_upload,
 )
 from .apim_self_hosted_gateway import AzureSelfHostedGatewayManagementMixin
@@ -3045,35 +3050,28 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
                         issues.append(f"missing_operation_policy:{operation_id}")
                     else:
                         operation_policies.append(policy)
-                if len(operation_policies) == len(managed_operations):
-                    observed_policy_hash = policy_sha256(*operation_policies)
-                    if (
-                        publication.policy_sha256 is not None
-                        and observed_policy_hash != publication.policy_sha256
-                    ):
-                        expected_policies = (
-                            compiled.chat_completions_policy,
-                            compiled.responses_policy,
-                            compiled.responses_compact_policy,
-                            compiled.messages_policy,
-                            compiled.count_tokens_policy,
-                            compiled.models_policy,
-                            *((compiled.images_generations_policy,)
-                              if compiled.images_generations_policy is not None else ()),
-                            *(source for _, source in compiled.availability_probe_policies),
+                if (
+                    len(operation_policies) == len(managed_operations)
+                    and publication.policy_sha256 is not None
+                    and not policy_hash_matches(publication.policy_sha256, *operation_policies)
+                ):
+                    expected_policies = compiled_policy_sources(compiled)
+                    matches_canonical_compilation = (
+                        compiled_policy_matches(compiled, publication.policy_sha256)
+                        and policy_hash_matches(compiled.policy_sha256, *operation_policies)
+                    )
+                    matches_availability_compilation = (
+                        bool(compiled.availability_probe_policies)
+                        and compiled_policy_matches(compiled, publication.policy_sha256)
+                        and len(operation_policies) == len(expected_policies)
+                        and all(
+                            component_digest(parse_policy(actual), normalize_text_defaults=False)
+                            == component_digest(parse_policy(expected), normalize_text_defaults=False)
+                            for actual, expected in zip(operation_policies, expected_policies, strict=True)
                         )
-                        matches_availability_compilation = (
-                            bool(compiled.availability_probe_policies)
-                            and compiled.policy_sha256 == publication.policy_sha256
-                            and len(operation_policies) == len(expected_policies)
-                            and all(
-                                component_digest(parse_policy(actual), normalize_text_defaults=False)
-                                == component_digest(parse_policy(expected), normalize_text_defaults=False)
-                                for actual, expected in zip(operation_policies, expected_policies, strict=True)
-                            )
-                        )
-                        if not matches_availability_compilation:
-                            issues.append("mismatched_compiled_policy_sha256")
+                    )
+                    if not (matches_canonical_compilation or matches_availability_compilation):
+                        issues.append("mismatched_compiled_policy_sha256")
 
         observed_backend_types: dict[str, str] = {}
         for backend_id in backend_ids:

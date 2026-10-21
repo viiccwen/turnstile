@@ -194,6 +194,9 @@ param employeeTenantId string = subscription().tenantId
 @description('Public client application ID used by employee desktop clients.')
 param employeeClientId string = entraClientId
 
+@description('Additional permitted employee public client IDs, such as Codex, alongside employeeClientId.')
+param employeeAdditionalClientIds string[] = []
+
 @description('Application ID of the model API that employee tokens are issued for.')
 param employeeAudience string = entraClientId
 
@@ -298,6 +301,9 @@ var effectiveApimName = provisionApimService ? apim!.outputs.name : existingApim
 var effectiveApimPrincipalId = provisionApimService ? apim!.outputs.principalId : existingApimPrincipalId
 var effectiveApimGatewayUrl = provisionApimService ? apim!.outputs.gatewayUrl : existingApimGatewayUrl
 var effectiveGatewayApiPath = '${effectiveApimGatewayUrl}/${gatewayApiRelativePath}'
+var approvedEmployeeClientIds = !empty(trim(employeeClientId)) && !empty(trim(employeeAudience))
+  ? concat([trim(employeeClientId)], map(employeeAdditionalClientIds, id => trim(id)))
+  : ['00000000-0000-0000-0000-000000000000']
 
 resource sharedStorage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
   scope: resourceGroup(storageResourceGroupName)
@@ -433,6 +439,7 @@ module apimIntegration 'modules/apim-integration.bicep' = if (deployApimBootstra
     legacyObserverRoutingEnabled: apimUsageObserverLegacyRoutingEnabled
     employeeTenantId: employeeTenantId
     employeeClientId: employeeClientId
+    employeeAdditionalClientIds: employeeAdditionalClientIds
     employeeAudience: employeeAudience
     employeeTokensPerMinute: employeeTokensPerMinute
     ledgerTableEndpoint: dataPlane.outputs.ledgerTableEndpoint
@@ -478,6 +485,7 @@ module controlPlane 'modules/control-plane-function.bicep' = if (provisionContro
     apimResourceGroupName: effectiveApimResourceGroupName
     apimName: effectiveApimName
     apimApiId: apimApiId
+    employeeClientIds: approvedEmployeeClientIds
     apimProductId: apimProductId
     dashboardSubscriptionId: apimDashboardSubscriptionId
     probeSubscriptionId: apimProbeSubscriptionId

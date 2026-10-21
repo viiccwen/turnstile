@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock, patch
@@ -737,6 +738,56 @@ def test_parent_snapshot_accepts_xml_roundtrip_but_rejects_drift_before_writes(
     assert result is not None and result.status == ("failed" if changed else "verifying")
     if changed:
         assert client.calls == [("current-policy", "1")]
+
+
+@pytest.mark.parametrize("identity", ["legacy_raw", "canonical", "wrong", "null", "short"])
+def test_parent_snapshot_identity_and_document_evidence(identity: str) -> None:
+    from turnstile_core.integrations.apim_policy_compiler import policy_sha256
+
+    repository = InMemoryRepository()
+    GatewayControlPlaneService(repository).publish(bedrock_publication(), "unit-owner")
+    client = FakeApimClient()
+    worker = GatewayPublicationWorker(repository, client, client.policy)
+    for _ in range(3):
+        worker.run_once("worker")
+    manifest = repository.gateway_publications[-1]["resource_manifest"]
+    if identity in {"legacy_raw", "canonical"}:
+        manifest.pop("base_policy_document_sha256")
+        manifest["base_policy_sha256"] = (
+            hashlib.sha256(client.policy.encode("utf-8")).hexdigest()
+            if identity == "legacy_raw" else policy_sha256(client.policy)
+        )
+    else:
+        # The policy identity still matches: bad document evidence must not fall back.
+        manifest["base_policy_document_sha256"] = {
+            "wrong": "0" * 64, "null": None, "short": "abc",
+        }[identity]
+    client.calls.clear()
+    result = worker.run_once("worker")
+    assert result is not None
+    assert result.status == ("verifying" if identity in {"legacy_raw", "canonical"} else "failed")
+    if result.status == "failed":
+        assert "changed after publication was queued" in (result.error_message or "")
+        assert client.calls == [("current-policy", "1")]
+
+
+def test_worker_resumes_legacy_raw_compiled_policy_identity() -> None:
+    from turnstile_core.integrations.apim_policy_compiler import compiled_policy_sources
+
+    repository = InMemoryRepository()
+    GatewayControlPlaneService(repository).publish(bedrock_publication(), "unit-owner")
+    client = FakeApimClient()
+    worker = GatewayPublicationWorker(repository, client, client.policy)
+    for _ in range(4):
+        publication = worker.run_once("worker")
+    assert publication is not None and publication.status == "verifying"
+    compiled = ApimPolicyCompiler().compile(publication)
+    repository.gateway_publications[-1]["policy_sha256"] = hashlib.sha256(
+        "\n".join(compiled_policy_sources(compiled)).encode("utf-8")
+    ).hexdigest()
+    for expected in ("promoting", "active"):
+        result = worker.run_once("worker")
+        assert result is not None and result.status == expected
 
 
 def test_foundry_publication_waits_for_rbac_and_resumes_the_same_candidate() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from html import escape, unescape
@@ -2179,11 +2180,15 @@ def _active_bedrock_release() -> tuple[GatewayPublication, FakeApimClient]:
     return release, fake
 
 
+@pytest.mark.parametrize("legacy_identity", [False, True])
 @pytest.mark.parametrize(
     ("failure", "expected_status"),
     [
         (None, "healthy"),
         ("normalized_policy", "healthy"),
+        ("changed_parent", "mismatched"),
+        ("changed_operation", "mismatched"),
+        ("wrong_recorded_hash", "mismatched"),
         ("missing_backend", "missing"),
         ("mismatched_named_value", "mismatched"),
     ],
@@ -2191,8 +2196,20 @@ def _active_bedrock_release() -> tuple[GatewayPublication, FakeApimClient]:
 def test_arm_client_inspects_recorded_release_dependencies(
     failure: str | None,
     expected_status: str,
+    legacy_identity: bool,
 ) -> None:
     release, fake = _active_bedrock_release()
+    if legacy_identity:
+        from turnstile_core.integrations.apim_policy_compiler import compiled_policy_sources
+
+        compiled = ApimPolicyCompiler().compile(release)
+        release = release.model_copy(update={
+            "policy_sha256": hashlib.sha256(
+                "\n".join(compiled_policy_sources(compiled)).encode("utf-8")
+            ).hexdigest(),
+        })
+    if failure == "wrong_recorded_hash":
+        release = release.model_copy(update={"policy_sha256": "0" * 64})
     assert release.apim_revision is not None
     revision = release.apim_revision
     raw_backends = release.resource_manifest.get("backends")
@@ -2278,6 +2295,9 @@ def test_arm_client_inspects_recorded_release_dependencies(
                 root = ElementTree.fromstring(value, parser=parser)
                 ElementTree.indent(root)
                 value = ElementTree.tostring(root, encoding="unicode")
+            if (failure == "changed_parent" and operation is None
+                    or failure == "changed_operation" and operation == "responses-compact"):
+                value = value.replace("<inbound>", '<inbound><return-response />', 1)
             return httpx.Response(
                 200,
                 headers={"content-type": "application/json"},
@@ -2292,7 +2312,11 @@ def test_arm_client_inspects_recorded_release_dependencies(
     )
     result = client.inspect_revision_dependencies(release)
 
-    assert result.live_status == expected_status
+    assert result.live_status == expected_status, result.issues
+    assert ("mismatched_parent_policy_sha256" in result.issues) is (failure == "changed_parent")
+    assert ("mismatched_compiled_policy_sha256" in result.issues) is (
+        failure in {"changed_operation", "wrong_recorded_hash"}
+    )
     assert (f"missing_backend:{backend_ids[0]}" in result.issues) is (
         failure == "missing_backend"
     )

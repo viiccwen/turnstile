@@ -33,6 +33,7 @@ from turnstile_core.integrations.apim_control_plane import (
     PolicyCompilationError,
 )
 from turnstile_core.integrations.apim_onboarding_policy import onboarding_canonical_parent
+from turnstile_core.integrations.apim_policy_components import render_parent_client_ids
 from turnstile_core.integrations.apim_publisher_client import AzureApimPublisherClient
 from turnstile_core.integrations.apim_storage_routes import FixedProgramVerifier
 from turnstile_core.integrations.apim_target_client_factory import (
@@ -264,8 +265,12 @@ def _parent_policy_overrides(
                 continue
             if target in overrides:
                 raise RuntimeError("Execution cannot silently replace a schema-one target")
+            target_source = (
+                render_parent_client_ids(source, settings.apim_employee_client_ids)
+                if settings.apim_employee_client_ids else source
+            )
             overrides[target] = compose_budget_execution_parent(
-                source, source, enabled=True,
+                target_source, target_source, enabled=True,
                 delegation=settings.budget_delegation_trust.get(target),
             )
     if initialized:
@@ -509,10 +514,15 @@ def publish_gateway_changes(timer: func.TimerRequest) -> None:
         if not policy_path.is_file():
             logger.error("Gateway publication skipped: parent policy baseline is unavailable")
         else:
+            parent_policy = policy_path.read_text(encoding="utf-8")
+            if settings.apim_employee_client_ids:
+                parent_policy = render_parent_client_ids(
+                    parent_policy, settings.apim_employee_client_ids,
+                )
             worker = GatewayPublicationWorker(
                 repository,
                 publisher,
-                policy_path.read_text(encoding="utf-8"),
+                parent_policy,
                 ApimPolicyCompiler(settings.apim_probe_subscription_id),
                 cipher,
                 chat_completions_operation_id=settings.apim_chat_completions_operation_id,
@@ -641,6 +651,10 @@ def process_gateway_release_operations(timer: func.TimerRequest) -> None:
             "CONTROL_PLANE_PARENT_POLICY_PATH", "policies/foundry-finops-policy.xml",
         ))
         parent_policy = policy_path.read_text(encoding="utf-8") if policy_path.is_file() else None
+        if parent_policy is not None and settings.apim_employee_client_ids:
+            parent_policy = render_parent_client_ids(
+                parent_policy, settings.apim_employee_client_ids,
+            )
         parent_overrides = _parent_policy_overrides(policy_path, repository)
 
         def enroll_gateway(

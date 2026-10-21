@@ -85,6 +85,9 @@ def onboarding_policy_configuration_digest(
 def onboarding_canonical_parent(
     canonical_parent: str, api_id: str, *, delegation: BudgetDelegationTrust | None = None,
 ) -> str:
+    # Onboarding approves its own single configuration.employee_client_id, not the
+    # deployment's additional employee clients. Keep the primary slot bindable.
+    canonical_parent = canonical_parent.replace("__EMPLOYEE_ADDITIONAL_CLIENT_IDS__", "")
     source = compose_budget_execution_parent(
         canonical_parent, canonical_parent, enabled=True, delegation=delegation,
     )

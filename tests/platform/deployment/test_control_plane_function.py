@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 from uuid import UUID
+from xml.etree import ElementTree as ET
 
 import pytest
 
@@ -20,7 +21,10 @@ from tests.support.paths import REPOSITORY_ROOT
 from turnstile_core.config import Settings
 from turnstile_core.domain.model_availability import ModelAvailabilityState
 from turnstile_core.integrations.apim_onboarding_policy import render_onboarding_parent
-from turnstile_core.integrations.apim_policy_components import validate_parent_policy
+from turnstile_core.integrations.apim_policy_components import (
+    render_parent_client_ids,
+    validate_parent_policy,
+)
 from turnstile_core.persistence.in_memory import InMemoryRepository
 from turnstile_core.security import CredentialCipher
 from turnstile_core.services.budget_settlement import BudgetScopeRepository
@@ -375,6 +379,59 @@ def test_retired_initial_target_with_delegation_does_not_block_publisher(
     initialization.configure_budget_delegation.assert_not_called()
 
 
+@pytest.mark.parametrize("timer", ["publication", "release"])
+def test_publication_worker_receives_exact_approved_client_baseline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, timer: str,
+) -> None:
+    template = (REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml").read_text(
+        encoding="utf-8"
+    )
+    policy_path = tmp_path / "parent.xml"
+    policy_path.write_text(template, encoding="utf-8")
+    monkeypatch.setenv("CONTROL_PLANE_PARENT_POLICY_PATH", str(policy_path))
+    ids = ["be989933-a2eb-42ef-9ae6-72024b01a997", "249631a0-836d-40a9-b32a-92c5240902c6"]
+    settings = Settings.model_construct(
+        control_plane_enabled=True,
+        gateway_publication_worker_enabled=True,
+        gateway_release_worker_enabled=True,
+        apim_target_registry_enabled=True,
+        apim_employee_client_ids=ids,
+    )
+    repository, configs, publisher = MagicMock(), MagicMock(), MagicMock()
+    worker = MagicMock()
+    worker.run_once.return_value = None
+    worker_factory = MagicMock(return_value=worker)
+    config_factory = MagicMock(return_value=configs)
+    resolver_factory = MagicMock(return_value=publisher)
+    global_factory = MagicMock(side_effect=AssertionError("global client is forbidden"))
+    monkeypatch.setattr(function_app, "get_settings", lambda: settings)
+    monkeypatch.setattr(function_app, "create_repository", lambda *_, **__: repository)
+    monkeypatch.setattr(function_app, "apim_target_client_config_resolver", config_factory)
+    monkeypatch.setattr(function_app, "AzureApimPublisherClientResolver", resolver_factory)
+    monkeypatch.setattr(function_app, "AzureApimPublisherClient", global_factory)
+    monkeypatch.setattr(function_app, "FixedRoutePublisherFactory", MagicMock())
+    monkeypatch.setattr(function_app, "initialized_apim_targets", lambda _: {})
+    monkeypatch.setattr(CredentialCipher, "from_settings", lambda _: object())
+    if timer == "publication":
+        monkeypatch.setattr(function_app, "GatewayPublicationWorker", worker_factory)
+        function_app.publish_gateway_changes(None)
+        baseline = worker_factory.call_args.args[2]
+    else:
+        monkeypatch.setattr(function_app, "GatewayReleaseOperationWorker", worker_factory)
+        function_app.process_gateway_release_operations(None)
+        baseline = worker_factory.call_args.kwargs["parent_policy"]
+    assert worker_factory.call_args.args[:2] == (repository, publisher)
+    assert worker_factory.call_args.kwargs["parent_policy_overrides"] == {}
+    assert baseline == render_parent_client_ids(template, ids)
+    assert [node.text for node in ET.fromstring(baseline).iter("application-id")] == ids
+    assert settings.apim_employee_client_ids == ids
+    assert policy_path.read_text(encoding="utf-8") == template
+    config_factory.assert_called_once_with(repository, settings)
+    resolver_factory.assert_called_once_with(configs)
+    global_factory.assert_not_called()
+    repository.close.assert_called_once()
+
+
 def test_target_mode_does_not_construct_a_global_publisher(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -444,6 +501,9 @@ def test_initialized_parent_matches_the_public_rendered_policy(
         apim_target_registry_enabled=True, budget_execution_enabled=True,
         ledger_table_endpoint=f"https://{parts[8]}.table.core.windows.net/",
         ledger_table_name=parts[-1],
+        apim_employee_client_ids=[
+            "be989933-a2eb-42ef-9ae6-72024b01a997", "249631a0-836d-40a9-b32a-92c5240902c6",
+        ],
     )
     repository = InMemoryRepository()
     monkeypatch.setattr(
@@ -452,17 +512,56 @@ def test_initialized_parent_matches_the_public_rendered_policy(
     policy_path = REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml"
     monkeypatch.setattr(function_app, "get_settings", lambda: settings)
     parents = function_app._parent_policy_overrides(policy_path, repository)
-    validate_parent_policy(
-        render_onboarding_parent(request, config, source), parents[request.gateway_profile_id],
+    initialized_parent = parents[request.gateway_profile_id]
+    assert "__EMPLOYEE_ADDITIONAL_CLIENT_IDS__" not in initialized_parent
+    assert all(
+        client_id not in initialized_parent for client_id in settings.apim_employee_client_ids
     )
+    validate_parent_policy(
+        render_onboarding_parent(request, config, source), initialized_parent,
+    )
+    assert [
+        node.text for node in ET.fromstring(
+            render_onboarding_parent(request, config, source),
+        ).iter("application-id")
+    ] == [str(config.employee_client_id)]
     settings = settings.model_copy(update={
         "budget_execution_target_ids": [request.gateway_profile_id],
     })
     monkeypatch.setattr(function_app, "get_settings", lambda: settings)
     parents = function_app._parent_policy_overrides(policy_path, repository)
+    assert parents[request.gateway_profile_id] == initialized_parent
     validate_parent_policy(
         render_onboarding_parent(request, config, source), parents[request.gateway_profile_id],
     )
+    assert settings.apim_employee_client_ids == [
+        "be989933-a2eb-42ef-9ae6-72024b01a997", "249631a0-836d-40a9-b32a-92c5240902c6",
+    ]
+    assert policy_path.read_text() == source
+
+
+def test_execution_parent_preserves_approved_clients_without_mutating_template(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from turnstile_core.integrations.apim_budget_execution import compose_budget_execution_parent
+
+    source = (REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml").read_text(
+        encoding="utf-8",
+    )
+    policy = tmp_path / "policy.xml"
+    policy.write_text(source, encoding="utf-8")
+    ids = ["be989933-a2eb-42ef-9ae6-72024b01a997", "249631a0-836d-40a9-b32a-92c5240902c6"]
+    settings = Settings.model_construct(
+        budget_execution_target_ids=[TARGET], apim_employee_client_ids=ids,
+    )
+    snapshot = settings.model_dump()
+    monkeypatch.setattr(function_app, "get_settings", lambda: settings)
+    parents = function_app._parent_policy_overrides(policy)
+    approved = render_parent_client_ids(source, ids)
+    assert parents == {TARGET: compose_budget_execution_parent(approved, approved, enabled=True)}
+    assert [node.text for node in ET.fromstring(parents[TARGET]).iter("application-id")] == ids
+    assert settings.model_dump() == snapshot
+    assert policy.read_text(encoding="utf-8") == source
 
 
 @pytest.mark.parametrize("enrollment", ["valid", "missing", "other_epoch", "other_target"])

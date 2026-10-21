@@ -48,6 +48,7 @@
           failed-validation-error-message="A valid employee token is required.">
           <client-application-ids>
             <application-id>__EMPLOYEE_CLIENT_ID__</application-id>
+            __EMPLOYEE_ADDITIONAL_CLIENT_IDS__
           </client-application-ids>
           <audiences>
             <audience>__EMPLOYEE_AUDIENCE__</audience>

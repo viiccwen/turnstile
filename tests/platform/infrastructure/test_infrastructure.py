@@ -246,6 +246,10 @@ def test_employee_token_policy_is_disabled_without_entra_configuration() -> None
     ) in APIM_INTEGRATION
     assert "employeeTokenEnabled ? 'true' : 'false'" in APIM_INTEGRATION
     assert "employeeTokenEnabled ? trim(employeeClientId)" in APIM_INTEGRATION
+    assert "map(employeeAdditionalClientIds, id => '<application-id>" in APIM_INTEGRATION
+    assert "__EMPLOYEE_ADDITIONAL_CLIENT_IDS__" in (
+        ROOT / "infra/policies/foundry-finops-policy.xml"
+    ).read_text(encoding="utf-8")
     assert "employeeTokenEnabled ? trim(employeeAudience)" in APIM_INTEGRATION
     assert "@(__EMPLOYEE_TOKEN_ENABLED__ &amp;&amp;" in (
         ROOT / "infra/policies/foundry-finops-policy.xml"
@@ -496,19 +500,25 @@ def test_deployment_bootstraps_only_owned_shared_storage_children() -> None:
         and node.name == "ensure_shared_storage_resources"
     )
     commands = [
-        [ast.literal_eval(item) for item in node.elts[:4]]
+        [ast.unparse(item) for item in node.elts[:4]]
         for node in ast.walk(bootstrap)
         if isinstance(node, ast.List) and len(node.elts) >= 4
-        and all(isinstance(item, ast.Constant) for item in node.elts[:4])
+        and isinstance(node.elts[0], ast.Constant) and node.elts[0].value == "az"
     ]
     assert commands == [
-        ["az", "storage", "container", "create"],
-        ["az", "storage", "table", "create"],
+        ["'az'", "'storage'", "kind", "'create'"],
     ]
     source = ast.unparse(bootstrap)
-    assert "(telemetry_container, control_container)" in source
-    assert "dict.fromkeys((ledger_table, DEFAULT_ROUTE_TABLE_NAME))" in source
+    for child in (
+        "('container', 'blobServices/default/containers', telemetry_container)",
+        "('container', 'blobServices/default/containers', control_container)",
+        "('table', 'tableServices/default/tables', ledger_table)",
+        "('table', 'tableServices/default/tables', DEFAULT_ROUTE_TABLE_NAME)",
+    ):
+        assert child in source
+    assert "for kind, child_path, name in children:" in source
     assert "'--auth-mode', 'login'" in source
+    assert "result.stdout.strip() == 'true'" in source
     assert re.search(r'^DEFAULT_ROUTE_TABLE_NAME\s*=\s*[\'"]ModelRoutes[\'"]', DEPLOY_SCRIPT, re.M)
     assert "param ledgerTableName string = 'TurnstileLedger'" in MAIN
     assert "resource sharedStorage 'Microsoft.Storage/storageAccounts@" in MAIN

@@ -230,6 +230,50 @@ def policy_document_digest(source: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def canonical_policy_sha256(*sources: str) -> str:
+    canonical = (
+        ET.canonicalize(source, strip_text=True, with_comments=True) for source in sources
+    )
+    return hashlib.sha256("\n".join(canonical).encode("utf-8")).hexdigest()
+
+
+def policy_hash_matches(expected: object, *sources: str) -> bool:
+    """Read both legacy byte identities and canonical identities; write only canonical."""
+    if not isinstance(expected, str):
+        return False
+    if hashlib.sha256("\n".join(sources).encode("utf-8")).hexdigest() == expected:
+        return True
+    try:
+        return canonical_policy_sha256(*sources) == expected
+    except ET.ParseError:
+        return False
+
+
+def render_parent_client_ids(template: str, client_ids: Sequence[str]) -> str:
+    """Bind the deployment-approved clients before comparing the live parent contract."""
+    primary = "<application-id>__EMPLOYEE_CLIENT_ID__</application-id>"
+    additional = "__EMPLOYEE_ADDITIONAL_CLIENT_IDS__"
+    if template.count(primary) != 1 or template.count(additional) != 1:
+        raise ValueError("Parent policy client ID slots are missing or ambiguous")
+    if not client_ids:
+        raise ValueError("At least one approved APIM client ID is required")
+    approved: list[str] = []
+    for value in client_ids:
+        try:
+            normalized = str(UUID(value))
+        except (TypeError, ValueError, AttributeError) as error:
+            raise ValueError("Invalid approved APIM client ID") from error
+        if value != normalized or normalized in approved:
+            raise ValueError("Approved APIM client IDs must be unique canonical UUIDs")
+        approved.append(normalized)
+    return template.replace(primary, f"<application-id>{approved[0]}</application-id>").replace(
+        additional,
+        "\n            ".join(
+            f"<application-id>{value}</application-id>" for value in approved[1:]
+        ),
+    )
+
+
 def serialize_policy(root: ET.Element) -> str:
     fragments = re.split(
         r"(<!--.*?-->|<[^>]*>)", ET.tostring(root, encoding="unicode"), flags=re.DOTALL
@@ -950,19 +994,16 @@ def parent_readback_matches(
 ) -> bool:
     if isinstance(expected_contract, str):
         try:
-            return (
+            if (
                 component_digest(parse_policy(source), normalize_text_defaults=False)
                 == expected_contract
-            )
+            ):
+                return True
         except ET.ParseError:
             return False
-    return (
-        isinstance(expected_raw, str)
-        and hashlib.sha256(
-            ET.canonicalize(source, strip_text=True, with_comments=True).encode()
-        ).hexdigest()
-        == expected_raw
-    )
+    # ARM XML readback normalizes attribute whitespace, including expression lines.
+    # Its recorded canonical identity remains valid even when tokenization differs.
+    return policy_hash_matches(expected_raw, source)
 
 
 def _token_wrapper(node: ET.Element, burst_tokens: int) -> ET.Element:

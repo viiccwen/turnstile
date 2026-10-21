@@ -20,6 +20,7 @@ param applicationInsightsConnectionString string
 param apimResourceGroupName string
 param apimName string
 param apimApiId string = 'turnstile-llm'
+param employeeClientIds string[]
 param apimProductId string = 'finops-ai-consumers'
 param dashboardSubscriptionId string = 'turnstile-dashboard'
 param probeSubscriptionId string = 'turnstile-publisher-probe'
@@ -128,6 +129,7 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
         { name: 'APIM_RESOURCE_GROUP', value: apimResourceGroupName }
         { name: 'APIM_SERVICE_NAME', value: apimName }
         { name: 'APIM_API_ID', value: apimApiId }
+        { name: 'APIM_EMPLOYEE_CLIENT_IDS', value: string(employeeClientIds) }
         { name: 'APIM_PRODUCT_ID', value: apimProductId }
         { name: 'APIM_CHAT_COMPLETIONS_OPERATION_ID', value: chatCompletionsOperationId }
         { name: 'APIM_RESPONSES_OPERATION_ID', value: responsesOperationId }

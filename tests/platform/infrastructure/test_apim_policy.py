@@ -1,13 +1,17 @@
 from datetime import UTC, datetime
 from xml.etree import ElementTree
 
+import pytest
+
 from tests.support.paths import REPOSITORY_ROOT
 from turnstile_core.config import Settings
 from turnstile_core.domain.image_profiles import create_image_profile
+from turnstile_core.integrations.apim_control_plane import PolicyCompilationError
 from turnstile_core.integrations.apim_policy_components import (
     IMAGE_CONDITION,
     TEXT_CONDITION,
     parse_policy,
+    render_parent_client_ids,
     validate_parent_policy,
 )
 from turnstile_core.integrations.ledger import ledger_stamp
@@ -16,6 +20,46 @@ ROOT = REPOSITORY_ROOT
 POLICY_PATH = ROOT / "infra" / "policies" / "foundry-finops-policy.xml"
 APIM_MODULE_PATH = ROOT / "infra" / "modules" / "apim-integration.bicep"
 MAIN_TEMPLATE_PATH = ROOT / "infra" / "main.bicep"
+
+
+def test_parent_contract_requires_exact_deployed_client_ids() -> None:
+    template = POLICY_PATH.read_text(encoding="utf-8")
+    primary = "be989933-a2eb-42ef-9ae6-72024b01a997"
+    codex = "249631a0-836d-40a9-b32a-92c5240902c6"
+    stranger = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+    for ids in ([primary], [primary, codex]):
+        expected = render_parent_client_ids(template, ids)
+        assert validate_parent_policy(expected, expected) == expected
+        with pytest.raises(PolicyCompilationError, match="Parent authentication validation"):
+            validate_parent_policy(render_parent_client_ids(template, [*ids, stranger]), expected)
+    with pytest.raises(PolicyCompilationError, match="Parent authentication validation"):
+        validate_parent_policy(render_parent_client_ids(template, [primary, stranger]),
+                               render_parent_client_ids(template, [primary, codex]))
+    with pytest.raises(PolicyCompilationError, match="Parent authentication validation"):
+        validate_parent_policy(render_parent_client_ids(template, [primary]),
+                               render_parent_client_ids(template, [primary, codex]))
+
+
+@pytest.mark.parametrize("ids", [
+    [], ["not-an-id"], ["be989933-a2eb-42ef-9ae6-72024b01a997"] * 2,
+    ["BE989933-A2EB-42EF-9AE6-72024B01A997"],
+])
+def test_parent_contract_rejects_missing_invalid_or_duplicate_clients(ids: list[str]) -> None:
+    with pytest.raises(ValueError):
+        render_parent_client_ids(POLICY_PATH.read_text(encoding="utf-8"), ids)
+
+
+@pytest.mark.parametrize("slot", [
+    "<application-id>__EMPLOYEE_CLIENT_ID__</application-id>",
+    "__EMPLOYEE_ADDITIONAL_CLIENT_IDS__",
+])
+@pytest.mark.parametrize("replacement_count", [0, 2])
+def test_parent_client_renderer_rejects_missing_or_ambiguous_slots(
+    slot: str, replacement_count: int,
+) -> None:
+    source = POLICY_PATH.read_text(encoding="utf-8").replace(slot, slot * replacement_count)
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        render_parent_client_ids(source, ["be989933-a2eb-42ef-9ae6-72024b01a997"])
 
 
 def test_public_parent_supports_images_without_using_text_token_policies() -> None:

@@ -46,17 +46,33 @@ from .apim_model_availability import (
 from .apim_policy_components import (
     IMAGE_POLICY_VERSION,
     NATIVE_STREAM_REQUEST,
+    canonical_policy_sha256,
+    policy_hash_matches,
     validate_native_stream_policy,
 )
 from .apim_storage_routes import FixedRouteBinding, FixedRouteProgram, compile_fixed_route_program
 
 
 def policy_sha256(*policies: str) -> str:
-    canonical = (
-        ElementTree.canonicalize(policy, strip_text=True, with_comments=True)
-        for policy in policies
+    return canonical_policy_sha256(*policies)
+
+
+def compiled_policy_sources(compiled: CompiledGatewayRelease) -> tuple[str, ...]:
+    return (
+        compiled.chat_completions_policy,
+        compiled.responses_policy,
+        compiled.responses_compact_policy,
+        compiled.messages_policy,
+        compiled.count_tokens_policy,
+        compiled.models_policy,
+        *((compiled.images_generations_policy,)
+          if compiled.images_generations_policy is not None else ()),
+        *(source for _, source in compiled.availability_probe_policies),
     )
-    return hashlib.sha256("\n".join(canonical).encode("utf-8")).hexdigest()
+
+
+def compiled_policy_matches(compiled: CompiledGatewayRelease, expected: object) -> bool:
+    return policy_hash_matches(expected, *compiled_policy_sources(compiled))
 
 
 def _chat_completions_policy(publication: GatewayPublication) -> str:

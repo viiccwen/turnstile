@@ -116,6 +116,48 @@
     "existingApimProbeSubscriptionKeySecretUri": {
       "value": ""
     },
+    "apimApiId": {
+      "value": "turnstile-llm"
+    },
+    "gatewayApiRelativePath": {
+      "value": "turnstile/llm"
+    },
+    "apimProductId": {
+      "value": "turnstile-ai-consumers"
+    },
+    "apimDashboardSubscriptionId": {
+      "value": "turnstile-dashboard"
+    },
+    "apimProbeSubscriptionId": {
+      "value": "turnstile-publisher-probe"
+    },
+    "apimAppInsightsLoggerId": {
+      "value": "turnstile-appinsights"
+    },
+    "apimEventHubLoggerId": {
+      "value": "turnstile-eventhub"
+    },
+    "apimDiagnosticSettingName": {
+      "value": "turnstile-gateway-logs"
+    },
+    "observerAdapterKeyNamedValueName": {
+      "value": "turnstile-observer-key"
+    },
+    "apimRegressionModelKey": {
+      "value": ""
+    },
+    "employeeTenantId": {
+      "value": ""
+    },
+    "employeeClientId": {
+      "value": ""
+    },
+    "employeeAdditionalClientIds": {
+      "value": []
+    },
+    "employeeAudience": {
+      "value": ""
+    },
     "entraClientId": {
       "value": ""
     },
@@ -150,6 +192,9 @@
       "value": false
     },
     "gatewayApplicationKeyManagementEnabled": {
+      "value": false
+    },
+    "gatewayApplicationProvisioningEnabled": {
       "value": false
     }
   }

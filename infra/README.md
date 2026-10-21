@@ -36,6 +36,8 @@ Do not store those values in a checked-in parameter file.
 
 To reuse an existing APIM service while creating the rest of the environment from scratch, set `existingApimName`, `existingApimResourceGroupName`, `existingApimPrincipalId`, and `existingApimGatewayUrl`. Leave all four empty to provision a new capacity-one `StandardV2` APIM service. Shared APIM resources are isolated by `resourcePrefix`.
 
+For employee delegated tokens, `employeeClientId` is the existing public client app ID. Set `employeeAdditionalClientIds` to additional public client app IDs when multiple tools (for example, Claude and Codex) must share the gateway; do not replace the existing ID. Each app must be granted the model API's `Model.Invoke` delegated scope. Use `employeeClientMap` to attribute usage to each app. When `employeeClientId` or `employeeAudience` is empty, employee-token validation remains disabled.
+
 ## Preview and deploy
 
 ```bash
