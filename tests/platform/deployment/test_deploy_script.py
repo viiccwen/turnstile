@@ -384,14 +384,25 @@ def test_resume_skips_existing_platform_and_gateway_bootstrap(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(
-    ("existing", "complete_installation"),
-    [(False, False), (True, False), ("pending", False), (True, True), ("pending", True)],
+    ("existing", "complete_installation", "failure_stage"),
+    [
+        (existing, complete, failure)
+        for existing, complete in [
+            (False, False), (True, False), ("pending", False), (True, True), ("pending", True),
+            ("platform", False), ("platform", True), ("observer", False), ("observer", True),
+            ("platform-with-observer", False), ("platform-with-observer", True),
+        ]
+        for failure in (None, "readiness")
+    ] + [
+        (False, False, "packages"), (False, False, "observer"),
+        (False, False, "plan"), ("platform", False, "plan"), ("observer", False, "plan"),
+    ],
 )
-@pytest.mark.parametrize("program_ready", [True, False])
 def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool | str,
-    complete_installation: bool, program_ready: bool, capsys: pytest.CaptureFixture[str],
+    complete_installation: bool, failure_stage: str | None, capsys: pytest.CaptureFixture[str],
 ) -> None:
+    program_ready = failure_stage != "readiness"
     outputs: dict[str, object] = {
         "resourceGroupName": "turnstile-test",
         "apiName": "api-test",
@@ -402,11 +413,19 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
         "apimPrincipalId": "00000000-0000-0000-0000-000000000002",
         "acrName": "retained-registry",
     }
+    deployed_outputs = dict(outputs)
     if existing == "pending":
         outputs["pendingFixedBootstrap"] = {}
+    elif existing in {"platform", "observer", "platform-with-observer"}:
+        outputs["pendingInstallation"] = "observer" if existing == "observer" else "platform"
+        if existing == "platform":
+            outputs.pop("webAppUrl")
+            outputs.pop("acrName")
     arguments = build_parser().parse_args([
-        "deploy", "--subscription", "00000000-0000-0000-0000-000000000001",
-        "--parameters", str(_parameters(tmp_path / "parameters.json")), "--yes",
+        "plan" if failure_stage == "plan" else "deploy",
+        "--subscription", "00000000-0000-0000-0000-000000000001",
+        "--parameters", str(_parameters(tmp_path / "parameters.json")),
+        "--state", str(tmp_path / "state.json"), "--yes",
         *(["--complete-installation"] if complete_installation else []),
     ])
     for name in (
@@ -430,24 +449,41 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     ):
         monkeypatch.setattr(f"scripts.deploy.{name}", Mock(return_value={}))
     monkeypatch.setattr("scripts.deploy.deployment_outputs", Mock(return_value={
-        **{key: value for key, value in outputs.items()
-           if not complete_installation or key != "acrName"},
+        **{key: value for key, value in deployed_outputs.items()
+              if not complete_installation or existing is not True or key != "acrName"},
         **({"controlPlanePrincipalId": "00000000-0000-4000-8000-000000000011"}
-           if complete_installation else {}),
+              if complete_installation and existing is True else {}),
     }))
     for name in ("source_version", "observer_source_version", "frontend_asset"):
         monkeypatch.setattr(f"scripts.deploy.{name}", Mock(return_value="offline-candidate"))
     events: list[str] = []
+
+    def record_event(*args: object, event: str) -> None:
+        events.append(event)
+        if (failure_stage == "packages" and event == "deploy_packages") or (
+            failure_stage == "observer" and event == "build_and_start_observer"
+        ):
+            raise DeploymentError("Checkpoint interruption")
+
     for name in (
         "deploy_packages", "build_and_start_observer",
-        "deploy_resource_group_template", "_write_outputs",
+        "deploy_resource_group_template",
     ):
         monkeypatch.setattr(
             f"scripts.deploy.{name}",
-            Mock(side_effect=lambda *args, event=name, **kwargs: events.append(event)),
+            Mock(side_effect=lambda *args, event=name, **kwargs: record_event(*args, event=event)),
             raising=False,
         )
 
+    checkpoints: list[dict[str, object]] = []
+    write_outputs = execute.__globals__["_write_outputs"]
+
+    def save_checkpoint(inputs: DeploymentInputs, values: dict[str, object]) -> None:
+        events.append("_write_outputs")
+        checkpoints.append(dict(values))
+        write_outputs(inputs, values)
+
+    monkeypatch.setattr("scripts.deploy._write_outputs", Mock(side_effect=save_checkpoint))
     descriptor = {
         "registration": {"gateway_profile_id": "unit-target"},
         "binding": {"program_sha256": "a" * 64},
@@ -475,17 +511,46 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     monkeypatch.setattr("scripts.deploy.wait_for_health", readiness)
     monkeypatch.setattr("scripts.deploy.verify_frontend_asset", isolated_frontend_read)
     initializes_program = existing is not True or complete_installation
-    if initializes_program and not program_ready:
-        with pytest.raises(DeploymentError, match="not ready for model publication"):
+    if failure_stage in {"packages", "observer"} or (initializes_program and not program_ready):
+        with pytest.raises(DeploymentError):
             execute(arguments, CommandRunner())
     else:
         execute(arguments, CommandRunner())
+
+    if failure_stage == "plan":
+        assert events == []
+        assert checkpoints == []
+        assert not (tmp_path / "state.outputs.json").exists()
+        return
+    if checkpoints:
+        outputs_path = tmp_path / "state.outputs.json"
+        assert json.loads(outputs_path.read_text()) == checkpoints[-1]
+        assert stat.S_IMODE(outputs_path.stat().st_mode) == 0o600
+    if failure_stage in {"packages", "observer"}:
+        expected = ["_write_outputs", "deploy_packages"]
+        if failure_stage == "observer":
+            expected.extend(("_write_outputs", "build_and_start_observer"))
+        assert events == expected
+        assert checkpoints[-1]["pendingInstallation"] == (
+            "platform" if failure_stage == "packages" else "observer"
+        )
+        readiness.assert_not_called()
+        program_readiness.assert_not_called()
+        assert "Turnstile deployment completed." not in capsys.readouterr().out
+        return
 
     readiness.assert_called_once_with(
         "https://api-test.example.test", timeout_seconds=1800, expected_asset="offline-candidate",
     )
     isolated_frontend_read.assert_not_called()
-    expected = ["deploy_packages", "build_and_start_observer"]
+    expected = []
+    platform_deployed = not existing or (complete_installation and existing is True)
+    if platform_deployed:
+        expected.append("_write_outputs")
+    expected.append("deploy_packages")
+    if initializes_program:
+        expected.append("_write_outputs")
+    expected.append("build_and_start_observer")
     if initializes_program:
         expected.append("initialize_fixed_program")
     expected.append("deploy_resource_group_template")
@@ -505,12 +570,43 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     assert ("Turnstile deployment completed." in capsys.readouterr().out) == (
         not initializes_program or program_ready
     )
+    if initializes_program:
+        phases = [values["pendingInstallation"] for values in checkpoints
+                  if "pendingInstallation" in values]
+        assert phases == (["platform", "observer"] if platform_deployed else ["observer"])
+        assert checkpoints[-1].get("pendingInstallation") == (
+            None if program_ready else "observer"
+        )
     if complete_installation and program_ready:
         observer = execute.__globals__["observer_parameters"].call_args.kwargs["existing_observer"]
-        assert observer["acrName"] == "retained-registry"
-        assert execute.__globals__["_write_outputs"].call_args.args[1] == {
-            key: value for key, value in outputs.items() if key != "pendingFixedBootstrap"
-        }
+        if existing == "platform":
+            assert observer is None
+        else:
+            assert observer["acrName"] == "retained-registry"
+        assert execute.__globals__["_write_outputs"].call_args.args[1] == deployed_outputs
+
+
+def test_invalid_installation_checkpoint_is_rejected_before_cloud_actions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = build_parser().parse_args([
+        "deploy", "--subscription", "unit",
+        "--parameters", str(_parameters(tmp_path / "parameters.json")),
+        "--state", str(tmp_path / "state.json"),
+    ])
+    outputs_path = tmp_path / "state.outputs.json"
+    original = json.dumps({"pendingInstallation": "unknown-stage"})
+    outputs_path.write_text(original)
+    monkeypatch.setattr("scripts.deploy.require_prerequisites", Mock())
+    monkeypatch.setattr("scripts.deploy.validate_source_snapshot", Mock())
+    runner = Mock(spec=CommandRunner)
+
+    with pytest.raises(DeploymentError, match="invalid installation stage"):
+        execute(arguments, runner)
+
+    runner.run.assert_not_called()
+    runner.run_json.assert_not_called()
+    assert outputs_path.read_text() == original
 
 
 def test_saved_outputs_enable_existing_core_on_rerun(tmp_path: Path) -> None:

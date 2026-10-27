@@ -1128,7 +1128,7 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
             operation_id=operation,
         )
         expected = component_digest(parse_policy(encoded), normalize_text_defaults=False)
-        observed = self._request("GET", path + "?format=xml", allow_not_found=True)
+        observed = self._request("GET", path + "?format=rawxml", allow_not_found=True)
         if create_only and observed.status_code != 404:
             raise PolicyCompilationError("New Operation policy already exists or cannot be verified")
         if observed.status_code == 404:
@@ -1147,7 +1147,7 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
             json_body={"properties": {"format": "xml", "value": encoded}},
             extra_headers=headers,
         )
-        readback = self._request("GET", path + "?format=xml")
+        readback = self._request("GET", path + "?format=rawxml")
         if readback.status_code != 200:
             raise PolicyCompilationError("APIM policy readback is unavailable")
         actual = self._policy_response_value(readback)
@@ -2927,7 +2927,7 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
             ):
                 raise PolicyCompilationError("Fixed program operation inventory changed")
             response = self._request(
-                "GET", path + "/" + quote(name, safe="") + "/policies/policy?format=xml",
+                "GET", path + "/" + quote(name, safe="") + "/policies/policy?format=rawxml",
                 allow_not_found=True,
             )
             if response.status_code == 404:
@@ -3860,10 +3860,14 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
         except (ValueError, ElementTree.ParseError):
             raise PolicyCompilationError("APIM parent audit XML is invalid") from None
         before_request()
+        policy = self._policy_response_value(self._request("GET", path + "?format=rawxml"))
+        if len(policy.encode()) > 1048576:
+            raise PolicyCompilationError("APIM parent audit XML exceeds its size limit")
+        before_request()
         after = self._request("HEAD", path)
         if after.headers.get("ETag") != etag:
             raise PolicyCompilationError("APIM parent audit version changed")
-        return str(properties["value"])
+        return policy
 
     def _policy_value(
         self, path: str, *, record_probe_request: bool = False,
@@ -3875,7 +3879,7 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
                 and location.path.endswith("/policies/policy")
                 and "/operations/" not in location.path):
             return self._audit_parent_policy(location.path, before_request)
-        representations = ("xml",) if api_audit else ("rawxml", "xml")
+        representations = ("rawxml",) if api_audit else ("rawxml", "xml")
         for representation in representations:
             query = {**dict(parse_qsl(location.query)), "format": representation}
             address = location._replace(query=urlencode(query)).geturl()
@@ -3886,7 +3890,7 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
             try:
                 response = self._request("GET", address, allow_not_found=True)
             except httpx.ReadTimeout:
-                if representation == "rawxml" and before_request is not None:
+                if representation == "rawxml" and before_request is not None and not api_audit:
                     continue
                 raise
             if response.status_code == 404:

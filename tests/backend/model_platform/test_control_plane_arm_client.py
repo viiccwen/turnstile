@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from html import escape
 from typing import Any, cast
 from unittest.mock import Mock
 from uuid import UUID
@@ -108,6 +109,7 @@ def test_fixed_route_operation_reader_is_bounded_readonly_and_identity_bound(
             })
         if defect == "missing-policy":
             return httpx.Response(404)
+        assert request.url.params["format"] == "rawxml"
         return httpx.Response(200, json={"properties": {"value": policy}})
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as transport:
@@ -1750,7 +1752,10 @@ def test_arm_client_clones_revision_from_current_api() -> None:
 def test_arm_client_reads_current_policy_wire_formats(
     content_type: str, body: str, expected: str
 ) -> None:
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         if request.url.path.endswith("/apis/turnstile-llm"):
             return httpx.Response(200, json={"properties": {"apiRevision": "1"}})
         if request.method == "HEAD":
@@ -1765,7 +1770,7 @@ def test_arm_client_reads_current_policy_wire_formats(
         assert request.url.path.endswith(
             "/apis/turnstile-llm;rev=1/policies/policy"
         )
-        assert request.url.params["format"] == "xml"
+        assert request.url.params["format"] == "rawxml"
         return httpx.Response(
             200,
             text=body,
@@ -1782,6 +1787,134 @@ def test_arm_client_reads_current_policy_wire_formats(
         200, text=body, headers={"Content-Type": content_type},
     )) == expected
     assert client.current_api_policy() == ("1", expected)
+    assert [request.url.params.get("format") for request in requests] == [
+        None, None, "xml", "rawxml", None,
+    ]
+
+
+@pytest.mark.parametrize("content_type", [
+    "application/json", "application/vnd.ms-azure-apim.policy.raw+xml; charset=utf-8",
+])
+@pytest.mark.parametrize("defect", [None, "parent", "operation", "etag", "inventory"])
+def test_runtime_fixed_program_verification_reads_raw_policy_with_unchanged_guards(
+    monkeypatch: pytest.MonkeyPatch, content_type: str, defect: str | None,
+) -> None:
+    from tests.backend.model_platform.test_apim_onboarding import (
+        onboarding_configuration,
+        onboarding_plan,
+    )
+    from tests.support.paths import REPOSITORY_ROOT
+    from turnstile_core.domain.gateway_targets import CapabilitySupport
+    from turnstile_core.integrations.apim_onboarding_policy import render_onboarding_fixed_program
+    from turnstile_core.integrations.apim_policy_components import parse_policy, serialize_policy
+    from turnstile_core.integrations.apim_storage_routes import FixedProgramVerifier
+
+    settings = publisher_settings()
+    request = onboarding_plan().request.model_copy(update={
+        "api_id": settings.apim_api_id, "gateway_profile_id": settings.apim_gateway_profile_id,
+    })
+    configuration = onboarding_configuration()
+    program = render_onboarding_fixed_program(
+        request, configuration,
+        (REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml").read_text(),
+        self_hosted_gateway=CapabilitySupport.SUPPORTED,
+    )
+    installation = program.installation(
+        document_digest(configuration), "https://gateway.example.test/turnstile/llm",
+    )
+    policies = dict(program.operation_policies)
+    requests: list[httpx.Request] = []
+    head_reads = 0
+
+    def escaped_conditions(value: str) -> str:
+        root = parse_policy(value)
+        for node in root.iter():
+            if "condition" in node.attrib:
+                node.set("condition", escape(node.attrib["condition"], quote=True))
+        return serialize_policy(root)
+
+    def policy_response(value: str) -> httpx.Response:
+        if content_type == "application/json":
+            return httpx.Response(200, json={"properties": {"format": "rawxml", "value": value}})
+        return httpx.Response(200, text=value, headers={"Content-Type": content_type})
+
+    def handler(arm_request: httpx.Request) -> httpx.Response:
+        nonlocal head_reads
+        requests.append(arm_request)
+        assert arm_request.url.host == "management.azure.com"
+        assert arm_request.method in {"GET", "HEAD"}
+        assert arm_request.headers["Authorization"].startswith("Bearer ")
+        path = arm_request.url.path
+        if arm_request.method == "HEAD":
+            head_reads += 1
+            etag = '"changed"' if defect == "etag" and head_reads == 2 else '"original"'
+            return httpx.Response(200, headers={"ETag": etag})
+        if path.endswith("/apis/" + settings.apim_api_id):
+            return httpx.Response(200, json={"properties": {"apiRevision": "1"}})
+        assert ";rev=1/" in path
+        if path.endswith("/policies"):
+            assert arm_request.url.params["format"] == "xml"
+            return httpx.Response(200, json={"value": [{
+                "id": path + ("/other" if defect == "inventory" else "/policy"),
+                "name": "policy", "properties": {
+                    "format": "xml", "value": escaped_conditions(program.parent_policy),
+                },
+            }]})
+        if path.endswith("/operations"):
+            return httpx.Response(200, json={"value": [{
+                "id": path + "/" + name, "name": name,
+                "properties": {"method": method, "urlTemplate": route},
+            } for name, method, route in program.operation_contracts]})
+        if path.endswith("/policies/policy"):
+            assert arm_request.url.params["format"] == "rawxml"
+            if "/operations/" in path:
+                name = path.split("/operations/", 1)[1].split("/", 1)[0]
+                policy = policies[name]
+                if defect == "operation" and name == "chat-completions":
+                    policy = escaped_conditions(policy)
+            else:
+                policy = program.parent_policy
+                if defect == "parent":
+                    policy = escaped_conditions(policy)
+            return policy_response(policy)
+        raise AssertionError(path)
+
+    probe = Mock()
+    monkeypatch.setattr(FixedProgramVerifier, "_probe", probe)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as transport:
+        management = AzureApimPublisherClient(settings, StubTokenProvider(), transport)
+        verifier = FixedProgramVerifier(
+            installation, management, SecretStr("offline-probe-key"), transport, clock=lambda: 100,
+        )
+        if defect is not None:
+            messages = {
+                "parent": "Fixed route program parent changed",
+                "operation": "Fixed route program operation changed",
+                "etag": "APIM parent audit version changed",
+                "inventory": "APIM parent audit identity is invalid",
+            }
+            with pytest.raises(PolicyCompilationError, match=messages[defect]):
+                verifier.verify()
+            probe.assert_not_called()
+        else:
+            assert verifier.verify().identity == installation.program
+            probe.assert_called_once()
+            before_request = Mock()
+            policy_path = f"/apis/{settings.apim_api_id};rev=1/policies/policy"
+            assert management._policy_value(
+                policy_path, before_request=before_request,
+            ) == program.parent_policy
+            assert before_request.call_count == 4
+            with monkeypatch.context() as interrupted:
+                interrupted.setattr(management, "_request", Mock(side_effect=httpx.ReadTimeout(
+                    "Offline policy read timeout",
+                )))
+                with pytest.raises(httpx.ReadTimeout):
+                    management._policy_value(
+                        f"/apis/{settings.apim_api_id};rev=1/operations/chat-completions/policies/policy",
+                        before_request=before_request,
+                    )
+
 
 @pytest.mark.parametrize("observed", [
     None, {"secret": False}, {"secret": True, "provisioningState": "Creating"},

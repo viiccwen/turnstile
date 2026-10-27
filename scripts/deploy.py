@@ -1944,7 +1944,12 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     complete_installation = args.complete_installation
     if complete_installation and saved_outputs is None:
         raise DeploymentError("Completing an installation requires original deployment outputs")
-    pending_installation = saved_outputs is not None and "pendingFixedBootstrap" in saved_outputs
+    pending_stage = (saved_outputs or {}).get("pendingInstallation")
+    if pending_stage not in (None, "platform", "observer"):
+        raise DeploymentError("Saved deployment outputs have an invalid installation stage")
+    pending_installation = saved_outputs is not None and (
+        pending_stage is not None or "pendingFixedBootstrap" in saved_outputs
+    )
     if saved_outputs is not None and (
         _output_string(saved_outputs, "resourceGroupName").casefold()
         != inputs.resource_group_name.casefold()
@@ -2010,30 +2015,42 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         if complete_installation:
             assert saved_outputs is not None
             platform_outputs = {**saved_outputs, **platform_outputs}
+        platform_outputs = {**platform_outputs, "pendingInstallation": "platform"}
+        _write_outputs(inputs, platform_outputs)
     else:
         platform_outputs = saved_outputs
-        api_settings = current_app_settings(
-            runner, inputs, _output_string(platform_outputs, "apiName")
-        )
-        control_plane_settings = current_app_settings(
-            runner,
-            inputs,
-            _output_string(platform_outputs, "controlPlaneFunctionName"),
-        )
-        release_parameters = runtime_release_parameters(
-            secrets_,
-            platform_outputs,
-            platform_outputs,
-            api_settings,
-            control_plane_settings,
-        )
-        what_if_resource_group(
-            runner,
-            inputs,
-            release_template,
-            release_parameters,
-            f"{inputs.resource_prefix}-runtime-release",
-        )
+        if pending_stage == "platform":
+            observer_document = observer_parameters(
+                inputs, platform_outputs, secrets_, observer_source_version(runner),
+                existing_observer=platform_outputs if "acrName" in platform_outputs else None,
+            )
+            what_if(
+                runner, inputs, REPOSITORY_ROOT / "infra/envoy-cache-adapter/main.bicep",
+                observer_document, f"{inputs.resource_prefix}-observer",
+            )
+        else:
+            api_settings = current_app_settings(
+                runner, inputs, _output_string(platform_outputs, "apiName")
+            )
+            control_plane_settings = current_app_settings(
+                runner,
+                inputs,
+                _output_string(platform_outputs, "controlPlaneFunctionName"),
+            )
+            release_parameters = runtime_release_parameters(
+                secrets_,
+                platform_outputs,
+                platform_outputs,
+                api_settings,
+                control_plane_settings,
+            )
+            what_if_resource_group(
+                runner,
+                inputs,
+                release_template,
+                release_parameters,
+                f"{inputs.resource_prefix}-runtime-release",
+            )
         if args.action == "plan":
             return
         _confirm_deployment(args.yes)
@@ -2048,7 +2065,11 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         platform_outputs,
         secrets_,
         observer_version,
-        existing_observer=platform_outputs if saved_outputs is not None else None,
+        existing_observer=(
+            platform_outputs if saved_outputs is not None and (
+                pending_stage != "platform" or "acrName" in platform_outputs
+            ) else None
+        ),
     )
     observer_template = REPOSITORY_ROOT / "infra" / "envoy-cache-adapter" / "main.bicep"
     what_if(
@@ -2066,6 +2087,11 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         f"{inputs.resource_prefix}-observer",
     )
     observer_outputs = deployment_outputs(observer_result)
+    if saved_outputs is None or pending_installation or complete_installation:
+        platform_outputs = {
+            **platform_outputs, **observer_outputs, "pendingInstallation": "observer",
+        }
+        _write_outputs(inputs, platform_outputs)
     build_and_start_observer(runner, inputs, observer_outputs, observer_version)
     wait_for_observer_health(_output_string(observer_outputs, "webAppUrl"))
 
@@ -2124,17 +2150,22 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         )
     completed_outputs = {
         key: value for key, value in {**final_outputs, **observer_outputs}.items()
-        if key not in {"pendingFixedBootstrap", "pendingFixedProgramParameters"}
+        if key not in {
+            "pendingInstallation", "pendingFixedBootstrap", "pendingFixedProgramParameters",
+        }
     }
     if complete_installation:
         assert saved_outputs is not None
         original_outputs = {
             key: value for key, value in saved_outputs.items()
-            if key not in {"pendingFixedBootstrap", "pendingFixedProgramParameters"}
+            if key not in {
+                "pendingInstallation", "pendingFixedBootstrap", "pendingFixedProgramParameters",
+            }
         }
         if any(completed_outputs.get(key) != value for key, value in original_outputs.items()):
             raise DeploymentError("Completing installation changed an existing output binding")
-        completed_outputs = original_outputs
+        if pending_stage is None:
+            completed_outputs = original_outputs
     _write_outputs(inputs, completed_outputs)
     print("Turnstile deployment completed.")
     print(f"Open: {api_url}")
