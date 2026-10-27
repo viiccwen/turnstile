@@ -4,6 +4,7 @@ import json
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
+from html import escape, unescape
 from pathlib import Path
 from typing import Any
 
@@ -348,7 +349,15 @@ def test_what_if_rejects_other_resources_and_unresolved_writes(kind: str) -> Non
     }]}, plan, "prepare", plan.revision)
 
 
-def test_arm_reader_pins_revision_checks_maintenance_and_refuses_external_pagination() -> None:
+@pytest.mark.parametrize("policy_content_type", [
+    "application/json",
+    "application/vnd.ms-azure-apim.policy.raw+xml; charset=utf-8",
+    "application/xml",
+    "text/xml",
+])
+def test_arm_reader_pins_revision_checks_maintenance_and_refuses_external_pagination(
+    policy_content_type: str,
+) -> None:
     source = snapshot()
     application_ids = (
         "/subscriptions/unit/resourceGroups/customer/providers/Microsoft.Web/sites/api",
@@ -356,6 +365,12 @@ def test_arm_reader_pins_revision_checks_maintenance_and_refuses_external_pagina
     )
     current_path = API_ID + ";rev=" + source.revision
     requests = []
+
+    def policy_response(value: str | None) -> httpx.Response:
+        assert value is not None
+        if policy_content_type == "application/json":
+            return httpx.Response(200, json={"properties": {"format": "rawxml", "value": value}})
+        return httpx.Response(200, text=value, headers={"Content-Type": policy_content_type})
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -368,8 +383,8 @@ def test_arm_reader_pins_revision_checks_maintenance_and_refuses_external_pagina
                 "isOnline": True, "sourceApiId": API_ID + ";rev=old",
             }})
         if path == current_path + "/policies/policy":
-            assert request.url.params["format"] == "xml"
-            return httpx.Response(200, json={"properties": {"value": source.parent_policy}})
+            assert request.url.params["format"] == "rawxml"
+            return policy_response(source.parent_policy)
         if path == current_path + "/operations":
             return httpx.Response(200, json={"value": [{"name": "chat-completions"}]})
         if path == current_path + "/operations/chat-completions":
@@ -378,10 +393,8 @@ def test_arm_reader_pins_revision_checks_maintenance_and_refuses_external_pagina
                 "policies": source.operation_policies["chat-completions"],
             }})
         if path == current_path + "/operations/chat-completions/policies/policy":
-            assert request.url.params["format"] == "xml"
-            return httpx.Response(200, json={"properties": {
-                "value": source.operation_policies["chat-completions"],
-            }})
+            assert request.url.params["format"] == "rawxml"
+            return policy_response(source.operation_policies["chat-completions"])
         raise AssertionError(path)
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
@@ -396,6 +409,119 @@ def test_arm_reader_pins_revision_checks_maintenance_and_refuses_external_pagina
             with pytest.raises(ApimUpgradeError, match="exact upgrade target"):
                 backend._get(API_ID + suffix)
     assert all(request.method == "GET" for request in requests)
+
+
+@pytest.mark.parametrize("policy_content_type", [
+    "application/json",
+    "application/vnd.ms-azure-apim.policy.raw+xml; charset=utf-8",
+])
+def test_arm_policy_snapshot_compiles_fixed_program_without_unescaping_guards(
+    policy_content_type: str,
+) -> None:
+    from tests.backend.model_platform.test_apim_onboarding import (
+        onboarding_configuration,
+        onboarding_plan,
+    )
+    from turnstile_core.domain.gateway_targets import CapabilitySupport
+    from turnstile_core.integrations.apim_control_plane_contract import PolicyCompilationError
+    from turnstile_core.integrations.apim_model_availability import compose_availability_parent
+    from turnstile_core.integrations.apim_onboarding_policy import (
+        _render_onboarding_parent,
+        onboarding_canonical_parent,
+        render_onboarding_fixed_program,
+    )
+    from turnstile_core.integrations.apim_storage_routes import compile_fixed_route_program
+
+    request, configuration = onboarding_plan().request, onboarding_configuration()
+    canonical = compose_availability_parent(
+        onboarding_canonical_parent(CANONICAL_PARENT, request.api_id),
+    )
+    binding = render_onboarding_fixed_program(
+        request, configuration, CANONICAL_PARENT,
+        self_hosted_gateway=CapabilitySupport.SUPPORTED,
+    ).binding
+    source = replace(
+        snapshot(), revision=binding.api_revision,
+        parent_policy=_render_onboarding_parent(request, configuration, canonical),
+    )
+    escaped_root = parse_policy(source.parent_policy)
+    guards = [node for node in escaped_root.iter("when")
+              if "selectedModelKnown" in node.get("condition", "")]
+    assert len(guards) == 2
+    for node in guards:
+        condition = node.attrib["condition"]
+        node.set("condition", escape(condition, quote=True))
+        assert unescape(node.attrib["condition"]) == condition
+    escaped_parent = serialize_policy(escaped_root)
+    with pytest.raises(
+        PolicyCompilationError, match="Parent unknown-model rejection is incomplete",
+    ):
+        compile_fixed_route_program(escaped_parent, binding, canonical_parent=canonical)
+
+    api_resource_id = (
+        f"/subscriptions/{request.subscription_id}/resourceGroups/{request.resource_group}/providers/"
+        f"Microsoft.ApiManagement/service/{request.service_name}/apis/{request.api_id}"
+    )
+    current_path = api_resource_id + ";rev=" + source.revision
+    application_root = (
+        f"/subscriptions/{request.subscription_id}/resourceGroups/{request.resource_group}"
+        "/providers/Microsoft.Web/sites"
+    )
+    served_parent = source.parent_policy
+
+    def policy_response(value: str | None) -> httpx.Response:
+        assert value is not None
+        if policy_content_type == "application/json":
+            return httpx.Response(200, json={"properties": {"value": value}})
+        return httpx.Response(200, text=value, headers={"Content-Type": policy_content_type})
+
+    def handler(arm_request: httpx.Request) -> httpx.Response:
+        assert arm_request.method == "GET"
+        assert arm_request.headers["Authorization"] == "Bearer unit-test-reader"
+        assert arm_request.url.params["api-version"] == "2024-05-01"
+        path = arm_request.url.path
+        if path in {api_resource_id, current_path}:
+            return httpx.Response(200, json={"properties": {
+                **source.api_properties, "apiRevision": source.revision, "isCurrent": True,
+            }})
+        if path == current_path + "/policies/policy":
+            parent = (
+                served_parent if arm_request.url.params["format"] == "rawxml" else escaped_parent
+            )
+            return policy_response(parent)
+        if path == current_path + "/operations":
+            return httpx.Response(200, json={"value": [{"name": "chat-completions"}]})
+        if path == current_path + "/operations/chat-completions":
+            return httpx.Response(200, json={"properties": source.operations["chat-completions"]})
+        if path == current_path + "/operations/chat-completions/policies/policy":
+            assert arm_request.url.params["format"] == "rawxml"
+            return policy_response(source.operation_policies["chat-completions"])
+        raise AssertionError(path)
+
+    with httpx.Client(
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer unit-test-reader"},
+    ) as client:
+        backend = AzureUpgradeBackend(
+            client, api_resource_id, (application_root + "/api", application_root + "/control"),
+            lambda *_: None,
+        )
+        observed = backend.read()
+        assert observed == source
+        program = compile_fixed_route_program(
+            observed.parent_policy, binding, canonical_parent=canonical,
+        )
+        assert program.binding.scope == binding.scope
+        assert program.binding.api_revision == source.revision
+        assert program.binding.model_additions_enabled
+
+        served_parent = escaped_parent
+        invalid = backend.read(source.revision)
+        assert invalid is not None
+        with pytest.raises(
+            PolicyCompilationError, match="Parent unknown-model rejection is incomplete",
+        ):
+            compile_fixed_route_program(invalid.parent_policy, binding, canonical_parent=canonical)
 
 
 def test_full_upgrade_commands_plan_apply_repeat_and_rollback(

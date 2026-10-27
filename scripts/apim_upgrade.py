@@ -277,7 +277,7 @@ class AzureUpgradeBackend:
         if path in self.application_ids:
             parameters["api-version"] = "2024-11-01"
         if policy:
-            parameters["format"] = "xml"
+            parameters["format"] = "rawxml"
         response = self.client.get(
             httpx.URL(url).copy_merge_params(parameters), follow_redirects=False
         )
@@ -285,7 +285,13 @@ class AzureUpgradeBackend:
             return None
         if response.status_code != 200:
             raise ApimUpgradeError(f"ARM upgrade read returned HTTP {response.status_code}")
-        value = response.json()
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if policy and (
+            content_type in {"application/xml", "text/xml"} or content_type.endswith("+xml")
+        ):
+            value = {"properties": {"value": response.text}}
+        else:
+            value = response.json()
         if not isinstance(value, dict):
             raise ApimUpgradeError("ARM upgrade read returned an invalid object")
         return value
