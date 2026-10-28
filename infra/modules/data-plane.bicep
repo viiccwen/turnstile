@@ -20,6 +20,8 @@ param postgresAdministratorLogin string
 param postgresAdministratorPassword string
 param postgresSkuName string
 param postgresTier string
+@allowed(['1', '2', '3'])
+param postgresAvailabilityZone string = '1'
 param provisionPostgres bool = true
 param postgresAdopted bool = false
 param existingPostgresServerResourceId string = ''
@@ -95,7 +97,8 @@ param bootstrapOwnerEmail string
 @secure()
 param bootstrapOwnerPasswordHash string
 
-var credentialVaultName = 'kv-${resourcePrefix}-rt-${take(suffix, 6)}'
+// Keep the vault within 24 characters without renaming valid existing prefixes.
+var credentialVaultName = 'kv-${take(resourcePrefix, 11)}-rt-${take(suffix, 6)}'
 var managedPostgresServerName = 'pg-${resourcePrefix}-${suffix}'
 var managedDatabaseName = 'turnstile'
 var managedEventHubNamespaceName = 'eh-${resourcePrefix}-${suffix}'
@@ -241,7 +244,7 @@ resource managedPostgres 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' 
     version: '16'
     administratorLogin: postgresAdministratorLogin
     administratorLoginPassword: postgresAdministratorPassword
-    availabilityZone: '1'
+    availabilityZone: postgresAvailabilityZone
     storage: {
       storageSizeGB: 32
       autoGrow: 'Enabled'

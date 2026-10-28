@@ -134,6 +134,35 @@ def test_apim_outbound_subnet_preserves_adopted_network_and_storage_ownership() 
     assert "provisionApimService && provisionNetwork" in MAIN
 
 
+def test_credential_vault_name_fits_the_maximum_resource_prefix() -> None:
+    assert (
+        "var credentialVaultName = 'kv-${take(resourcePrefix, 11)}-rt-${take(suffix, 6)}'"
+        in DATA_PLANE
+    )
+    suffix = "fv2a6jyqwtz52"
+    for prefix in ("abc", "turnstile", "vicadopted", "a" * 11, "victurnstile", "a" * 12):
+        name = f"kv-{prefix[:11]}-rt-{suffix[:6]}"
+        assert 3 <= len(name) <= 24
+        assert re.fullmatch(r"[a-z][a-z0-9-]*[a-z0-9]", name)
+        if len(prefix) <= 11:
+            assert name == f"kv-{prefix}-rt-{suffix[:6]}"
+
+
+def test_postgres_availability_zone_is_configurable_with_the_existing_default() -> None:
+    for template in (MAIN, DATA_PLANE):
+        assert "param postgresAvailabilityZone string = '1'" in template
+    assert "postgresAvailabilityZone: postgresAvailabilityZone" in MAIN
+    assert "availabilityZone: postgresAvailabilityZone" in DATA_PLANE
+    assert "availabilityZone: '1'" not in DATA_PLANE
+
+
+def test_observer_compute_region_does_not_move_the_registry() -> None:
+    assert "param registryLocation string = location" in OBSERVER_MAIN
+    registry = OBSERVER_MAIN.split("module registry ", 1)[1].split("module app ", 1)[0]
+    assert "location: registryLocation" in registry
+    assert "output observerLocation string = location" in OBSERVER_MAIN
+
+
 def test_apim_exposes_the_turnstile_gateway_path() -> None:
     assert "param apimApiId string = 'turnstile-llm'" in MAIN
     assert "param gatewayApiRelativePath string = 'turnstile/llm'" in MAIN

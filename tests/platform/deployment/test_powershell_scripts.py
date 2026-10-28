@@ -410,6 +410,58 @@ try {{
     assert result["rejected"] is True
 
 
+@pytest.mark.parametrize("provisioned,subscription,group,resource_type", [
+    (False, "sub", "platform", "privateEndpoints"),
+    (True, "sub", "platform", "privateEndpoints"),
+    ("false", "sub", "platform", "privateEndpoints"),
+    ([True], "sub", "platform", "privateEndpoints"),
+    (None, "sub", "platform", "privateEndpoints"),
+    (True, "other", "platform", "privateEndpoints"),
+    (True, "sub", "other", "privateEndpoints"),
+    (True, "sub", "platform", "networkSecurityGroups"),
+])
+def test_remove_shortened_vault_endpoint_requires_exact_managed_output(
+    provisioned: object, subscription: str, group: str, resource_type: str,
+) -> None:
+    endpoint = (
+        f"/subscriptions/{subscription}/resourceGroups/{group}/providers/"
+        f"Microsoft.Network/{resource_type}/pe-kv-victurnstil-rt-abcdef-vault"
+    )
+    outputs = {"dependencyResources": {"credentialVault": {
+        "provisioned": provisioned, "privateEndpointId": endpoint,
+    }}}
+    block = "$approvedPrivateEndpointIds = @(" + REMOVE.split(
+        "$approvedPrivateEndpointIds = @(", 1
+    )[1].split("$approvedAppServiceNames = @(", 1)[0]
+    result = _powershell_json(f"""
+$Subscription = 'sub'; $platformResourceGroup = 'platform'
+$outputDocument = {_ps_json(outputs)}
+""" + block + """
+$accepted = @(); $rejected = @()
+foreach ($name in @('pe-kv-victurnstil-rt-abcdef-vault', 'pe-unrelated')) {
+    $action = [pscustomobject]@{
+        Description = 'private endpoint'; Arguments = @(
+            'network', 'private-endpoint', 'delete', '--resource-group', 'platform', '--name', $name
+        )
+    }
+    try {
+        Assert-ManifestAction `
+            $action 'platform' 'victurnstile' 'storage' '/apim' `
+            'shared' 'telemetry' 'control' 'Ledger' @() @() $approvedPrivateEndpointIds
+        $accepted += $name
+    } catch { $rejected += $name }
+}
+@{ accepted = @($accepted); rejected = @($rejected) } | ConvertTo-Json -Compress
+""")
+    name = endpoint.rsplit("/", 1)[-1]
+    approved = (
+        provisioned is True and subscription == "sub" and group == "platform"
+        and resource_type == "privateEndpoints"
+    )
+    assert result["accepted"] == ([name] if approved else [])
+    assert set(result["rejected"]) == ({"pe-unrelated"} if approved else {name, "pe-unrelated"})
+
+
 @pytest.mark.parametrize("present", [False, True])
 def test_remove_product_subscription_lookup_skips_absent_product(present: bool) -> None:
     block = "$productSubscriptionIds = @()" + REMOVE.split(

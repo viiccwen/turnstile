@@ -118,6 +118,7 @@ OBSERVER_PLAN_SKU_NAMES = frozenset({"P0v3", "P1v3", "P2v3", "P3v3"})
 DEFAULT_APIM_DASHBOARD_SUBSCRIPTION_ID = "turnstile-dashboard"
 DEFAULT_APIM_PROBE_SUBSCRIPTION_ID = "turnstile-publisher-probe"
 ORCHESTRATOR_PARAMETERS = {
+    "observerLocation",
     "observerPlanSkuName",
     "observerPlanWorkerCount",
     "foundryCognitiveServicesAccountResourceId",
@@ -1267,6 +1268,11 @@ def validate_postgres_capabilities(
 ) -> None:
     if inputs.existing_postgres is not None:
         return
+    requested_zone = _string_parameter(
+        inputs.parameters, "postgresAvailabilityZone", POSTGRES_AVAILABILITY_ZONE
+    )
+    if requested_zone not in {"1", "2", "3"}:
+        raise DeploymentError("postgresAvailabilityZone must be 1, 2, or 3")
     capabilities = runner.run_json(
         [
             "az",
@@ -1310,14 +1316,14 @@ def validate_postgres_capabilities(
                     continue
                 zones = sku.get("zones")
                 combination_supported = (
-                    isinstance(zones, list) and POSTGRES_AVAILABILITY_ZONE in zones
+                    isinstance(zones, list) and requested_zone in zones
                 )
                 if combination_supported:
                     break
     if not combination_supported:
         raise DeploymentError(
             f"PostgreSQL {inputs.postgres_tier}/{inputs.postgres_sku_name} in zone "
-            f"{POSTGRES_AVAILABILITY_ZONE} is unavailable in {inputs.postgres_location}"
+            f"{requested_zone} is unavailable in {inputs.postgres_location}"
         )
 
 
@@ -2890,10 +2896,18 @@ def observer_parameters(
     )
     if not isinstance(adapter_key_named_value_name, str) or not adapter_key_named_value_name:
         adapter_key_named_value_name = "turnstile-envoy-adapter-key"
+    saved_location = (
+        existing_observer.get("observerLocation") if existing_observer else None
+    )
+    observer_location = _string_parameter(
+        inputs.parameters, "observerLocation",
+        saved_location if isinstance(saved_location, str) and saved_location else inputs.location,
+    )
     return _arm_parameter_document(
         {
             "apimResourceGroupName": apim_resource_group_name,
-            "location": inputs.location,
+            "location": observer_location,
+            "registryLocation": inputs.location,
             "appServicePlanName": observer_plan_name(inputs),
             "appServicePlanSkuName": inputs.observer_plan_sku_name,
             "appServicePlanWorkerCount": inputs.observer_plan_worker_count,
@@ -3136,13 +3150,15 @@ def build_and_start_observer(
         print(f"Observer image already exists: {image_repository_and_tag} ({version})")
         return
     with observer_build_context() as context:
+        # Windows CLI children can retain their cwd after the build exits.
+        # Pass only the allowlisted context without making it the process cwd.
         runner.run(
             [
                 "az", "acr", "build", "--subscription", inputs.subscription,
                 "--registry", acr_name, "--image", image_repository_and_tag,
-                "--file", "Dockerfile", ".",
+                "--file", str(context / "Dockerfile"), str(context),
             ],
-            cwd=context,
+            cwd=REPOSITORY_ROOT,
         )
     web_app_name = _output_string(observer_outputs, "webAppName")
     runner.run(

@@ -6,6 +6,26 @@ Turnstile infrastructure includes PostgreSQL, Event Hubs, an existing shared Sto
 
 The API, telemetry and control-plane Functions, and observer explicitly enable public network access and carry the resource-level `SecurityControl=Ignore` tag so an organization-level network Modify policy does not silently disable them. The exemption is not applied at resource-group scope. Shared Storage retains its administrator-managed network policy; verify runtime and deployment connectivity without weakening its firewall. Key Vault resources designed for private-link access remain isolated.
 
+### PostgreSQL allocation
+
+New managed PostgreSQL servers default to `Standard_B1ms` in availability zone `1`.
+`postgresAvailabilityZone` accepts `1`, `2`, or `3`; the deployment preflight checks the
+requested zone against the region's advertised SKU support. Advertised support does not
+guarantee current capacity. If a new server fails with `RegionalAllocationFailed`, confirm
+that no server was created before choosing another supported zone and resuming with the
+same deployment state. Keep an existing server's zone unchanged; changing this parameter
+does not authorize moving or replacing a database. Adopted PostgreSQL servers are not
+reconfigured by this setting.
+
+### Observer capacity
+
+`observerLocation` defaults to the platform region. Before an Observer app or plan exists,
+an operator can select another supported region when PremiumV3 capacity is unavailable.
+The dedicated Always On plan and its worker count remain unchanged, and the registry stays
+in the platform region. Review cross-region latency, egress costs, and data-location
+requirements before using this override. Keep the chosen region in the private deployment
+parameters; this setting does not move an existing app or plan.
+
 ### Shared Storage bootstrap and scoped permissions
 
 Before ARM deployment, the resumable deployment lifecycle must create or verify only the two

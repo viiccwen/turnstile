@@ -2,6 +2,8 @@ targetScope = 'resourceGroup'
 
 param apimResourceGroupName string = resourceGroup().name
 param location string
+@description('Registry region, kept independent from Observer compute for capacity recovery.')
+param registryLocation string = location
 param appServicePlanName string
 @allowed([
   'P0v3'
@@ -37,7 +39,7 @@ module registry 'br/public:avm/res/container-registry/registry:0.13.0' = if (pro
   scope: resourceGroup(acrResourceGroupName)
   params: {
     name: acrName
-    location: location
+    location: registryLocation
     acrSku: 'Basic'
     acrAdminUserEnabled: false
     azureADAuthenticationAsArmPolicyStatus: 'enabled'
@@ -97,6 +99,7 @@ module publisherObserverKeyAccess '../modules/observer-named-value-rbac.bicep' =
 
 output webAppUrl string = app.outputs.webAppUrl
 output webAppName string = webAppName
+output observerLocation string = location
 output observerAppServicePlanName string = appServicePlanName
 output observerAppServicePlanSkuName string = appServicePlanSkuName
 output observerAppServicePlanWorkerCount int = appServicePlanWorkerCount

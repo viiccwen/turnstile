@@ -156,7 +156,8 @@ function Assert-ManifestAction(
     [string]$ControlContainerName,
     [string]$LedgerTableName,
     [string[]]$ManagedRoleAssignmentIds,
-    [string[]]$ApprovedAppServiceNames
+    [string[]]$ApprovedAppServiceNames,
+    [string[]]$ApprovedPrivateEndpointIds
 ) {
     $arguments = @($Action.Arguments | ForEach-Object { [string]$_ })
     if ($arguments.Count -lt 2) {
@@ -281,9 +282,14 @@ function Assert-ManifestAction(
         $nameIndex = [Array]::IndexOf($arguments, '--name')
         if (
             $groupIndex -lt 0 -or $nameIndex -lt 0 -or
-            $arguments[$groupIndex + 1] -cne $PlatformResourceGroup -or
-            $arguments[$nameIndex + 1] -notlike "*$Prefix*"
+            $arguments[$groupIndex + 1] -cne $PlatformResourceGroup
         ) {
+            throw "Manifest network action targets an unexpected resource: $($Action.Description)"
+        }
+        $networkName = $arguments[$nameIndex + 1]
+        $endpointId = "/subscriptions/$Subscription/resourceGroups/$PlatformResourceGroup/providers/Microsoft.Network/privateEndpoints/$networkName"
+        $exactManagedEndpoint = $signature -eq 'network private-endpoint' -and $endpointId -in $ApprovedPrivateEndpointIds
+        if ($networkName -notlike "*$Prefix*" -and -not $exactManagedEndpoint) {
             throw "Manifest network action targets an unexpected resource: $($Action.Description)"
         }
     }
@@ -403,6 +409,7 @@ function Invoke-RecordedCleanup(
     [string]$FoundryResourceId,
     [string[]]$ManagedRoleAssignmentIds,
     [string[]]$ApprovedAppServiceNames,
+    [string[]]$ApprovedPrivateEndpointIds,
     [bool]$ExecuteActions,
     [bool]$SkipConfirmation,
     [bool]$DeleteLocalSecretState
@@ -456,7 +463,7 @@ function Invoke-RecordedCleanup(
         Assert-ManifestAction `
             $action $PlatformResourceGroup $Prefix $StorageResourceGroup $apimId `
             $StorageAccountName $TelemetryContainerName $ControlContainerName `
-            $LedgerTableName $ManagedRoleAssignmentIds $ApprovedAppServiceNames
+            $LedgerTableName $ManagedRoleAssignmentIds $ApprovedAppServiceNames $ApprovedPrivateEndpointIds
         $recordedActions.Add([pscustomobject]@{
             Description = [string]$action.description
             Arguments = @($action.arguments | ForEach-Object { [string]$_ })
@@ -677,6 +684,23 @@ $managedStorageChildResourceIds = @(
     @(Get-ObjectValue $outputDocument 'managedStorageChildResourceIds' @()) |
         ForEach-Object { [string]$_ } | Where-Object { $_ }
 )
+$approvedPrivateEndpointIds = @(
+    # Vault names may truncate the prefix to satisfy Azure's 24-character limit.
+    # Only exact, explicitly managed dependency outputs can bypass the name check.
+    foreach ($dependency in @('keyVault', 'credentialVault')) {
+        $metadata = Get-ObjectValue $outputDocument 'dependencyResources'
+        $dependencyObject = Get-ObjectValue $metadata $dependency
+        if ($null -eq $dependencyObject) { continue }
+        $ownership = $dependencyObject.PSObject.Properties['provisioned']
+        if ($null -ne $ownership -and $ownership.Value -is [bool] -and $ownership.Value) {
+            $endpointId = [string](Get-DependencyValue $outputDocument $dependency 'privateEndpointId' '')
+            $endpointPrefix = "/subscriptions/$Subscription/resourceGroups/$platformResourceGroup/providers/Microsoft.Network/privateEndpoints/"
+            if ($endpointId -and $endpointId.StartsWith($endpointPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $endpointId
+            }
+        }
+    }
+)
 $approvedAppServiceNames = @(
     @(
         'apiName',
@@ -753,6 +777,7 @@ if (-not $CaptureManifest) {
         -FoundryResourceId $foundryResourceId `
         -ManagedRoleAssignmentIds $managedRoleAssignmentIds `
         -ApprovedAppServiceNames $approvedAppServiceNames `
+        -ApprovedPrivateEndpointIds $approvedPrivateEndpointIds `
         -ExecuteActions ([bool]$Execute) `
         -SkipConfirmation ([bool]$Force) `
         -DeleteLocalSecretState ([bool]$RemoveLocalSecretState)
@@ -1522,7 +1547,7 @@ if ($CaptureManifest) {
         Assert-ManifestAction `
             $action $platformResourceGroup $prefix $storageResourceGroup $apimId `
             $storageAccountName $telemetryContainerName $controlContainerName `
-            $ledgerTableName $managedRoleAssignmentIds $approvedAppServiceNames
+            $ledgerTableName $managedRoleAssignmentIds $approvedAppServiceNames $approvedPrivateEndpointIds
     }
     $productApiLinks = @()
     if ($apimProducts.name -contains $productId) {

@@ -976,6 +976,30 @@ def test_postgres_preflight_accepts_requested_sku_and_zone(
     assert commands[0][commands[0].index("--location") + 1] == "eastus2"
 
 
+@pytest.mark.parametrize("zones", [["2"], ["1"]])
+def test_postgres_preflight_checks_the_configured_zone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, zones: list[str]
+) -> None:
+    path = _set_parameters(
+        _parameters(tmp_path / "parameters.json"), {"postgresAvailabilityZone": "2"}
+    )
+    inputs = DeploymentInputs.load("subscription", path, tmp_path / "state.json")
+    runner = CommandRunner()
+    monkeypatch.setattr(
+        runner, "run_json", lambda *_args, **_kwargs: {
+            "versions": ["16"],
+            "editions": [{"name": "Burstable", "skus": [
+                {"name": "Standard_B1ms", "zones": zones}
+            ]}],
+        },
+    )
+    if "2" in zones:
+        validate_postgres_capabilities(runner, inputs)
+    else:
+        with pytest.raises(DeploymentError, match="zone 2 is unavailable"):
+            validate_postgres_capabilities(runner, inputs)
+
+
 def test_shared_storage_bootstrap_requires_distinct_ledger_and_route_tables(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3540,12 +3564,16 @@ def test_observer_names_are_stable_and_azure_safe(tmp_path: Path) -> None:
     assert len(observer_plan_name(inputs)) <= 40
 
 
+@pytest.mark.parametrize("observer_location", [None, "northeurope"])
 def test_observer_parameters_reuse_apps_but_isolate_the_observer_plan(
-    tmp_path: Path,
+    tmp_path: Path, observer_location: str | None,
 ) -> None:
+    path = _parameters(tmp_path / "parameters.json")
+    if observer_location is not None:
+        _set_parameters(path, {"observerLocation": observer_location})
     inputs = DeploymentInputs.load(
         "subscription",
-        _parameters(tmp_path / "parameters.json"),
+        path,
         tmp_path / "state.json",
     )
     answers = iter(("a-secure-owner-password", "a-secure-owner-password"))
@@ -3588,6 +3616,9 @@ def test_observer_parameters_reuse_apps_but_isolate_the_observer_plan(
     assert document["parameters"]["appServicePlanWorkerCount"]["value"] == 1
     assert document["parameters"]["provisionAcr"]["value"] is False
     assert document["parameters"]["manageEventHubRoleAssignment"]["value"] is True
+    assert document["parameters"]["location"]["value"] == (observer_location or "eastus2")
+    assert document["parameters"]["registryLocation"]["value"] == "eastus2"
+    assert "observerLocation" not in deployment_parameters(inputs, material)["parameters"]
 
 
 def test_observer_parameters_use_adopted_event_hub_without_bicep_rbac(
@@ -3794,6 +3825,18 @@ def test_missing_observer_image_is_built_and_restarted(
         commands.append(command)
         if command[:4] == ["az", "acr", "repository", "show"]:
             raise DeploymentError("Error: the specified tag does not exist")
+        if command[:3] == ["az", "acr", "build"]:
+            context = Path(command[-1])
+            assert _kwargs["cwd"] == REPOSITORY_ROOT
+            assert context.is_absolute()
+            assert command[command.index("--file") + 1] == str(context / "Dockerfile")
+            files = {
+                path.relative_to(context).as_posix()
+                for path in context.rglob("*") if path.is_file()
+            }
+            assert files == {
+                *OBSERVER_RUNTIME_FILES, *OBSERVER_SHARED_PATHS,
+            }
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(runner, "run", run)

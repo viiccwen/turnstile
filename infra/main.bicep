@@ -46,6 +46,10 @@ param controlPlaneDeploymentContainerName string = 'turnstile-control-deploy'
 param location string
 param postgresLocation string = location
 
+@description('Availability zone for a new PostgreSQL server; existing servers must retain their zone.')
+@allowed(['1', '2', '3'])
+param postgresAvailabilityZone string = '1'
+
 @description('APIM publisher contact shown by Azure.')
 param apimPublisherEmail string
 
@@ -328,6 +332,7 @@ module dataPlane 'modules/data-plane.bicep' = {
     postgresAdministratorPassword: postgresAdministratorPassword
     postgresSkuName: postgresSkuName
     postgresTier: postgresTier
+    postgresAvailabilityZone: postgresAvailabilityZone
     provisionPostgres: provisionPostgres
     postgresAdopted: postgresAdopted
     existingPostgresServerResourceId: existingPostgresServerResourceId
