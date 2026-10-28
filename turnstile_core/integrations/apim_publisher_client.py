@@ -1128,7 +1128,7 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
             operation_id=operation,
         )
         expected = component_digest(parse_policy(encoded), normalize_text_defaults=False)
-        observed = self._request("GET", path + "?format=rawxml", allow_not_found=True)
+        observed, actual = self._read_policy(path, allow_not_found=True)
         if create_only and observed.status_code != 404:
             raise PolicyCompilationError("New Operation policy already exists or cannot be verified")
         if observed.status_code == 404:
@@ -1137,7 +1137,6 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
             etag = observed.headers.get("ETag", "").strip()
             if observed.status_code != 200 or not etag or etag == "*" or "\r" in etag or "\n" in etag:
                 raise PolicyCompilationError("APIM policy requires a concrete ETag before update")
-            actual = self._policy_response_value(observed)
             if component_digest(parse_policy(actual), normalize_text_defaults=False) == expected:
                 return
             headers = {"If-Match": etag}
@@ -1147,10 +1146,9 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
             json_body={"properties": {"format": "xml", "value": encoded}},
             extra_headers=headers,
         )
-        readback = self._request("GET", path + "?format=rawxml")
+        readback, actual = self._read_policy(path)
         if readback.status_code != 200:
             raise PolicyCompilationError("APIM policy readback is unavailable")
-        actual = self._policy_response_value(readback)
         validate_policy_upload(
             actual, gateway_profile_id=self._settings.apim_gateway_profile_id,
             api_id=self._settings.apim_api_id, api_revision=revision,
@@ -1173,9 +1171,34 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
             if not isinstance(value, str) or not value:
                 raise ValueError
             parse_policy(value)
-        except (KeyError, TypeError, ValueError, ElementTree.ParseError):
+        except ElementTree.ParseError as error:
+            raise PolicyCompilationError("APIM policy response has no valid XML value") from error
+        except (KeyError, TypeError, ValueError):
             raise PolicyCompilationError("APIM policy response has no valid XML value") from None
         return value
+
+    def _read_policy(
+        self, path: str, *, allow_not_found: bool = False,
+        before_request: Callable[[], None] | None = None, record_probe_request: bool = False,
+    ) -> tuple[httpx.Response, str]:
+        location = urlparse(path)
+        for representation in ("rawxml", "xml"):
+            query = {**dict(parse_qsl(location.query)), "format": representation}
+            address = location._replace(query=urlencode(query)).geturl()
+            if record_probe_request:
+                self._record_probe_request("GET", address)
+            if before_request is not None:
+                before_request()
+            response = self._request("GET", address, allow_not_found=allow_not_found)
+            if response.status_code == 404:
+                return response, ""
+            try:
+                return response, self._policy_response_value(response)
+            except PolicyCompilationError as error:
+                if representation == "rawxml" and isinstance(error.__cause__, ElementTree.ParseError):
+                    continue
+                raise
+        raise PolicyCompilationError(f"APIM policy {path} returned no XML representation")
 
     def probe_revision(
         self, revision: str, publication: GatewayPublication, *, journal: ImageProbeJournal | None = None,
@@ -2926,13 +2949,12 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
                 or not isinstance(properties.get("urlTemplate"), str)
             ):
                 raise PolicyCompilationError("Fixed program operation inventory changed")
-            response = self._request(
-                "GET", path + "/" + quote(name, safe="") + "/policies/policy?format=rawxml",
+            response, policy = self._read_policy(
+                path + "/" + quote(name, safe="") + "/policies/policy",
                 allow_not_found=True,
             )
             if response.status_code == 404:
                 raise PolicyCompilationError("Fixed program operation policy is missing")
-            policy = self._policy_response_value(response)
             result[name] = (properties["method"], properties["urlTemplate"], policy)
         return result
 
@@ -3859,8 +3881,7 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
             parse_policy(properties["value"])
         except (ValueError, ElementTree.ParseError):
             raise PolicyCompilationError("APIM parent audit XML is invalid") from None
-        before_request()
-        policy = self._policy_response_value(self._request("GET", path + "?format=rawxml"))
+        _, policy = self._read_policy(path, before_request=before_request)
         if len(policy.encode()) > 1048576:
             raise PolicyCompilationError("APIM parent audit XML exceeds its size limit")
         before_request()
@@ -3879,38 +3900,11 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
                 and location.path.endswith("/policies/policy")
                 and "/operations/" not in location.path):
             return self._audit_parent_policy(location.path, before_request)
-        representations = ("rawxml",) if api_audit else ("rawxml", "xml")
-        for representation in representations:
-            query = {**dict(parse_qsl(location.query)), "format": representation}
-            address = location._replace(query=urlencode(query)).geturl()
-            if record_probe_request:
-                self._record_probe_request("GET", address)
-            if before_request is not None:
-                before_request()
-            try:
-                response = self._request("GET", address, allow_not_found=True)
-            except httpx.ReadTimeout:
-                if representation == "rawxml" and before_request is not None and not api_audit:
-                    continue
-                raise
-            if response.status_code == 404:
-                return None
-            content_type = response.headers.get("content-type", "").casefold()
-            if "json" in content_type:
-                value = (response.json().get("properties") or {}).get("value")
-            else:
-                value = response.text
-                if value.lstrip().startswith("&lt;"):
-                    value = unescape(value)
-            if not isinstance(value, str) or not value:
-                raise PolicyCompilationError(f"APIM policy {path} returned no value")
-            if representation == "rawxml":
-                try:
-                    parse_policy(value)
-                except ElementTree.ParseError:
-                    continue
-            return value
-        raise PolicyCompilationError(f"APIM policy {path} returned no XML representation")
+        response, value = self._read_policy(
+            path, allow_not_found=True, before_request=before_request,
+            record_probe_request=record_probe_request,
+        )
+        return None if response.status_code == 404 else value
 
     def _staged_availability_programs(
         self, store: TableStorageLedger, target_id: UUID,

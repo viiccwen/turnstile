@@ -415,8 +415,9 @@ def test_arm_reader_pins_revision_checks_maintenance_and_refuses_external_pagina
     "application/json",
     "application/vnd.ms-azure-apim.policy.raw+xml; charset=utf-8",
 ])
+@pytest.mark.parametrize("raw_expression_characters", [False, True])
 def test_arm_policy_snapshot_compiles_fixed_program_without_unescaping_guards(
-    policy_content_type: str,
+    policy_content_type: str, raw_expression_characters: bool,
 ) -> None:
     from tests.backend.model_platform.test_apim_onboarding import (
         onboarding_configuration,
@@ -485,16 +486,16 @@ def test_arm_policy_snapshot_compiles_fixed_program_without_unescaping_guards(
                 **source.api_properties, "apiRevision": source.revision, "isCurrent": True,
             }})
         if path == current_path + "/policies/policy":
-            parent = (
-                served_parent if arm_request.url.params["format"] == "rawxml" else escaped_parent
-            )
+            parent = served_parent
+            if arm_request.url.params["format"] == "rawxml" and raw_expression_characters:
+                parent = unescape(parent)
             return policy_response(parent)
         if path == current_path + "/operations":
             return httpx.Response(200, json={"value": [{"name": "chat-completions"}]})
         if path == current_path + "/operations/chat-completions":
             return httpx.Response(200, json={"properties": source.operations["chat-completions"]})
         if path == current_path + "/operations/chat-completions/policies/policy":
-            assert arm_request.url.params["format"] == "rawxml"
+            assert arm_request.url.params["format"] in {"rawxml", "xml"}
             return policy_response(source.operation_policies["chat-completions"])
         raise AssertionError(path)
 

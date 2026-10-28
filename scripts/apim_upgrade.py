@@ -254,7 +254,9 @@ class AzureUpgradeBackend:
         ) for resource in application_ids):
             raise ApimUpgradeError("Maintenance targets must belong to the selected subscription")
 
-    def _get(self, resource_id: str, *, policy: bool = False) -> dict[str, Any] | None:
+    def _get(
+        self, resource_id: str, *, policy: bool = False, policy_format: str = "rawxml",
+    ) -> dict[str, Any] | None:
         parsed = urlsplit(resource_id)
         if parsed.scheme or parsed.netloc:
             if parsed.scheme != "https" or parsed.netloc != "management.azure.com":
@@ -277,7 +279,7 @@ class AzureUpgradeBackend:
         if path in self.application_ids:
             parameters["api-version"] = "2024-11-01"
         if policy:
-            parameters["format"] = "rawxml"
+            parameters["format"] = policy_format
         response = self.client.get(
             httpx.URL(url).copy_merge_params(parameters), follow_redirects=False
         )
@@ -297,14 +299,23 @@ class AzureUpgradeBackend:
         return value
 
     def _policy(self, resource_id: str) -> str | None:
-        document = self._get(resource_id + "/policies/policy", policy=True)
-        if document is None:
-            return None
-        value = document.get("properties", {}).get("value")
-        if not isinstance(value, str) or not value:
-            raise ApimUpgradeError("ARM returned an invalid XML policy")
-        parse_policy(value)
-        return value
+        for representation in ("rawxml", "xml"):
+            document = self._get(
+                resource_id + "/policies/policy", policy=True, policy_format=representation,
+            )
+            if document is None:
+                return None
+            value = document.get("properties", {}).get("value")
+            if not isinstance(value, str) or not value:
+                raise ApimUpgradeError("ARM returned an invalid XML policy")
+            try:
+                parse_policy(value)
+            except ElementTree.ParseError:
+                if representation == "rawxml":
+                    continue
+                raise ApimUpgradeError("ARM returned an invalid XML policy") from None
+            return value
+        raise ApimUpgradeError("ARM returned no XML policy representation")
 
     def read(self, revision: str | None = None) -> GatewaySnapshot | None:
         path = self.api_resource_id

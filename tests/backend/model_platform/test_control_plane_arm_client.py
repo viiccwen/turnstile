@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from html import escape
+from html import escape, unescape
 from typing import Any, cast
 from unittest.mock import Mock
 from uuid import UUID
@@ -1796,8 +1796,10 @@ def test_arm_client_reads_current_policy_wire_formats(
     "application/json", "application/vnd.ms-azure-apim.policy.raw+xml; charset=utf-8",
 ])
 @pytest.mark.parametrize("defect", [None, "parent", "operation", "etag", "inventory"])
+@pytest.mark.parametrize("raw_expression_characters", [False, True])
 def test_runtime_fixed_program_verification_reads_raw_policy_with_unchanged_guards(
     monkeypatch: pytest.MonkeyPatch, content_type: str, defect: str | None,
+    raw_expression_characters: bool,
 ) -> None:
     from tests.backend.model_platform.test_apim_onboarding import (
         onboarding_configuration,
@@ -1866,7 +1868,8 @@ def test_runtime_fixed_program_verification_reads_raw_policy_with_unchanged_guar
                 "properties": {"method": method, "urlTemplate": route},
             } for name, method, route in program.operation_contracts]})
         if path.endswith("/policies/policy"):
-            assert arm_request.url.params["format"] == "rawxml"
+            representation = arm_request.url.params["format"]
+            assert representation in {"rawxml", "xml"}
             if "/operations/" in path:
                 name = path.split("/operations/", 1)[1].split("/", 1)[0]
                 policy = policies[name]
@@ -1876,6 +1879,8 @@ def test_runtime_fixed_program_verification_reads_raw_policy_with_unchanged_guar
                 policy = program.parent_policy
                 if defect == "parent":
                     policy = escaped_conditions(policy)
+            if representation == "rawxml" and raw_expression_characters:
+                policy = unescape(policy)
             return policy_response(policy)
         raise AssertionError(path)
 
@@ -1904,7 +1909,7 @@ def test_runtime_fixed_program_verification_reads_raw_policy_with_unchanged_guar
             assert management._policy_value(
                 policy_path, before_request=before_request,
             ) == program.parent_policy
-            assert before_request.call_count == 4
+            assert before_request.call_count == 4 + int(raw_expression_characters)
             with monkeypatch.context() as interrupted:
                 interrupted.setattr(management, "_request", Mock(side_effect=httpx.ReadTimeout(
                     "Offline policy read timeout",
@@ -1914,6 +1919,31 @@ def test_runtime_fixed_program_verification_reads_raw_policy_with_unchanged_guar
                         f"/apis/{settings.apim_api_id};rev=1/operations/chat-completions/policies/policy",
                         before_request=before_request,
                     )
+
+
+@pytest.mark.parametrize("failure", ["invalid-xml", "missing-value", "http", "timeout"])
+def test_policy_representation_fallback_only_handles_xml_syntax(failure: str) -> None:
+    formats: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        formats.append(request.url.params["format"])
+        if failure == "timeout":
+            raise httpx.ReadTimeout("Offline policy timeout", request=request)
+        if failure == "http":
+            return httpx.Response(403, json={"error": {"code": "AuthorizationFailed"}})
+        return httpx.Response(200, json={"properties": {
+            "value": "<policies>&&</policies>" if failure == "invalid-xml" else None,
+        }})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as transport:
+        client = AzureApimPublisherClient(publisher_settings(), StubTokenProvider(), transport)
+        if failure == "timeout":
+            with pytest.raises(httpx.ReadTimeout):
+                client._policy_value("/apis/turnstile-llm;rev=1/policies/policy")
+        else:
+            with pytest.raises((PolicyCompilationError, httpx.HTTPStatusError)):
+                client._policy_value("/apis/turnstile-llm;rev=1/policies/policy")
+    assert formats == (["rawxml", "xml"] if failure == "invalid-xml" else ["rawxml"])
 
 
 @pytest.mark.parametrize("observed", [
@@ -2396,8 +2426,10 @@ def test_gc_plan_protects_policy_and_pool_references() -> None:
             )
         if path.endswith(";rev=current-revision/policies/policy"):
             return policy(
+                '<policies><inbound>'
                 '<set-backend-service backend-id="pool-protected" />'
                 '<set-backend-service backend-id="backend-protected" />'
+                '</inbound></policies>'
             )
         if path.endswith(";rev=product-protected-revision/policies/policy"):
             return policy("<policies />")
@@ -2410,7 +2442,11 @@ def test_gc_plan_protects_policy_and_pool_references() -> None:
         if path.endswith("/products"):
             return listed([resource("products", "product-one", {})])
         if path.endswith("/products/product-one/policies/policy"):
-            return policy("{{named-value-protected}}")
+            return policy(
+                '<policies><inbound><set-header name="x-unit" exists-action="override">'
+                '<value>{{named-value-protected}}</value>'
+                '</set-header></inbound></policies>'
+            )
         if path.endswith("/products/product-one/apis"):
             return listed(
                 [
