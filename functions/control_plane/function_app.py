@@ -273,19 +273,34 @@ def _budget_configuration(
     gateway_id: UUID, repository: QueryRepository, settings: Settings,
     *, ledger: AtomicTableLedger | None = None,
 ) -> dict[str, object]:
+    automatic = gateway_id not in settings.budget_execution_target_ids
     initialized = (
         initialized_apim_targets(repository)
         if getattr(settings, "apim_target_registry_enabled", False) else {}
     )
     if (
         not settings.budget_execution_enabled
-        or (
-            gateway_id not in settings.budget_execution_target_ids
-            and gateway_id not in initialized
-        )
+        or (automatic and not settings.apim_target_registry_enabled)
         or not settings.ledger_table_endpoint
     ):
         raise ValueError("Budget publication target is not enabled")
+    if automatic:
+        gateways = repository.get_gateway_profiles([gateway_id])
+        if (
+            len(gateways) != 1 or gateways[0]["id"] != gateway_id
+            or gateways[0].get("implementation") != "apim" or not gateways[0].get("enabled")
+        ):
+            raise ValueError("Budget publication target is not enabled")
+        if gateway_id not in initialized:
+            installation = repository.effective_gateway_publication(gateway_id)
+            if (
+                installation is None or installation["status"] != "active"
+                or str(installation["gateway_profile_id"]) != str(gateway_id)
+                or not isinstance(
+                    installation.get("resource_manifest", {}).get("fixed_route_program"), dict,
+                )
+            ):
+                raise ValueError("Budget publication target has no current fixed installation")
     target = repository.get_apim_target(gateway_id)
     if target is None:
         raise ValueError("Budget publication target is unavailable")
@@ -304,7 +319,7 @@ def _budget_configuration(
         or str(fence.get("apim_service_id", "")).lower() != service
     ):
         raise ValueError("Budget publication fence does not match its registered target")
-    if gateway_id in initialized:
+    if automatic or gateway_id in initialized:
         if not isinstance(repository, BudgetScopeRepository):
             raise ValueError("Initialized APIM requires durable budget execution enrollment")
         rollout = repository.active_budget_execution_rollout()

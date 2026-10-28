@@ -410,8 +410,9 @@ def test_initialized_parent_matches_the_public_rendered_policy(
 
 
 @pytest.mark.parametrize("enrollment", ["valid", "missing", "other_epoch", "other_target"])
+@pytest.mark.parametrize("initialization", ["onboarding", "installation"])
 def test_initialized_budget_reader_requires_exact_active_epoch(
-    monkeypatch: pytest.MonkeyPatch, enrollment: str,
+    monkeypatch: pytest.MonkeyPatch, enrollment: str, initialization: str,
 ) -> None:
     request, epoch = onboarding_request(), UUID(int=24)
     settings = Settings.model_construct(
@@ -423,9 +424,22 @@ def test_initialized_budget_reader_requires_exact_active_epoch(
     repository.get_apim_target = MagicMock(return_value={
         "service_name": request.service_name, "api_id": request.api_id,
     })
-    monkeypatch.setattr(
-        function_app, "initialized_apim_targets", lambda _: {request.gateway_profile_id: request},
-    )
+    repository.get_gateway_profiles = MagicMock(return_value=[{
+        "id": request.gateway_profile_id, "implementation": "apim", "enabled": True,
+        "config": {"onboarding_ready": True,
+                   "onboarding_request": request.model_dump(mode="json")}
+        if initialization == "onboarding" else {"fixed_installation": "a" * 64},
+    }])
+    repository.list_apim_targets = MagicMock(return_value=[{
+        "gateway_profile_id": request.gateway_profile_id, "ownership_mode": "turnstile_managed",
+        "arm_resource_id": request.resource_id, "tenant_id": request.tenant_id,
+        "api_id": request.api_id, "api_path": request.api_path,
+        "probe_subscription_id": request.probe_subscription_id,
+    }])
+    repository.effective_gateway_publication = MagicMock(return_value={
+        "gateway_profile_id": request.gateway_profile_id, "status": "active",
+        "resource_manifest": {"fixed_route_program": {}},
+    })
     rollout = None if enrollment == "missing" else {
         "epoch": epoch if enrollment != "other_epoch" else UUID(int=25),
         "gateway_profile_ids": [request.gateway_profile_id] if enrollment != "other_target" else [],
@@ -448,6 +462,72 @@ def test_initialized_budget_reader_requires_exact_active_epoch(
     else:
         with pytest.raises(ValueError, match="not enrolled"):
             function_app._budget_configuration(request.gateway_profile_id, repository, settings)
+    ledger.upsert.assert_not_called()
+
+
+@pytest.mark.parametrize("condition", [
+    "disabled", "not_apim", "missing_gateway", "wrong_gateway", "missing_target",
+    "missing_installation", "pending_installation", "wrong_installation", "missing_program",
+    "budget_off", "registry_off", "missing_ledger", "paused_fence", "wrong_fence_target",
+    "wrong_fence_api", "wrong_fence_service", "wrong_fence_protocol",
+])
+def test_installed_budget_target_keeps_admission_guards(
+    monkeypatch: pytest.MonkeyPatch, condition: str,
+) -> None:
+    request, epoch = onboarding_request(), UUID(int=24)
+    profile = {"id": request.gateway_profile_id, "implementation": "apim", "enabled": True,
+               "config": {"fixed_installation": "a" * 64}}
+    installation = {
+        "gateway_profile_id": request.gateway_profile_id, "status": "active",
+        "resource_manifest": {"fixed_route_program": {}},
+    }
+    settings = Settings.model_construct(
+        apim_target_registry_enabled=condition != "registry_off",
+        budget_execution_enabled=condition != "budget_off",
+        ledger_table_endpoint=None if condition == "missing_ledger" else "https://offline.invalid",
+    )
+    repository = MagicMock(spec=BudgetScopeRepository)
+    repository.get_gateway_profiles = MagicMock(return_value=[profile])
+    repository.get_apim_target = MagicMock(return_value={
+        "service_name": request.service_name, "api_id": request.api_id,
+    })
+    repository.effective_gateway_publication = MagicMock(return_value=installation)
+    repository.active_budget_execution_rollout.return_value = {
+        "epoch": epoch, "gateway_profile_ids": [request.gateway_profile_id],
+    }
+    if condition == "disabled":
+        profile["enabled"] = False
+    elif condition == "not_apim":
+        profile["implementation"] = "other"
+    elif condition == "missing_gateway":
+        repository.get_gateway_profiles.return_value = []
+    elif condition == "wrong_gateway":
+        profile["id"] = UUID(int=25)
+    elif condition == "missing_target":
+        repository.get_apim_target.return_value = None
+    elif condition == "missing_installation":
+        repository.effective_gateway_publication.return_value = None
+    elif condition == "pending_installation":
+        installation["status"] = "pending"
+    elif condition == "wrong_installation":
+        installation["gateway_profile_id"] = UUID(int=25)
+    elif condition == "missing_program":
+        installation["resource_manifest"] = {}
+    fence = {
+        "protocol_version": 1 if condition == "wrong_fence_protocol" else 2,
+        "mode": "paused" if condition == "paused_fence" else "active", "epoch": str(epoch),
+        "gateway_profile_id": str(UUID(int=25) if condition == "wrong_fence_target"
+                                  else request.gateway_profile_id),
+        "api_id": "other" if condition == "wrong_fence_api" else request.api_id,
+        "apim_service_id": "other" if condition == "wrong_fence_service" else request.service_name,
+    }
+    ledger = MagicMock()
+    ledger.read_entity.return_value = {"Document": json.dumps(fence)}
+    monkeypatch.setattr(function_app, "initialized_apim_targets", lambda _: {})
+    with pytest.raises(ValueError):
+        function_app._budget_configuration(
+            request.gateway_profile_id, repository, settings, ledger=ledger,
+        )
     ledger.upsert.assert_not_called()
 
 
