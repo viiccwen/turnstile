@@ -1906,13 +1906,21 @@ def verify_initial_fixed_program(
     with httpx.Client(
         base_url=api_url, timeout=15, follow_redirects=False, trust_env=False,
     ) as http:
-        login = http.post("/api/v1/auth/login", json={
-            "email": owner_email, "password": owner_password,
-        })
-        login.raise_for_status()
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                login = http.post("/api/v1/auth/login", json={
+                    "email": owner_email, "password": owner_password,
+                }, timeout=min(15, remaining))
+            except httpx.TransportError:
+                time.sleep(min(3, max(0, deadline - time.monotonic())))
+                continue
+            login.raise_for_status()
+            break
+        else:
+            raise DeploymentError("Initial fixed program Owner login timed out")
         try:
-            while time.monotonic() < deadline:
-                response = http.get(path)
+            while (remaining := deadline - time.monotonic()) > 0:
+                response = http.get(path, timeout=min(15, remaining))
                 if response.status_code == 200:
                     installation = response.json()["current_installation"]
                     if (
@@ -1925,7 +1933,7 @@ def verify_initial_fixed_program(
                     return
                 if response.status_code != 409:
                     response.raise_for_status()
-                time.sleep(3)
+                time.sleep(min(3, max(0, deadline - time.monotonic())))
             raise DeploymentError("Initial fixed program is not ready for model publication")
         finally:
             http.post("/api/v1/auth/logout")

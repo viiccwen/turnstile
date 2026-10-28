@@ -952,6 +952,71 @@ def test_initial_fixed_program_readiness_requires_verified_binding_and_logout(
     ]
 
 
+@pytest.mark.parametrize("failure", ["once", "always", "401", "403", "preview-pending"])
+def test_initial_fixed_program_login_retries_within_shared_deadline(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    elapsed = [0.0]
+    calls = {"login": 0, "preview": 0, "logout": 0}
+    client_factory = httpx.Client
+
+    def advance(seconds: float) -> None:
+        elapsed[0] += seconds
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        timeout = request.extensions["timeout"]["read"]
+        assert 0 < timeout <= 15
+        if request.url.path.endswith("/auth/login"):
+            calls["login"] += 1
+            if failure == "always" or (
+                failure in {"once", "preview-pending"} and calls["login"] == 1
+            ):
+                advance(timeout)
+                raise httpx.ReadTimeout("Offline transient login timeout", request=request)
+            if failure in {"401", "403"}:
+                return httpx.Response(int(failure), json={"detail": "Rejected"})
+            return httpx.Response(
+                200, json={}, headers={"Set-Cookie": "offline-owner=verified; Path=/"},
+            )
+        if request.url.path.endswith("/auth/logout"):
+            calls["logout"] += 1
+            return httpx.Response(204)
+        calls["preview"] += 1
+        assert request.headers["Cookie"] == "offline-owner=verified"
+        if failure == "preview-pending":
+            advance(timeout)
+            return httpx.Response(409, json={"detail": "A current fixed program is required"})
+        return httpx.Response(200, json={"current_installation": {
+            "program": {"program_sha256": "a" * 64, "scope": {"target_id": "unit-target"}},
+            "model_additions_enabled": True,
+        }})
+
+    monkeypatch.setattr("scripts.deploy.time.monotonic", lambda: elapsed[0])
+    monkeypatch.setattr("scripts.deploy.time.sleep", advance)
+    monkeypatch.setattr("scripts.deploy.httpx.Client", lambda **kwargs: client_factory(
+        **kwargs, transport=httpx.MockTransport(respond),
+    ))
+    descriptor = {
+        "registration": {"gateway_profile_id": "unit-target"},
+        "binding": {"program_sha256": "a" * 64},
+    }
+    arguments = ("https://offline.example.test", "owner@example.test", "offline", descriptor)
+    if failure in {"401", "403"}:
+        with pytest.raises(httpx.HTTPStatusError) as rejected:
+            verify_initial_fixed_program(*arguments)
+        assert rejected.value.response.status_code == int(failure)
+        assert calls == {"login": 1, "preview": 0, "logout": 0}
+    elif failure in {"always", "preview-pending"}:
+        with pytest.raises(DeploymentError):
+            verify_initial_fixed_program(*arguments)
+        assert elapsed[0] == 180
+        assert calls["logout"] == (1 if failure == "preview-pending" else 0)
+    else:
+        verify_initial_fixed_program(*arguments)
+        assert calls == {"login": 2, "preview": 1, "logout": 1}
+        assert elapsed[0] < 180
+
+
 def test_temporary_parameter_file_is_private_and_deleted(tmp_path: Path) -> None:
     with temporary_parameter_file({"parameters": {}}, tmp_path) as path:
         assert path.is_file()
