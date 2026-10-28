@@ -3983,7 +3983,7 @@ schemas:
         $ref: ../../openapi.yaml#/components/schemas/FixedProgramUpgrade
       parent_policy:
         type: string
-        maxLength: 524288
+        maxLength: 1048576
         minLength: 1
         title: Parent Policy
       expected_parent_etag:

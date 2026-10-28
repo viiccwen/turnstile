@@ -32,7 +32,11 @@ import httpx
 from cryptography.fernet import Fernet
 from pydantic import HttpUrl
 
-from backend.bootstrap_storage_route import FixedInstallationDescriptor, installation_record
+from backend.bootstrap_storage_route import (
+    FixedInstallationDescriptor,
+    installation_record,
+    prepare_budget_delegation_upgrade,
+)
 from backend.services.auth_service import hash_password
 from backend.services.gateway_targets import DEFAULT_SEEDED_APIM_GATEWAY_ID
 from scripts.apim_upgrade import (
@@ -55,6 +59,7 @@ from turnstile_core.domain.gateway_targets import (
     self_hosted_gateway_capability_for_tier,
 )
 from turnstile_core.domain.storage_routes import (
+    FixedProgramCutover,
     FixedProgramInstallation,
     RouteScope,
 )
@@ -1642,7 +1647,8 @@ def gateway_upgrade(
     *,
     assume_yes: bool = False,
     owner_credentials: Path | None = None,
-) -> None:
+    fixed_program_source: Path | None = None,
+) -> tuple[FixedProgramCutover, str] | None:
     if (
         _output_string(outputs, "resourceGroupName").casefold()
         != inputs.resource_group_name.casefold()
@@ -1765,16 +1771,87 @@ def gateway_upgrade(
                         _output_string(outputs, "apiUrl"), inputs.owner_email, password,
                         installed.model_dump(mode="json"),
                     )
+                if registration is not None and delegation is not None:
+                    approved = _approved_fixed_installation(installed, registration)
+                    if fixed_policy_digest(current.parent_policy) != approved.parent_policy_sha256:
+                        if fixed_program_source is None:
+                            raise DeploymentError(
+                                "Fixed program recovery requires --fixed-program-source with "
+                                "retained original outputs containing pendingFixedBootstrap and "
+                                "pendingFixedProgramParameters; ARM history hides secure values",
+                            )
+                        try:
+                            original = json.loads(fixed_program_source.read_text(encoding="utf-8"))
+                            source_descriptor = FixedInstallationDescriptor.model_validate_json(
+                                json.dumps(original["pendingFixedBootstrap"]),
+                            )
+                            values = {name: entry["value"] for name, entry in original[
+                                "pendingFixedProgramParameters"
+                            ]["parameters"].items()}
+                            source_target = (
+                                values["apimResourceGroupName"], values["apimName"],
+                                values["apiId"],
+                                values["sourceRevision"], values["revision"], values["stage"],
+                            )
+                            source = GatewaySnapshot(
+                                values["revision"], values["apiProperties"], values["parentPolicy"],
+                                current.operations, current.operation_policies,
+                            )
+                        except (OSError, KeyError, TypeError, ValueError) as error:
+                            raise DeploymentError(
+                                "Fixed program recovery source is unreadable or incomplete; "
+                                "retained original outputs with secure policy values are required",
+                            ) from error
+                        if (source_descriptor != installed
+                            or current.revision != approved.program.api_revision
+                            or current.api_properties.get("path")
+                                != source.api_properties.get("path")) or source_target != (
+                            core.apim_resource_group_name, core.apim_name, api_id,
+                            approved.program.api_revision, approved.program.api_revision, "prepare",
+                        ):
+                            raise DeploymentError("Fixed program recovery source target changed")
+                        _validate_installed_fixed_program(
+                            source, installed, inputs, outputs, registration=registration,
+                        )
+                        upgrade, candidate_parent = prepare_budget_delegation_upgrade(
+                            approved, registration["previous_publication_id"],
+                            bind_budget_delegation(
+                                source.parent_policy, delegation,
+                                gateway_profile_id=installed.registration.gateway_profile_id,
+                            ),
+                            {name: (*approved.operation_contracts[name], cast(str, policy))
+                             for name, policy in current.operation_policies.items()},
+                        )
+                        normalized = ET.tostring(
+                            ET.fromstring(candidate_parent), encoding="unicode",
+                        )
+                        if fixed_policy_digest(current.parent_policy) not in {
+                            upgrade.installation.parent_policy_sha256,
+                            fixed_policy_digest(normalized),
+                        }:
+                            raise DeploymentError(
+                                "Installed fixed program identity or parent changed",
+                            )
+                        observed = client.head(
+                            "https://management.azure.com" + resource_id
+                            + ";rev=" + current.revision + "/policies/policy",
+                            params={"api-version": "2024-05-01"},
+                        )
+                        observed.raise_for_status()
+                        return FixedProgramCutover(
+                            upgrade=upgrade, parent_policy=candidate_parent,
+                            expected_parent_etag=observed.headers.get("ETag", ""),
+                        ), registration["config_sha256"]
                 _validate_installed_fixed_program(
                     current, installed, inputs, outputs, delegation, registration,
                 )
-                return
+                return None
             if plan_image_upgrade(resource_id, current, canonical).required:
                 raise DeploymentError(
                     "APIM infrastructure upgrade required before package deployment: "
                     "run scripts.deploy plan-upgrade, then upgrade in a maintenance window"
                 )
-            return
+            return None
         plan_path, journal_path = directory / "plan.json", directory / "journal.json"
         if plan_path.exists():
             document = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -1797,7 +1874,7 @@ def gateway_upgrade(
             if plan_image_upgrade(resource_id, current, canonical).required:
                 raise DeploymentError("The API no longer satisfies the recorded no-change plan")
             print("APIM infrastructure is current; no resource writes are required")
-            return
+            return None
         journal = (
             json.loads(journal_path.read_text(encoding="utf-8")) if journal_path.exists() else None
         )
@@ -1808,13 +1885,13 @@ def gateway_upgrade(
             and not plan_image_upgrade(resource_id, current, canonical).required
         ):
             print("The current revision retains the completed upgrade; no resource writes required")
-            return
+            return None
         if action == "plan-upgrade":
             candidate = backend.read(plan.revision)
             preview(plan, "prepare", plan.revision, candidate is None)
             print(f"APIM upgrade plan: {plan_path}")
             print("Drain publication work and stop API/Control-plane before applying this plan")
-            return
+            return None
         _confirm_deployment(assume_yes)
         result = execute_image_upgrade(
             plan, backend, denial, journal,
@@ -1823,6 +1900,7 @@ def gateway_upgrade(
         )
         print(f"APIM infrastructure upgrade: {result['status']}")
         print("API and Control-plane remain stopped; resume through the reviewed package rollout")
+        return None
 
 
 def initialize_fixed_program(
@@ -2022,6 +2100,32 @@ def initialize_fixed_program(
     return descriptor.model_dump(mode="json")
 
 
+def recover_fixed_program(
+    runner: CommandRunner, inputs: DeploymentInputs, outputs: Mapping[str, Any],
+    recovery: tuple[FixedProgramCutover, str],
+) -> None:
+    write, config_sha256 = recovery
+    name = _output_string(outputs, "controlPlaneFunctionName")
+    keys = runner.run_json([
+        "az", "functionapp", "function", "keys", "list", "--subscription", inputs.subscription,
+        "--resource-group", _output_string(outputs, "resourceGroupName"), "--name", name,
+        "--function-name", "cutover_gateway_program", "--output", "json",
+    ])
+    key = keys.get("default")
+    if not isinstance(key, str) or not key:
+        raise DeploymentError("Fixed program recovery Function credential is unavailable")
+    target = write.upgrade.installation.program.scope.target_id
+    with httpx.Client(timeout=90, follow_redirects=False, trust_env=False) as http:
+        response = http.post(
+            f"https://{name}.azurewebsites.net/api/model-programs/{target}/cutover",
+            headers={"x-functions-key": key, "If-Match": config_sha256},
+            json=write.model_dump(mode="json"),
+        )
+        response.raise_for_status()
+        if response.json() != write.upgrade.model_dump(mode="json"):
+            raise DeploymentError("Fixed program recovery registration differs from its candidate")
+
+
 def verify_initial_fixed_program(
     api_url: str, owner_email: str, owner_password: str, descriptor: Mapping[str, Any],
 ) -> JsonObject:
@@ -2112,9 +2216,11 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
             owner_credentials=args.owner_credentials,
         )
         return
+    recovery = None
     if saved_outputs is not None and not pending_installation:
-        gateway_upgrade(
+        recovery = gateway_upgrade(
             runner, inputs, saved_outputs, "check", owner_credentials=args.owner_credentials,
+            fixed_program_source=args.fixed_program_source,
         )
     if saved_outputs is None:
         validate_flex_consumption_capabilities(runner, inputs)
@@ -2263,7 +2369,9 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         saved_outputs is None or pending_installation or complete_installation
         or api_settings.get("BUDGET_EXECUTION_ENABLED", "false").casefold() == "true"
     ) else None
-    if saved_outputs is None or pending_installation or complete_installation:
+    if recovery is None and (
+        saved_outputs is None or pending_installation or complete_installation
+    ):
         fixed_descriptor = initialize_fixed_program(
             runner, inputs, {**platform_outputs, **observer_outputs}, api_settings, delegation,
         )
@@ -2296,13 +2404,22 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     )
     final_outputs = platform_outputs
     restart_runtime_apps(runner, inputs, final_outputs)
+    if recovery is not None:
+        verify_function_indexing(runner, inputs, final_outputs)
+        recover_fixed_program(runner, inputs, final_outputs, recovery)
     api_url = _output_string(final_outputs, "apiUrl")
     wait_for_health(api_url, timeout_seconds=1800, expected_asset=expected_asset)
     if secrets_.owner_password is None:
         raise DeploymentError("Initial Owner password is required for verification")
     verify_owner_login(api_url, inputs.owner_email, secrets_.owner_password)
-    verify_function_indexing(runner, inputs, final_outputs)
+    if recovery is None:
+        verify_function_indexing(runner, inputs, final_outputs)
     verify_telemetry_function_health(final_outputs)
+    if recovery is not None and gateway_upgrade(
+        runner, inputs, final_outputs, "check", owner_credentials=args.owner_credentials,
+        fixed_program_source=args.fixed_program_source,
+    ) is not None:
+        raise DeploymentError("Fixed program recovery has not completed registration")
     if fixed_descriptor is not None:
         verify_initial_fixed_program(
             api_url, inputs.owner_email, secrets_.owner_password, fixed_descriptor,
@@ -2348,6 +2465,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--owner-credentials",
         type=Path,
         help="Optional private 0600 JSON file containing the Owner email and password.",
+    )
+    parser.add_argument(
+        "--fixed-program-source", type=Path,
+        help="Retained original outputs JSON containing pendingFixedBootstrap and "
+        "pendingFixedProgramParameters; required only for an interrupted fixed-program recovery.",
     )
     parser.add_argument("--yes", action="store_true")
     parser.add_argument(

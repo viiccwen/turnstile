@@ -565,7 +565,7 @@ class FixedProgramUpgrade(RouteModel):
 
 class FixedProgramCutover(RouteModel):
     upgrade: FixedProgramUpgrade
-    parent_policy: str = Field(min_length=1, max_length=524288)
+    parent_policy: str = Field(min_length=1, max_length=1048576)
     expected_parent_etag: str = Field(pattern=r'^"[A-Za-z0-9+/=]{1,160}"$')
     operation_policies: dict[Identifier, str] = Field(
         default_factory=dict, max_length=30, exclude_if=lambda value: not value,

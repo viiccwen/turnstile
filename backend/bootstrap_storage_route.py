@@ -531,6 +531,54 @@ def bootstrap(descriptor: FixedInstallationDescriptor, settings: Settings) -> di
             owner.execute("SELECT pg_advisory_unlock(hashtextextended(%s,0))", (lock,))
 
 
+def prepare_budget_delegation_upgrade(
+    installed: FixedProgramInstallation, publication_id: str, candidate: str,
+    operations: dict[str, tuple[str, str, str]],
+) -> tuple[FixedProgramUpgrade, str]:
+    contracts = fixed_operation_contracts(
+        installed.operation_contracts["models"][1],
+        installed.operation_contracts["anthropic-messages"][1],
+        installed.retired_operations, decision_enabled=installed.decision_enabled,
+    )
+    root = parse_policy(compact_fixed_policy(candidate))
+    marker = root.find(".//set-variable[@name='routeProgram']")
+    if marker is None:
+        raise RuntimeError("Budget delegation program identity is missing")
+    predecessor = installed.program.program_sha256
+    legacy = installed.legacy_program_sha256 or predecessor
+    predecessors = tuple(sorted({
+        *installed.predecessor_program_sha256, predecessor,
+    } - {legacy}))
+    owner = next(node for node in root.iter() if marker in list(node))
+    for name, value in {
+        "routeLegacyProgram": legacy,
+        "routePredecessorPrograms": json.dumps(predecessors, separators=(",", ":")),
+    }.items():
+        node = root.find(f".//set-variable[@name='{name}']")
+        if node is None:
+            node = ET.Element("set-variable", {"name": name})
+            owner.insert(list(owner).index(marker), node)
+        node.set("value", value)
+    digest = fixed_program_digest(
+        serialize_policy(root), {name: operation[2] for name, operation in operations.items()},
+        tuple((name, *contract) for name, contract in contracts.items()),
+    )
+    marker.set("value", digest)
+    candidate = serialize_policy(root)
+    upgrade = FixedProgramUpgrade(
+        previous_publication_id=publication_id,
+        previous_installation_sha256=document_digest(installed),
+        installation=installed.model_copy(update={
+            "program": installed.program.model_copy(update={"program_sha256": digest}),
+            "parent_policy_sha256": fixed_policy_digest(candidate),
+            "legacy_program_sha256": legacy,
+            "predecessor_program_sha256": predecessors,
+        }),
+    )
+    upgrade.require_previous(publication_id, installed)
+    return upgrade, candidate
+
+
 def configure_budget_delegation(repository: Any, settings: Settings, target_id: UUID) -> None:
     trust = settings.budget_delegation_trust.get(target_id)
     if trust is None:
@@ -572,48 +620,9 @@ def configure_budget_delegation(repository: Any, settings: Settings, target_id: 
                 raise RuntimeError("Budget delegation current approved parent changed")
             return
         operations = management.route_program_operations(installed.program.api_revision)
-        contracts = fixed_operation_contracts(
-            installed.operation_contracts["models"][1],
-            installed.operation_contracts["anthropic-messages"][1],
-            installed.retired_operations, decision_enabled=installed.decision_enabled,
+        upgrade, candidate = prepare_budget_delegation_upgrade(
+            installed, str(previous["id"]), candidate, operations,
         )
-        root = parse_policy(candidate)
-        marker = root.find(".//set-variable[@name='routeProgram']")
-        if marker is None:
-            raise RuntimeError("Budget delegation program identity is missing")
-        predecessor = installed.program.program_sha256
-        legacy = installed.legacy_program_sha256 or predecessor
-        predecessors = tuple(sorted({
-            *installed.predecessor_program_sha256, predecessor,
-        } - {legacy}))
-        owner = next(node for node in root.iter() if marker in list(node))
-        for name, value in {
-            "routeLegacyProgram": legacy,
-            "routePredecessorPrograms": json.dumps(predecessors, separators=(",", ":")),
-        }.items():
-            node = root.find(f".//set-variable[@name='{name}']")
-            if node is None:
-                node = ET.Element("set-variable", {"name": name})
-                owner.insert(list(owner).index(marker), node)
-            node.set("value", value)
-        candidate = serialize_policy(root)
-        digest = fixed_program_digest(
-            candidate, {name: operation[2] for name, operation in operations.items()},
-            tuple((name, *contract) for name, contract in contracts.items()),
-        )
-        marker.set("value", digest)
-        candidate = serialize_policy(root)
-        upgrade = FixedProgramUpgrade(
-            previous_publication_id=str(previous["id"]),
-            previous_installation_sha256=document_digest(installed),
-            installation=installed.model_copy(update={
-                "program": installed.program.model_copy(update={"program_sha256": digest}),
-                "parent_policy_sha256": fixed_policy_digest(candidate),
-                "legacy_program_sha256": legacy,
-                "predecessor_program_sha256": predecessors,
-            }),
-        )
-        upgrade.require_previous(str(previous["id"]), installed)
         pending = {
             "previous_publication_id": str(previous["id"]),
             "previous_installation_sha256": document_digest(installed),

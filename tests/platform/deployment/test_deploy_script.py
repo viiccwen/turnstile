@@ -437,6 +437,7 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
         "verify_function_indexing", "verify_telemetry_function_health", "restart_runtime_apps",
     ):
         monkeypatch.setattr(f"scripts.deploy.{name}", Mock())
+    monkeypatch.setattr("scripts.deploy.gateway_upgrade", Mock(return_value=None))
     monkeypatch.setattr("scripts.deploy.load_saved_outputs", Mock(
         return_value=outputs if existing else None,
     ))
@@ -1079,6 +1080,12 @@ def test_existing_program_delegation_uses_guarded_cutover(
     "entry_missing_checkpoint", "entry_changed_trust", "entry_changed_publication",
     "entry_changed_target", "entry_changed_revision", "entry_changed_source",
     "entry_changed_candidate", "entry_foreign",
+    "deployment_normalized", "deployment_candidate", "deployment_foreign", "deployment_source",
+    "deployment_source_target", "deployment_revision", "deployment_operation",
+    "deployment_contract", "deployment_approval", "deployment_etag", "deployment_write_failure",
+    "deployment_missing_source", "deployment_unreadable_source", "deployment_redacted_source",
+    "deployment_source_descriptor", "deployment_path", "deployment_unknown", "deployment_mismatch",
+    "deployment_healthy", "deployment_incomplete_target",
 ])
 def test_real_delegation_cutover_xml_roundtrip_and_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_state: str,
@@ -1124,12 +1131,22 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
             tmp_path, setup, False,
         )
         parameters = cast(Mock, deploy.deploy_template).call_args.args[3]["parameters"]
+        deployment_inputs = cast(Mock, deploy.deploy_template).call_args.args[1]
+        deployment_outputs = {**runtime.call_args.args[1], "apiUrl": "https://api-test.example.test"}
         descriptor = bootstrap.FixedInstallationDescriptor.model_validate_json(
             json.dumps(runtime.call_args.args[5]),
         )
         old_parent = parameters["parentPolicy"]["value"]
         trust = runtime.call_args.args[7]
     target = descriptor.registration.gateway_profile_id
+    deployment = native_state.startswith("deployment_")
+    arm_parameters = json.loads(json.dumps(parameters))
+    if native_state == "deployment_source":
+        arm_parameters["parentPolicy"]["value"] = old_parent.replace(
+            'name="routeTrust"', 'name="drift"',
+        )
+    elif native_state == "deployment_source_target":
+        arm_parameters["apimName"]["value"] = "other-apim"
     previous = bootstrap.installation_record(descriptor, "b" * 64)
     operations = {item["name"]: (item["method"], item["path"], item["policy"])
                   for item in parameters["fixedOperations"]["value"]}
@@ -1189,18 +1206,23 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
                               "fixed_route_head": head.model_dump(mode="json")},
     })
     repository.effective_gateway_publication.return_value = source.model_dump(mode="python")
+    original_publication = source.model_dump(mode="python")
     repository.model_availability_proof_guard.side_effect = lambda *_, **__: nullcontext()
     proof = ProgramCapabilityProof(
         proof_id=str(UUID(int=78)), identity=previous.program,
         supported_profiles=previous.supported_profiles, issued_epoch=1050, expires_epoch=1170,
     )
-    already_written = native_state in {"candidate", "proof_written", "proof_expired"}
+    already_written = native_state in {
+        "candidate", "proof_written", "proof_expired", "deployment_candidate",
+    }
     current: dict[str, Any] = {"parent": candidate if already_written else
                ET.tostring(ET.fromstring(candidate), encoding="unicode")
-               if native_state == "normalized" else
+               if native_state == "normalized" or deployment else
                '<policies><inbound><return-response /></inbound></policies>'
                if native_state == "foreign" else old_parent,
                "etag": '"old"', "proof": proof}
+    if native_state == "deployment_healthy":
+        current["parent"] = old_parent
     if native_state in {"proof_written", "proof_expired"}:
         current["proof"] = proof.model_copy(update={
             "identity": upgrade.installation.program,
@@ -1208,6 +1230,9 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
                     if native_state == "proof_expired" else {}),
         })
     writes: list[str] = []
+    deployment_events: list[str] = []
+    cutover_inputs: list[Any] = []
+    arm_history_reads: list[str] = []
     def request(method: str, path: str, **kwargs: Any) -> httpx.Response:
         if method == "PUT":
             assert kwargs["extra_headers"] == {"If-Match": current["etag"]}
@@ -1225,8 +1250,37 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
     management.revision_api_policy.side_effect = lambda *_: current["parent"]
     entry = native_state.startswith("entry_")
     registration_failure = [native_state in {"entry_proof_written", "entry_proof_expired"}]
-    reject = [native_state == "interrupted" or entry and not registration_failure[0]]
+    reject = [native_state in {"interrupted", "deployment_write_failure"}
+              or entry and not registration_failure[0]]
     def probe(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "management.azure.com":
+            if request.method == "GET":
+                arm_history_reads.append(str(request.url))
+            return httpx.Response(200, headers={"ETag": current["etag"]}, json={"properties": {
+                "provisioningState": "Succeeded", "parameters": {
+                    name: {} if name in {"parentPolicy", "apiProperties", "fixedOperations"}
+                    else value for name, value in arm_parameters.items()
+                },
+            }})
+        if request.url.host == "control-test.azurewebsites.net":
+            import azure.functions as func
+
+            from functions.control_plane import function_app as control_plane
+
+            assert deployment_events[-1] == "indexing"
+            assert "packages" in deployment_events and "started" in deployment_events
+            assert request.headers["x-functions-key"] == "offline-function-key"
+            cutover_inputs.append(json.loads(request.content))
+            result = control_plane.cutover_gateway_program(func.HttpRequest(
+                method="POST", url=str(request.url), headers=dict(request.headers),
+                body=request.content, route_params={"target_id": str(target)},
+            ))
+            deployment_events.append("cutover")
+            if native_state == "deployment_unknown":
+                raise httpx.ReadTimeout("Injected unknown cutover result", request=request)
+            if native_state == "deployment_mismatch":
+                return httpx.Response(200, json={"unconfirmed": True})
+            return httpx.Response(result.status_code, content=result.get_body())
         is_new = fixed_policy_digest(current["parent"]) == upgrade.installation.parent_policy_sha256
         if reject[0] and is_new:
             reject[0] = False
@@ -1290,6 +1344,213 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
             repository, configurations, upgrade, document_digest({}), clock=lambda: 1100,
             parent_policy=candidate, expected_parent_etag=current["etag"],
         )
+    if deployment:
+        import getpass
+
+        from fastapi import Response
+
+        from backend.http.model_platform import preview_gateway_program_upgrade
+        from functions.control_plane import function_app as control_plane
+        from scripts.apim_upgrade import AzureUpgradeBackend, GatewaySnapshot
+
+        source_path = tmp_path / "original-fixed-program.outputs.json"
+        deploy._write_private_json(source_path, {
+            "pendingFixedBootstrap": descriptor.model_dump(mode="json"),
+            "pendingFixedProgramParameters": {"parameters": arm_parameters},
+        })
+        if native_state in {
+            "deployment_redacted_source", "deployment_source_descriptor",
+            "deployment_incomplete_target",
+        }:
+            retained = json.loads(source_path.read_text())
+            if native_state == "deployment_redacted_source":
+                del retained["pendingFixedProgramParameters"]["parameters"]["parentPolicy"]["value"]
+            elif native_state == "deployment_incomplete_target":
+                del retained["pendingFixedProgramParameters"]["parameters"]["apimName"]
+            else:
+                retained["pendingFixedBootstrap"]["registration"]["api_id"] = "other"
+            deploy._write_private_json(source_path, retained)
+        elif native_state in {"deployment_unreadable_source", "deployment_healthy"}:
+            source_path = tmp_path / "absent-original.outputs.json"
+        runner = Mock(spec=CommandRunner)
+        runner.run_json.side_effect = lambda command: (
+            {"default": "offline-function-key"} if "keys" in command
+            else {"accessToken": "offline-token"}
+        )
+        if native_state == "deployment_foreign":
+            current["parent"] = candidate.replace('name="routeTrust"', 'name="drift"')
+        elif native_state == "deployment_operation":
+            operation = operations["chat-completions"]
+            operations["chat-completions"] = (
+                operation[0], operation[1], "<policies><inbound /></policies>",
+            )
+        elif native_state == "deployment_contract":
+            operation = operations["chat-completions"]
+            operations["chat-completions"] = ("GET", operation[1], operation[2])
+        monkeypatch.setattr(AzureUpgradeBackend, "read", lambda *_: GatewaySnapshot(
+            "other" if native_state == "deployment_revision" else previous.program.api_revision,
+            {**parameters["apiProperties"]["value"],
+             **({"path": "other"} if native_state == "deployment_path" else {})}, current["parent"],
+            {name: {"method": method, "urlTemplate": path}
+             for name, (method, path, _) in operations.items()},
+            {name: policy for name, (_, _, policy) in operations.items()},
+        ))
+        monkeypatch.setattr(deploy, "current_app_settings", lambda *_: {
+            "TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR": descriptor.model_dump_json(),
+        })
+        monkeypatch.setattr(deploy, "deployment_budget_delegation", lambda *_: (
+            settings.budget_delegation_trust[target]
+        ))
+        monkeypatch.setattr(getpass, "getpass", lambda *_: "offline-owner-password")
+        def approved_preview(*args: Any) -> Any:
+            result = preview_gateway_program_upgrade(target, repository, "unit-owner", Response())
+            if native_state == "deployment_approval":
+                result["current_installation"]["parent_policy_sha256"] = "f" * 64
+            return result
+        monkeypatch.setattr(deploy, "verify_initial_fixed_program", approved_preview)
+        def deployment_args(action: str) -> Any:
+            return deploy.build_parser().parse_args([
+                action, "--subscription", deployment_inputs.subscription,
+                "--parameters", str(deployment_inputs.parameters_path),
+                "--state", str(deployment_inputs.state_path), "--yes",
+                *([] if native_state == "deployment_missing_source"
+                  else ["--fixed-program-source", str(source_path)]),
+            ])
+        if native_state in {
+            "deployment_foreign", "deployment_source", "deployment_source_target",
+            "deployment_revision", "deployment_operation", "deployment_contract",
+            "deployment_approval",
+            "deployment_missing_source", "deployment_unreadable_source",
+            "deployment_redacted_source",
+            "deployment_source_descriptor", "deployment_path",
+            "deployment_incomplete_target",
+        }:
+            monkeypatch.setattr(deploy, "require_prerequisites", lambda *_: None)
+            monkeypatch.setattr(deploy, "validate_source_snapshot", lambda *_: None)
+            monkeypatch.setattr(deploy, "load_saved_outputs", lambda *_: deployment_outputs)
+            unavailable = "requires --fixed-program-source" if (
+                native_state == "deployment_missing_source"
+            ) else "recovery source" if native_state in {
+                "deployment_unreadable_source", "deployment_redacted_source",
+                "deployment_source_descriptor", "deployment_incomplete_target",
+            } else None
+            with pytest.raises(DeploymentError, match=unavailable):
+                deploy.execute(deployment_args("plan"), runner)
+            assert not writes and not recorded and not deployment_events
+            assert not arm_history_reads
+            return
+        recovery = deploy.gateway_upgrade(
+            runner, deployment_inputs, deployment_outputs, "check",
+            fixed_program_source=source_path,
+        )
+        assert not writes and not recorded
+        if native_state == "deployment_healthy":
+            assert recovery is None
+        else:
+            assert recovery is not None
+            assert recovery[0].upgrade == upgrade
+            assert recovery[0].parent_policy == candidate
+        monkeypatch.setattr(control_plane, "get_settings", lambda: Settings.model_construct(
+            control_plane_enabled=True,
+        ))
+        monkeypatch.setattr(control_plane, "create_repository", lambda *_: repository)
+        monkeypatch.setattr(control_plane, "apim_target_client_config_resolver", lambda *_: (
+            configurations
+        ))
+        monkeypatch.setattr(
+            control_plane, "register_verified_program_upgrade", lambda *args, **kwargs: (
+                routes.register_verified_program_upgrade(*args, **kwargs, clock=lambda: 1100)
+            ),
+        )
+        def finish_registration(value: Any, digest: str, **options: Any) -> None:
+            record(value, digest, **options)
+            repository.get_gateway_profiles.return_value[0]["config"] = {
+                "fixed_route_program_upgrade": value,
+            }
+        repository.record_fixed_program_upgrade.side_effect = finish_registration
+        monkeypatch.setattr(deploy, "load_saved_outputs", lambda *_: deployment_outputs)
+        monkeypatch.setattr(deploy, "load_or_create_secret_material", lambda *_, **kwargs: (
+            Mock(owner_password="offline-owner-password")
+        ))
+        for name in (
+            "require_prerequisites", "validate_source_snapshot", "what_if_resource_group",
+            "deploy_resource_group_template", "what_if", "build_and_start_observer",
+            "wait_for_observer_health", "verify_owner_login", "verify_telemetry_function_health",
+            "_confirm_deployment", "_write_outputs",
+        ):
+            monkeypatch.setattr(deploy, name, Mock())
+        completion = Mock()
+        monkeypatch.setattr(deploy, "_write_outputs", completion)
+        printed = Mock()
+        monkeypatch.setattr(deploy, "print", printed, raising=False)
+        for name in (
+            "deployment_parameters", "runtime_release_parameters", "observer_parameters",
+            "build_packages", "deploy_template",
+        ):
+            monkeypatch.setattr(deploy, name, Mock(return_value={}))
+        for name in ("source_version", "observer_source_version", "frontend_asset"):
+            monkeypatch.setattr(deploy, name, lambda *_: "offline-fixed-runtime")
+        monkeypatch.setattr(deploy, "deployment_outputs", lambda *_: {
+            "webAppUrl": "https://observer.example.test",
+        })
+        def uploaded(*args: Any) -> None:
+            assert not writes and not recorded
+            deployment_events.append("packages")
+            if native_state == "deployment_etag":
+                current["etag"] = '"changed"'
+        monkeypatch.setattr(deploy, "deploy_packages", uploaded)
+        monkeypatch.setattr(deploy, "restart_runtime_apps", lambda *_: (
+            deployment_events.append("started")
+        ))
+        monkeypatch.setattr(deploy, "verify_function_indexing", lambda *_: (
+            deployment_events.append("indexing")
+        ))
+        def healthy(*args: Any, **kwargs: Any) -> None:
+            assert len(recorded) == (native_state != "deployment_healthy")
+            deployment_events.append("healthy")
+        monkeypatch.setattr(deploy, "wait_for_health", healthy)
+        for action in ("plan", "deploy"):
+            arguments = deployment_args(action)
+            if action == "deploy" and native_state in {
+                "deployment_etag", "deployment_write_failure", "deployment_unknown",
+                "deployment_mismatch",
+            }:
+                expected_error = (httpx.ReadTimeout if native_state == "deployment_unknown"
+                                  else DeploymentError if native_state == "deployment_mismatch"
+                                  else httpx.HTTPStatusError)
+                with pytest.raises(expected_error):
+                    deploy.execute(arguments, runner)
+                assert deployment_events == ["packages", "started", "indexing", "cutover"]
+                assert len(cutover_inputs) == 1
+                assert len(recorded) == (
+                    native_state in {"deployment_unknown", "deployment_mismatch"}
+                )
+                assert len(writes) == (native_state != "deployment_etag")
+                completion.assert_not_called()
+                assert all(call.args != ("Turnstile deployment completed.",)
+                           for call in printed.call_args_list)
+                assert repository.effective_gateway_publication.return_value == original_publication
+                assert not arm_history_reads
+                return
+            deploy.execute(arguments, runner)
+            if action == "plan":
+                assert not writes and not recorded and not deployment_events
+                completion.assert_not_called()
+        if native_state == "deployment_healthy":
+            assert deployment_events == ["packages", "started", "healthy", "indexing"]
+            assert not writes and not recorded and not cutover_inputs
+            assert not arm_history_reads
+            return
+        assert deployment_events == ["packages", "started", "indexing", "cutover", "healthy"]
+        assert len(recorded) == len(cutover_inputs) == 1
+        assert len(writes) == (native_state != "deployment_candidate")
+        assert recovery is not None
+        assert cutover_inputs[0] == recovery[0].model_dump(mode="json")
+        assert fixed_policy_digest(current["parent"]) == upgrade.installation.parent_policy_sha256
+        assert repository.effective_gateway_publication.return_value == original_publication
+        assert "recorded_usage" not in str(repository.mock_calls)
+        assert not arm_history_reads
+        return
     if native_state == "foreign":
         with pytest.raises(ValueError):
             cutover()
