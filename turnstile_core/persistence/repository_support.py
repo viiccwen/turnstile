@@ -176,6 +176,21 @@ def _registered_program_installation(
     return installation
 
 
+def _approved_preparation_installations(
+    publication_id: str, installation: Any, config: Mapping[str, Any],
+) -> tuple[Any, tuple[Any, ...]]:
+    from ..domain.storage_routes import FixedProgramUpgrade, canonical_document
+
+    approved = _registered_program_installation(publication_id, installation, config)
+    records = list(config.get("fixed_route_program_upgrade_history", []))
+    if config.get("fixed_route_program_upgrade") is not None:
+        records.append(config["fixed_route_program_upgrade"])
+    candidates = (installation, *(FixedProgramUpgrade.model_validate_json(
+        canonical_document(record),
+    ).installation for record in records))
+    return approved, candidates
+
+
 def _fixed_program_upgrade_config(
     previous_row: Mapping[str, Any] | None, config: Mapping[str, Any],
     descriptor: Mapping[str, Any], expected_config_sha256: str,
@@ -283,36 +298,113 @@ def _model_removal_manifest(
 
 def _model_addition_credential_retry(
     publication: Mapping[str, Any], previous: Mapping[str, Any] | None, probe_count: int,
+    *, config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    from ..domain.storage_routes import document_digest
+    from ..domain.control_plane import GatewayPublication
+    from ..domain.storage_routes import (
+        FixedProgramInstallation,
+        canonical_document,
+        document_digest,
+    )
 
     manifest = publication.get("resource_manifest") or {}
+    configuration = config or {}
+    previous = _managed_program_publication(previous, {
+        "managed_route_program_initialization": configuration.get(
+            "managed_route_program_initialization",
+        ),
+    })
     message = publication.get("error_message") or ""
     try:
         diagnostic = json.loads(message.removeprefix("APIM management failed: "))
     except (ValueError, TypeError):
         diagnostic = None
+    budget_denied = (
+        publication.get("error_code") == "ValueError"
+        and message == "Budget publication target is not enabled"
+    )
+    credential_denied = (
+        publication.get("error_code") == "PolicyCompilationError"
+        and isinstance(diagnostic, dict) and diagnostic.get("code") == "AuthorizationFailed"
+        and diagnostic.get("method") == "POST" and diagnostic.get("status") == 403
+        and re.fullmatch(r"/namedValues/[A-Za-z0-9._-]{1,256}/listValue",
+                         str(diagnostic.get("path", ""))) is not None
+    )
     if (publication.get("status") != "failed"
             or publication.get("publication_kind") != "model_add"
-            or set(manifest) != {"model_route_addition"}
+            or "model_route_addition" not in manifest
+            or set(manifest) - {"model_route_addition", "route_preparation", "route_credentials",
+                                "route_last_progress_attempt"}
             or publication.get("apim_revision") is not None
             or publication.get("policy_sha256") is not None
             or type(probe_count) is not int or probe_count != 0
             or previous is None or publication.get("base_release_id") != previous.get("id")
-            or publication.get("error_code") != "PolicyCompilationError"
-            or not isinstance(diagnostic, dict) or diagnostic.get("code") != "AuthorizationFailed"
-            or diagnostic.get("method") != "POST" or diagnostic.get("status") != 403
-            or not re.fullmatch(r"/namedValues/[A-Za-z0-9._-]{1,256}/listValue",
-                                str(diagnostic.get("path", "")))):
+            or not (budget_denied or credential_denied)):
         raise ValueError(
-            "Model addition recovery requires an unchanged zero-probe credential denial",
+            "Model addition recovery requires an unchanged zero-probe preparation denial",
         )
-    _model_addition_manifest(previous, publication["desired_spec"],
-        publication["desired_spec_sha256"], manifest)
-    return {"kind": "model_addition_credential_read_recovery",
+    _model_addition_manifest(
+        previous, publication["desired_spec"], publication["desired_spec_sha256"],
+        {"model_route_addition": manifest["model_route_addition"]},
+    )
+    if set(manifest) != {"model_route_addition"}:
+        installation = FixedProgramInstallation.model_validate_json(canonical_document(
+            previous["resource_manifest"]["fixed_route_program"],
+        ))
+        candidate = GatewayPublication.model_validate(publication)
+        _, installations = _approved_preparation_installations(
+            str(previous["id"]), installation, configuration,
+        )
+        preparation = manifest.get("route_preparation")
+        for approved in installations:
+            expected = document_digest({
+                "publication_id": str(candidate.id),
+                "desired_spec_sha256": candidate.desired_spec_sha256,
+                "specification": candidate.desired_spec.model_dump(mode="json"),
+                "installation": approved.model_dump(mode="json"),
+            })
+            if isinstance(preparation, dict) and preparation.get("context_sha256") == expected:
+                installation = approved
+                break
+        _validate_preparation_checkpoint(
+            candidate, manifest, installation,
+        )
+    return {"kind": "model_addition_budget_admission_recovery" if budget_denied
+                   else "model_addition_credential_read_recovery",
         "attempt_count": publication["attempt_count"], "manifest_sha256": document_digest(manifest),
         "previous_error_code": publication["error_code"],
         "previous_error_sha256": document_digest({"message": message})}
+
+
+def _validate_preparation_checkpoint(
+    candidate: Any, manifest: Mapping[str, Any], installation: Any,
+) -> None:
+    from ..domain.storage_routes import document_digest
+
+    preparation = manifest.get("route_preparation")
+    expected = document_digest({
+        "publication_id": str(candidate.id), "desired_spec_sha256": candidate.desired_spec_sha256,
+        "specification": candidate.desired_spec.model_dump(mode="json"),
+        "installation": installation.model_dump(mode="json"),
+    })
+    progress = manifest.get("route_last_progress_attempt", 0)
+    if (not isinstance(preparation, dict)
+            or type(preparation.get("version")) is not int or preparation["version"] != 1
+            or preparation.get("context_sha256") != expected
+            or set(preparation) - {"version", "context_sha256", "connections", "credentials",
+                                   "oauth"}
+            or any(not isinstance(preparation.get(field, {}), dict)
+                   or len(preparation.get(field, {})) > 10000
+                   for field in ("connections", "credentials", "oauth"))
+            or type(progress) is not int or not 0 <= progress <= candidate.attempt_count):
+        raise ValueError("Route preparation checkpoint changed")
+    credentials = manifest.get("route_credentials")
+    if "route_credentials" in manifest and (
+        not isinstance(credentials, dict) or set(credentials) != {"version", "bindings"}
+        or type(credentials.get("version")) is not int or credentials["version"] != 1
+        or not isinstance(credentials.get("bindings"), dict) or len(credentials["bindings"]) > 10000
+    ):
+        raise ValueError("Route credential checkpoint changed")
 
 
 def _route_reconcile_credential_read_denied(publication: Mapping[str, Any]) -> bool:
@@ -465,32 +557,7 @@ def _program_migration_retry(
         installation = FixedProgramInstallation.model_validate_json(canonical_document(
             manifest["fixed_route_migration"]["installation"],
         ))
-        preparation = manifest.get("route_preparation")
-        expected = document_digest({
-            "publication_id": str(candidate.id),
-            "desired_spec_sha256": candidate.desired_spec_sha256,
-            "specification": candidate.desired_spec.model_dump(mode="json"),
-            "installation": installation.model_dump(mode="json"),
-        })
-        progress = manifest.get("route_last_progress_attempt", 0)
-        if (not isinstance(preparation, dict)
-                or type(preparation.get("version")) is not int or preparation["version"] != 1
-                or preparation.get("context_sha256") != expected
-                or set(preparation) - {"version", "context_sha256", "connections", "credentials",
-                                       "oauth"}
-                or any(not isinstance(preparation.get(field, {}), dict)
-                       or len(preparation.get(field, {})) > 10000
-                       for field in ("connections", "credentials", "oauth"))
-                or type(progress) is not int or not 0 <= progress <= candidate.attempt_count):
-            raise ValueError("Program migration preparation checkpoint changed")
-        credentials = manifest.get("route_credentials")
-        if "route_credentials" in manifest and (
-            not isinstance(credentials, dict) or set(credentials) != {"version", "bindings"}
-            or type(credentials.get("version")) is not int or credentials["version"] != 1
-            or not isinstance(credentials.get("bindings"), dict)
-            or len(credentials["bindings"]) > 10000
-        ):
-            raise ValueError("Program migration credential checkpoint changed")
+        _validate_preparation_checkpoint(candidate, manifest, installation)
     return {
         "recovery": ("program_migration_from_preparation" if prepared
                      else "program_migration_before_preparation"),

@@ -23,15 +23,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.metadata import distributions
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import UUID, uuid5
 from xml.etree import ElementTree as ET
 
 import httpx
 from cryptography.fernet import Fernet
+from pydantic import HttpUrl
 
-from backend.bootstrap_storage_route import FixedInstallationDescriptor
+from backend.bootstrap_storage_route import FixedInstallationDescriptor, installation_record
 from backend.services.auth_service import hash_password
 from backend.services.gateway_targets import DEFAULT_SEEDED_APIM_GATEWAY_ID
 from scripts.apim_upgrade import (
@@ -47,13 +48,18 @@ from scripts.apim_upgrade import (
     validate_upgrade_what_if,
 )
 from scripts.stage_deployment import REPOSITORY_ROOT, stage_deployment, validate_source_snapshot
+from turnstile_core.domain.budget_delegation import BudgetDelegationTarget, BudgetDelegationTrust
 from turnstile_core.domain.gateway_targets import (
     ApimOnboardingConfiguration,
     native_gateway_scope_for_capability,
     self_hosted_gateway_capability_for_tier,
 )
-from turnstile_core.domain.storage_routes import RouteScope
+from turnstile_core.domain.storage_routes import (
+    FixedProgramInstallation,
+    RouteScope,
+)
 from turnstile_core.domain.storage_routes import document_digest as route_document_digest
+from turnstile_core.integrations.apim_budget_execution import bind_budget_delegation
 from turnstile_core.integrations.apim_model_availability import compose_availability_parent
 from turnstile_core.integrations.apim_onboarding_policy import onboarding_canonical_parent
 from turnstile_core.integrations.apim_policy_components import parse_policy, serialize_policy
@@ -64,6 +70,7 @@ from turnstile_core.integrations.apim_storage_routes import (
     fixed_policy_digest,
     fixed_program_digest,
 )
+from turnstile_core.persistence.repository_support import _registered_program_installation
 
 JsonObject = dict[str, Any]
 PasswordReader = Callable[[str], str]
@@ -1145,6 +1152,27 @@ def observer_parameters(
     )
 
 
+def deployment_budget_delegation(
+    runner: CommandRunner, inputs: DeploymentInputs, outputs: Mapping[str, Any],
+) -> BudgetDelegationTrust:
+    scope = (
+        f"/subscriptions/{inputs.subscription}/resourceGroups/{inputs.resource_group_name}"
+        f"/providers/Microsoft.Web/sites/{_output_string(outputs, 'apiName')}"
+    )
+    identity = runner.run_json([
+        "az", "rest", "--subscription", inputs.subscription, "--method", "GET", "--url",
+        "https://management.azure.com" + scope
+        + "/providers/Microsoft.ManagedIdentity/identities/default?api-version=2024-11-30",
+    ])["properties"]
+    trust = BudgetDelegationTrust(
+        tenant_id=identity["tenantId"], audience="https://management.azure.com/",
+        client_ids=(identity["clientId"],), object_ids=(identity["principalId"],),
+    )
+    if str(trust.object_ids[0]) != _output_string(outputs, "apiPrincipalId"):
+        raise DeploymentError("Budget delegation API identity differs from deployment outputs")
+    return trust
+
+
 def runtime_release_parameters(
     secrets_: SecretMaterial,
     platform_outputs: Mapping[str, Any],
@@ -1153,10 +1181,31 @@ def runtime_release_parameters(
     current_control_plane_settings: Mapping[str, str],
     fixed_descriptor: Mapping[str, Any] | None = None,
     current_telemetry_settings: Mapping[str, str] | None = None,
+    delegation: BudgetDelegationTrust | None = None,
 ) -> JsonObject:
     api_settings = dict(current_api_settings)
     control_plane_settings = dict(current_control_plane_settings)
     fixed_parameters: JsonObject = {}
+    if delegation is not None:
+        target = str(fixed_descriptor["registration"]["gateway_profile_id"]) if (
+            fixed_descriptor is not None
+        ) else api_settings.get("APIM_GATEWAY_PROFILE_ID", str(DEFAULT_SEEDED_APIM_GATEWAY_ID))
+        origin = urlsplit(_output_string(platform_outputs, "gatewayApiPath"))
+        configuration = BudgetDelegationTarget(
+            audience=delegation.audience,
+            allowed_origins=(HttpUrl(f"{origin.scheme}://{origin.netloc}"),),
+        )
+        targets = json.loads(api_settings.get("BUDGET_DELEGATION_TARGETS", "{}"))
+        targets[target] = configuration.model_dump(mode="json")
+        api_settings["BUDGET_DELEGATION_TARGETS"] = json.dumps(targets)
+        for current in (api_settings, control_plane_settings):
+            selected = json.loads(current.get("BUDGET_EXECUTION_TARGET_IDS", "[]"))
+            if target not in selected:
+                selected.append(target)
+            trust = json.loads(current.get("BUDGET_DELEGATION_TRUST", "{}"))
+            trust[target] = delegation.model_dump(mode="json")
+            current["BUDGET_EXECUTION_TARGET_IDS"] = json.dumps(selected)
+            current["BUDGET_DELEGATION_TRUST"] = json.dumps(trust)
     if fixed_descriptor is not None:
         api_settings.update({
             "APIM_PROBE_SUBSCRIPTION_KEY": secrets_.values["apimProbeSubscriptionKey"],
@@ -1497,16 +1546,56 @@ def _upgrade_lock(directory: Path) -> Iterator[None]:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+def _approved_fixed_installation(
+    installed: FixedInstallationDescriptor, registration: Mapping[str, Any],
+) -> FixedProgramInstallation:
+    try:
+        initial = FixedProgramInstallation.model_validate_json(
+            json.dumps(registration["initial_installation"]),
+        )
+        if initial != installation_record(installed, initial.target_identity_sha256):
+            raise ValueError("Registered program origin differs from deployment outputs")
+        approved = _registered_program_installation(
+            registration["previous_publication_id"], initial, {
+                "fixed_route_program_upgrade": registration["registration"],
+                "fixed_route_program_upgrade_history": registration["registration_history"],
+            },
+        )
+        if approved.model_dump(mode="json") != registration["current_installation"]:
+            raise ValueError("Registered current program differs from its approval chain")
+    except (KeyError, TypeError, ValueError) as error:
+        raise DeploymentError("Installed fixed program approval chain is invalid") from error
+    return cast(FixedProgramInstallation, approved)
+
+
 def _validate_installed_fixed_program(
     current: GatewaySnapshot, installed: FixedInstallationDescriptor,
     inputs: DeploymentInputs, outputs: Mapping[str, Any],
+    delegation: BudgetDelegationTrust | None = None,
+    registration: Mapping[str, Any] | None = None,
 ) -> None:
+    approved = (
+        _approved_fixed_installation(installed, registration) if registration is not None else None
+    )
+    if delegation is not None and bind_budget_delegation(
+        current.parent_policy, delegation,
+        gateway_profile_id=installed.registration.gateway_profile_id,
+    ) != current.parent_policy:
+        raise DeploymentError("Installed fixed program delegation differs from API identity")
     core = ExistingCore.from_outputs(outputs)
     target = installed.registration
     contracts = fixed_operation_contracts(
-        installed.binding.models_path, installed.binding.messages_path,
-        installed.binding.retired_operations, decision_enabled=installed.binding.decision_enabled,
+        approved.operation_contracts["models"][1] if approved is not None
+        else installed.binding.models_path,
+        approved.operation_contracts["anthropic-messages"][1] if approved is not None
+        else installed.binding.messages_path,
+        approved.retired_operations if approved is not None
+        else installed.binding.retired_operations,
+        decision_enabled=approved.decision_enabled if approved is not None
+        else installed.binding.decision_enabled,
     )
+    if approved is not None and contracts != approved.operation_contracts:
+        raise DeploymentError("Installed fixed program approved operation contract changed")
     if (
         (str(target.subscription_id), target.resource_group.casefold(),
          target.service_name.casefold(), target.api_id)
@@ -1515,7 +1604,10 @@ def _validate_installed_fixed_program(
         or installed.api_name != _output_string(outputs, "controlPlaneFunctionName")
         or target.api_path != current.api_properties.get("path")
         or installed.binding.api_revision != current.revision
-        or fixed_policy_digest(current.parent_policy) != installed.parent_policy_sha256
+        or fixed_policy_digest(current.parent_policy) != (
+            approved.parent_policy_sha256 if approved is not None
+            else installed.parent_policy_sha256
+        )
         or set(current.operations) != set(contracts)
         or set(current.operation_policies) != set(contracts)
     ):
@@ -1527,14 +1619,18 @@ def _validate_installed_fixed_program(
         if (
             operation.get("method") != method or operation.get("urlTemplate") != path
             or operation.get("templateParameters", []) != [] or policy is None
-            or fixed_policy_digest(policy) != installed.operation_policies_sha256[name]
+            or fixed_policy_digest(policy) != (
+                approved.operation_policies_sha256[name] if approved is not None
+                else installed.operation_policies_sha256[name]
+            )
         ):
             raise DeploymentError("Installed fixed program operation changed")
         policies[name] = policy
     if fixed_program_digest(
         current.parent_policy, policies,
         tuple((name, method, path) for name, (method, path) in contracts.items()),
-    ) != installed.binding.program_sha256:
+    ) != (approved.program.program_sha256 if approved is not None
+          else installed.binding.program_sha256):
         raise DeploymentError("Installed fixed program digest changed")
 
 
@@ -1545,6 +1641,7 @@ def gateway_upgrade(
     action: str,
     *,
     assume_yes: bool = False,
+    owner_credentials: Path | None = None,
 ) -> None:
     if (
         _output_string(outputs, "resourceGroupName").casefold()
@@ -1646,7 +1743,31 @@ def gateway_upgrade(
                 ).get("TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR")
             if descriptor:
                 installed = FixedInstallationDescriptor.model_validate_json(descriptor)
-                _validate_installed_fixed_program(current, installed, inputs, outputs)
+                marker = parse_policy(current.parent_policy).find(
+                    ".//set-variable[@name='routeProgram']",
+                )
+                if (
+                    fixed_policy_digest(current.parent_policy) != installed.parent_policy_sha256
+                    and (marker is None or marker.get("value") == installed.binding.program_sha256)
+                ):
+                    raise DeploymentError("Installed fixed program parent changed without upgrade")
+                delegation = deployment_budget_delegation(runner, inputs, outputs) if (
+                    fixed_policy_digest(current.parent_policy) != installed.parent_policy_sha256
+                ) else None
+                registration = None
+                if delegation is not None:
+                    password = (
+                        owner_credentials_password(owner_credentials, inputs.owner_email)
+                        if owner_credentials is not None
+                        else getpass.getpass("Existing Owner password: ")
+                    )
+                    registration = verify_initial_fixed_program(
+                        _output_string(outputs, "apiUrl"), inputs.owner_email, password,
+                        installed.model_dump(mode="json"),
+                    )
+                _validate_installed_fixed_program(
+                    current, installed, inputs, outputs, delegation, registration,
+                )
                 return
             if plan_image_upgrade(resource_id, current, canonical).required:
                 raise DeploymentError(
@@ -1709,6 +1830,7 @@ def initialize_fixed_program(
     inputs: DeploymentInputs,
     outputs: Mapping[str, Any],
     api_settings: Mapping[str, str],
+    delegation: BudgetDelegationTrust | None = None,
 ) -> JsonObject:
     pending = outputs.get("pendingFixedBootstrap")
     template = REPOSITORY_ROOT / "infra/apim-upgrade.bicep"
@@ -1800,6 +1922,9 @@ def initialize_fixed_program(
     if snapshot is None:
         raise DeploymentError("Initial APIM API is missing")
     assert configuration is not None
+    delegation = delegation or deployment_budget_delegation(runner, inputs, outputs)
+    if delegation.tenant_id != configuration.management_tenant_id:
+        raise DeploymentError("Budget delegation API tenant differs from the Gateway tenant")
     target_id = UUID(api_settings.get(
         "APIM_GATEWAY_PROFILE_ID", str(DEFAULT_SEEDED_APIM_GATEWAY_ID),
     ))
@@ -1824,7 +1949,7 @@ def initialize_fixed_program(
     )
     canonical = (REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml").read_text()
     parent = parse_policy(compose_availability_parent(
-        onboarding_canonical_parent(snapshot.parent_policy, api_id),
+        onboarding_canonical_parent(snapshot.parent_policy, api_id, delegation=delegation),
     ))
     logger_id = parse_policy(snapshot.parent_policy).findall(".//log-to-eventhub")[0].attrib[
         "logger-id"
@@ -1845,7 +1970,7 @@ def initialize_fixed_program(
         serialize_policy(parent),
         binding,
         canonical_parent=compose_availability_parent(
-            onboarding_canonical_parent(canonical, api_id),
+            onboarding_canonical_parent(canonical, api_id, delegation=delegation),
         ),
     )
     installed = program.installation(
@@ -1899,7 +2024,7 @@ def initialize_fixed_program(
 
 def verify_initial_fixed_program(
     api_url: str, owner_email: str, owner_password: str, descriptor: Mapping[str, Any],
-) -> None:
+) -> JsonObject:
     target = descriptor["registration"]["gateway_profile_id"]
     path = f"/api/v1/model-management/gateways/{target}/program-upgrades/preview"
     deadline = time.monotonic() + 180
@@ -1922,7 +2047,23 @@ def verify_initial_fixed_program(
             while (remaining := deadline - time.monotonic()) > 0:
                 response = http.get(path, timeout=min(15, remaining))
                 if response.status_code == 200:
-                    installation = response.json()["current_installation"]
+                    preview = response.json()
+                    installation = preview["current_installation"]
+                    if installation["program"]["program_sha256"] != (
+                        descriptor["binding"]["program_sha256"]
+                    ):
+                        try:
+                            initial = FixedInstallationDescriptor.model_validate_json(
+                                json.dumps(descriptor),
+                            )
+                        except ValueError as error:
+                            raise DeploymentError(
+                                "Initial fixed program binding differs",
+                            ) from error
+                        _approved_fixed_installation(
+                            initial, preview,
+                        )
+                        installation = preview["initial_installation"]
                     if (
                         installation["program"]["program_sha256"]
                         != descriptor["binding"]["program_sha256"]
@@ -1930,7 +2071,7 @@ def verify_initial_fixed_program(
                         or installation.get("model_additions_enabled") is not True
                     ):
                         raise DeploymentError("Initial fixed program binding differs")
-                    return
+                    return cast(JsonObject, preview)
                 if response.status_code != 409:
                     response.raise_for_status()
                 time.sleep(min(3, max(0, deadline - time.monotonic())))
@@ -1966,10 +2107,15 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     if args.action in {"plan-upgrade", "upgrade", "rollback-upgrade"}:
         if saved_outputs is None:
             raise DeploymentError("An incremental upgrade requires the original deployment outputs")
-        gateway_upgrade(runner, inputs, saved_outputs, args.action, assume_yes=args.yes)
+        gateway_upgrade(
+            runner, inputs, saved_outputs, args.action, assume_yes=args.yes,
+            owner_credentials=args.owner_credentials,
+        )
         return
     if saved_outputs is not None and not pending_installation:
-        gateway_upgrade(runner, inputs, saved_outputs, "check")
+        gateway_upgrade(
+            runner, inputs, saved_outputs, "check", owner_credentials=args.owner_credentials,
+        )
     if saved_outputs is None:
         validate_flex_consumption_capabilities(runner, inputs)
         validate_postgres_capabilities(runner, inputs)
@@ -2113,9 +2259,13 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     )
     fixed_descriptor = None
     telemetry_settings = None
+    delegation = deployment_budget_delegation(runner, inputs, platform_outputs) if (
+        saved_outputs is None or pending_installation or complete_installation
+        or api_settings.get("BUDGET_EXECUTION_ENABLED", "false").casefold() == "true"
+    ) else None
     if saved_outputs is None or pending_installation or complete_installation:
         fixed_descriptor = initialize_fixed_program(
-            runner, inputs, {**platform_outputs, **observer_outputs}, api_settings,
+            runner, inputs, {**platform_outputs, **observer_outputs}, api_settings, delegation,
         )
         telemetry_settings = current_app_settings(
             runner, inputs, _output_string(platform_outputs, "telemetryFunctionName"),
@@ -2128,6 +2278,7 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         control_plane_settings,
         fixed_descriptor,
         telemetry_settings,
+        delegation,
     )
     what_if_resource_group(
         runner,

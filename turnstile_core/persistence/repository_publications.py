@@ -639,7 +639,7 @@ class PostgreSqlPublicationRepositoryMixin:
             return PostgreSqlPublicationRepositoryMixin._resume_program_migration(
                 connection, publication, created_by,
             )
-        if set(publication.get("resource_manifest") or {}) == {"model_route_addition"}:
+        if "model_route_addition" in (publication.get("resource_manifest") or {}):
             if any(value is not None for value in (
                 credential_ciphertext, desired_spec, desired_spec_sha256, image_probe_authorization,
             )):
@@ -797,8 +797,9 @@ class PostgreSqlPublicationRepositoryMixin:
                 "SELECT config FROM gateway_profile WHERE id=%s FOR SHARE",
                 (publication["gateway_profile_id"],),
             ).fetchone()
-            previous = _managed_program_publication(previous, (gateway or {}).get("config") or {})
-        detail = (_model_addition_credential_retry(publication, previous, probes["total"])
+        detail = (_model_addition_credential_retry(
+            publication, previous, probes["total"], config=(gateway or {}).get("config") or {},
+        )
             if model_addition else _program_migration_retry(publication, previous, probes["total"]))
         PostgreSqlPublicationRepositoryMixin._validate_publication_deployments(
             connection, UUID(str(publication["gateway_profile_id"])), publication["desired_spec"],

@@ -7,6 +7,7 @@ from time import time
 from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID, uuid5
+from xml.etree import ElementTree as ET
 
 import httpx
 import psycopg
@@ -25,6 +26,7 @@ from turnstile_core.domain.gateway_targets import (
 from turnstile_core.domain.storage_routes import (
     ConfigurationApproval,
     Digest,
+    FixedProgramUpgrade,
     ProgramIdentity,
     RouteSnapshot,
     canonical_document,
@@ -33,10 +35,15 @@ from turnstile_core.domain.storage_routes import (
     document_digest,
     text_digest,
 )
+from turnstile_core.integrations.apim_budget_execution import bind_budget_delegation
+from turnstile_core.integrations.apim_policy_components import parse_policy, serialize_policy
 from turnstile_core.integrations.apim_publisher_client import AzureApimPublisherClient
 from turnstile_core.integrations.apim_storage_routes import (
     FixedRouteBinding,
+    compact_fixed_policy,
     fixed_operation_contracts,
+    fixed_policy_digest,
+    fixed_program_digest,
 )
 from turnstile_core.integrations.apim_target_client_factory import (
     apim_target_client_config_resolver,
@@ -49,10 +56,12 @@ from turnstile_core.integrations.storage_route_projection import (
     TableRouteProjection,
 )
 from turnstile_core.persistence.repository import PostgreSqlOpsDbProxy
+from turnstile_core.persistence.repository_support import _registered_program_installation
 from turnstile_core.services.budget_settlement import BudgetScopeService
 from turnstile_core.services.storage_route_publisher import (
     FixedProgramInstallation,
     FixedProgramVerifier,
+    register_verified_program_upgrade,
 )
 
 
@@ -522,6 +531,82 @@ def bootstrap(descriptor: FixedInstallationDescriptor, settings: Settings) -> di
             owner.execute("SELECT pg_advisory_unlock(hashtextextended(%s,0))", (lock,))
 
 
+def configure_budget_delegation(repository: Any, settings: Settings, target_id: UUID) -> None:
+    trust = settings.budget_delegation_trust.get(target_id)
+    if trust is None:
+        return
+    previous = repository.effective_gateway_publication(target_id)
+    gateways = repository.get_gateway_profiles([target_id])
+    if previous is None or len(gateways) != 1 or gateways[0]["id"] != target_id:
+        raise RuntimeError("Budget delegation fixed installation is unavailable")
+    config = gateways[0].get("config") or {}
+    installed = _registered_program_installation(
+        str(previous["id"]), FixedProgramInstallation.model_validate_json(canonical_document(
+            previous["resource_manifest"]["fixed_route_program"],
+        )), config,
+    )
+    with httpx.Client(timeout=15, follow_redirects=False) as http:
+        management = AzureApimPublisherClient(settings, client=http)
+        path = f"/apis/{installed.program.scope.api_id};rev={installed.program.api_revision}"
+        response, parent = management._read_policy(path + "/policies/policy")
+        if fixed_policy_digest(parent) != installed.parent_policy_sha256:
+            raise RuntimeError("Budget delegation current approved parent changed")
+        candidate = bind_budget_delegation(parent, trust, gateway_profile_id=target_id)
+        if candidate == parent:
+            return
+        candidate = compact_fixed_policy(candidate)
+        if fixed_policy_digest(candidate) == installed.parent_policy_sha256:
+            return
+        operations = management.route_program_operations(installed.program.api_revision)
+        contracts = fixed_operation_contracts(
+            installed.operation_contracts["models"][1],
+            installed.operation_contracts["anthropic-messages"][1],
+            installed.retired_operations, decision_enabled=installed.decision_enabled,
+        )
+        root = parse_policy(candidate)
+        marker = root.find(".//set-variable[@name='routeProgram']")
+        if marker is None:
+            raise RuntimeError("Budget delegation program identity is missing")
+        predecessor = installed.program.program_sha256
+        legacy = installed.legacy_program_sha256 or predecessor
+        predecessors = tuple(sorted({
+            *installed.predecessor_program_sha256, predecessor,
+        } - {legacy}))
+        owner = next(node for node in root.iter() if marker in list(node))
+        for name, value in {
+            "routeLegacyProgram": legacy,
+            "routePredecessorPrograms": json.dumps(predecessors, separators=(",", ":")),
+        }.items():
+            node = root.find(f".//set-variable[@name='{name}']")
+            if node is None:
+                node = ET.Element("set-variable", {"name": name})
+                owner.insert(list(owner).index(marker), node)
+            node.set("value", value)
+        candidate = serialize_policy(root)
+        digest = fixed_program_digest(
+            candidate, {name: operation[2] for name, operation in operations.items()},
+            tuple((name, *contract) for name, contract in contracts.items()),
+        )
+        marker.set("value", digest)
+        candidate = serialize_policy(root)
+        upgrade = FixedProgramUpgrade(
+            previous_publication_id=str(previous["id"]),
+            previous_installation_sha256=document_digest(installed),
+            installation=installed.model_copy(update={
+                "program": installed.program.model_copy(update={"program_sha256": digest}),
+                "parent_policy_sha256": fixed_policy_digest(candidate),
+                "legacy_program_sha256": legacy,
+                "predecessor_program_sha256": predecessors,
+            }),
+        )
+        upgrade.require_previous(str(previous["id"]), installed)
+        register_verified_program_upgrade(
+            repository, apim_target_client_config_resolver(repository, settings),
+            upgrade, document_digest(config), parent_policy=candidate,
+            expected_parent_etag=response.headers.get("ETag"),
+        )
+
+
 def main() -> None:
     try:
         descriptor = FixedInstallationDescriptor.model_validate_json(
@@ -535,7 +620,11 @@ def main() -> None:
             scoped = apim_target_client_config_resolver(repository, settings).resolve(
                 descriptor.registration.gateway_profile_id,
             )
-            print(json.dumps(bootstrap(descriptor, scoped.settings), sort_keys=True))
+            result = bootstrap(descriptor, scoped.settings)
+            configure_budget_delegation(
+                repository, scoped.settings, descriptor.registration.gateway_profile_id,
+            )
+            print(json.dumps(result, sort_keys=True))
         finally:
             repository.close()
     except Exception as error:

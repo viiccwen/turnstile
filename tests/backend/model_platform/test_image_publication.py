@@ -273,8 +273,9 @@ def test_image_probe_journal_keeps_each_gateway_endpoint_evidence_separate() -> 
     ("queued", 1, False), ("failed", 1, True), ("failed", 31, True),
     ("failed", 32, False), ("failed", 0, False), ("failed", True, False),
 ])
+@pytest.mark.parametrize("fixed_addition", [False, True])
 def test_image_retry_capability_is_failed_only_and_bounded(
-    status: str, limit: int, available: bool
+    status: str, limit: int, available: bool, fixed_addition: bool,
 ) -> None:
     repository = InMemoryRepository()
     service = GatewayControlPlaneService(
@@ -284,11 +285,12 @@ def test_image_retry_capability_is_failed_only_and_bounded(
     publication = publication.model_copy(update={
         "status": PublicationStatus(status),
         "resource_manifest": {
-            "image_probe_authorization": {"id": str(uuid4()), "attempt_limit": limit}
+            "image_probe_authorization": {"id": str(uuid4()), "attempt_limit": limit},
+            **({"model_route_addition": {"version": 1}} if fixed_addition else {}),
         },
     })
     view = GatewayPublicationView.from_publication(publication)
-    assert view.retry_can_authorize_image_probes is available
+    assert view.retry_can_authorize_image_probes is (available and not fixed_addition)
     assert "resource_manifest" not in view.model_dump()
     assert "desired_spec" not in view.model_dump()
 

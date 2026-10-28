@@ -464,6 +464,13 @@ def publish_gateway_changes(timer: func.TimerRequest) -> None:
                 document_digest(installed.model_dump(mode="json"))
             ):
                 raise PolicyCompilationError("Fixed installation descriptor changed")
+            if settings.budget_delegation_trust.get(target_id) is not None and any(
+                profile.get("enabled") for profile in repository.get_gateway_profiles([target_id])
+            ):
+                target_config = configurations.resolve(target_id)
+                initialization.configure_budget_delegation(
+                    repository, target_config.settings, target_id,
+                )
         publisher = AzureApimPublisherClientResolver(configurations)
         cipher = CredentialCipher.from_settings(settings)
         client = resources.enter_context(httpx.Client(timeout=10.0, follow_redirects=False))

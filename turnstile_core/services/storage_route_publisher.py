@@ -1755,6 +1755,45 @@ class FixedRoutePublisherFactory:
             "installation": installation.model_dump(mode="json"),
         })
 
+    def _preparation_context(
+        self, publication: GatewayPublication, installation: FixedProgramInstallation,
+    ) -> str:
+        context = self._dependency_context(publication, installation)
+        checkpoint = publication.resource_manifest.get("route_preparation")
+        if (not isinstance(checkpoint, dict) or checkpoint.get("context_sha256") == context
+                or "model_route_addition" not in publication.resource_manifest):
+            return context
+        from ..persistence.repository_support import (
+            _approved_preparation_installations,
+            _managed_program_publication,
+        )
+
+        previous = self._repository.effective_gateway_publication(publication.gateway_profile_id)
+        gateways = self._repository.get_gateway_profiles([publication.gateway_profile_id])
+        if (previous is None or str(previous["id"]) != str(publication.base_release_id)
+                or len(gateways) != 1 or gateways[0]["id"] != publication.gateway_profile_id):
+            raise PolicyCompilationError("Route preparation effective program changed")
+        config = gateways[0].get("config") or {}
+        origin = _managed_program_publication(previous, {
+            "managed_route_program_initialization": config.get(
+                "managed_route_program_initialization",
+            ),
+        })
+        assert origin is not None
+        initial = FixedProgramInstallation.model_validate_json(canonical_document(
+            origin["resource_manifest"]["fixed_route_program"],
+        ))
+        approved, candidates = _approved_preparation_installations(
+            str(previous["id"]), initial, config,
+        )
+        if approved != installation:
+            raise PolicyCompilationError("Route preparation current program is not approved")
+        recorded = checkpoint.get("context_sha256")
+        if any(self._dependency_context(publication, candidate) == recorded
+               for candidate in candidates):
+            return str(recorded)
+        return context
+
     @staticmethod
     def _runtime_destination_matches(
         publication: GatewayPublication, binding: GatewayModelBinding,
@@ -1956,7 +1995,7 @@ class FixedRoutePublisherFactory:
             }
         }
         new_sources = {route_credential_source(binding) for binding in keyed} - previous_sources
-        context = self._dependency_context(publication, installation)
+        context = self._preparation_context(publication, installation)
         raw_preparation = publication.resource_manifest.get("route_preparation")
         if raw_preparation is not None and not isinstance(raw_preparation, dict):
             raise PolicyCompilationError("Route credential preparation is invalid")
@@ -2124,7 +2163,7 @@ class FixedRoutePublisherFactory:
             inherited[key] != value for key, value in configurations.items() if key in inherited
         ):
             raise PolicyCompilationError("Fixed route OAuth source changed without a new provider")
-        context = self._dependency_context(publication, installation)
+        context = self._preparation_context(publication, installation)
         raw = publication.resource_manifest.get("route_preparation")
         if raw is not None and not isinstance(raw, dict):
             raise PolicyCompilationError("Fixed route OAuth preparation is invalid")
@@ -2262,7 +2301,7 @@ class FixedRoutePublisherFactory:
                 if (
                     preparation is None or self._cipher is None
                     or preparation.context_sha256
-                    != self._dependency_context(publication, installation)
+                    != self._preparation_context(publication, installation)
                     or source not in preparation.credentials
                 ):
                     raise PolicyCompilationError("Route credential source intent is missing")
@@ -2527,7 +2566,7 @@ class FixedRoutePublisherFactory:
         config: ApimTargetClientConfig, management: FixedProgramManagement,
         worker_id: str, heartbeat: Callable[[], None],
     ) -> Callable[[GatewayModelBinding], tuple[ConnectionRevision, int]]:
-        context = self._dependency_context(publication, installation)
+        context = self._preparation_context(publication, installation)
         raw = publication.resource_manifest.get("route_preparation")
         if raw is not None and not isinstance(raw, dict):
             raise PolicyCompilationError("Route connection preparation checkpoint is invalid")

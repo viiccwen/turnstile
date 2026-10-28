@@ -322,6 +322,59 @@ def test_initial_fixed_program_uses_resolved_target_before_publication(
         publisher.assert_called_once_with(configurations)
 
 
+@pytest.mark.parametrize("retired", [False, True])
+def test_retired_initial_target_with_delegation_does_not_block_publisher(
+    monkeypatch: pytest.MonkeyPatch, retired: bool,
+) -> None:
+    import sys
+    from types import SimpleNamespace
+    from uuid import uuid5
+
+    from tests.backend.model_platform.test_apim_target_inventory import lifecycle_service
+    from turnstile_core.integrations.apim_control_plane_contract import PolicyCompilationError
+
+    repository, service = lifecycle_service()
+    repository.runtimes = []
+    if retired:
+        service.remove_apim_target(TARGET)
+    profile = repository.get_gateway_profiles([TARGET])[0]
+    assert profile["enabled"] is not retired
+    document = {"target": str(TARGET)}
+    repository.gateway_publications.append({
+        "id": uuid5(TARGET, "fixed-program-installation"),
+        "resource_manifest": {"installation_request_sha256": hashlib.sha256(
+            json.dumps(document, separators=(",", ":")).encode(),
+        ).hexdigest()},
+    })
+    descriptor = SimpleNamespace(
+        registration=SimpleNamespace(gateway_profile_id=TARGET),
+        model_dump=lambda **_: document,
+    )
+    initialization = SimpleNamespace(
+        FixedInstallationDescriptor=SimpleNamespace(model_validate_json=lambda _: descriptor),
+        configure_budget_delegation=MagicMock(),
+    )
+    monkeypatch.setitem(sys.modules, "bootstrap_storage_route", initialization)
+    monkeypatch.setenv("TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR", "offline-descriptor")
+    settings = Settings.model_construct(
+        control_plane_enabled=True, gateway_publication_worker_enabled=True,
+        apim_target_registry_enabled=True, budget_delegation_trust={TARGET: object()},
+    )
+    monkeypatch.setattr(function_app, "get_settings", lambda: settings)
+    monkeypatch.setattr(function_app, "create_repository", lambda *_, **__: repository)
+    publisher = MagicMock(side_effect=RuntimeError("publisher reached"))
+    monkeypatch.setattr(function_app, "AzureApimPublisherClientResolver", publisher)
+    if retired:
+        with pytest.raises(RuntimeError, match="publisher reached"):
+            function_app.publish_gateway_changes(None)
+        publisher.assert_called_once()
+    else:
+        with pytest.raises(PolicyCompilationError, match="management authentication"):
+            function_app.publish_gateway_changes(None)
+        publisher.assert_not_called()
+    initialization.configure_budget_delegation.assert_not_called()
+
+
 def test_target_mode_does_not_construct_a_global_publisher(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

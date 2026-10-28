@@ -36,17 +36,47 @@ def bootstrap_initial_apim_target(
     *,
     tenant_id: str | None = None,
 ) -> bool:
-    if repository.list_apim_targets():
-        return False
+    targets = repository.list_apim_targets()
+    if targets:
+        if not any((settings.apim_gateway_profile_id, settings.apim_resource_group,
+                settings.apim_service_name, settings.apim_gateway_url)):
+            return False
+        identity = settings.legacy_apim_identity
+        matches = [row for row in targets if (
+            settings.apim_gateway_profile_id is None
+            or str(row["gateway_profile_id"]) == str(settings.apim_gateway_profile_id)
+        ) and (
+            identity is not None and (
+                str(row.get("subscription_id")), str(row.get("resource_group")).casefold(),
+                str(row.get("service_name")).casefold(), str(row.get("api_id")).casefold(),
+            ) == identity
+            or identity is None and settings.apim_gateway_profile_id is not None
+        )]
+        if len(matches) == 1:
+            return False
+        raise ValueError(
+            "Initial APIM identity does not match exactly one of the other APIM targets",
+        )
     identity = settings.legacy_apim_identity
     gateway_url = (settings.apim_gateway_url or "").strip()
     resolved_tenant = (tenant_id or os.environ.get("AZURE_TENANT_ID") or "").strip()
-    if identity is None or not gateway_url or not resolved_tenant:
-        return False
+    required = {
+        "AZURE_SUBSCRIPTION_ID": settings.azure_subscription_id,
+        "APIM_RESOURCE_GROUP": settings.apim_resource_group,
+        "APIM_SERVICE_NAME": settings.apim_service_name,
+        "APIM_API_ID": settings.apim_api_id,
+        "APIM_GATEWAY_URL": gateway_url,
+        "AZURE_TENANT_ID": resolved_tenant,
+    }
+    missing = [name for name, value in required.items() if not (value or "").strip()]
+    if missing:
+        raise ValueError("Missing initial APIM configuration: " + ", ".join(missing))
+    if identity is None:
+        raise ValueError("AZURE_SUBSCRIPTION_ID must be a valid UUID")
     try:
         parsed_tenant = UUID(resolved_tenant)
-    except ValueError:
-        return False
+    except ValueError as error:
+        raise ValueError("AZURE_TENANT_ID must be a valid UUID") from error
     subscription_id = UUID(identity[0])
     resource_group = (settings.apim_resource_group or "").strip()
     service_name = (settings.apim_service_name or "").strip()
@@ -90,15 +120,30 @@ def main() -> int:
         finally:
             store.close()
         print("Initial Owner created." if created else "Initial Owner bootstrap skipped.")
-    if settings.database_url and settings.legacy_apim_identity and settings.apim_gateway_url:
+    registration_required = settings.apim_target_registry_enabled or any((
+        settings.apim_resource_group, settings.apim_service_name, settings.apim_gateway_url,
+    ))
+    if registration_required:
+        if not settings.database_url:
+            print(
+                "Initial APIM target bootstrap failed: DATABASE_URL is required.", file=sys.stderr,
+            )
+            return 2
         repository = PostgreSqlOpsDbProxy(settings.database_url, apim_api_id=settings.apim_api_id)
         try:
             if bootstrap_initial_apim_target(repository, settings):
                 print("Initial APIM target registered.")
+            else:
+                print("Initial APIM target bootstrap skipped: APIM targets are already registered.")
         except Exception as error:
-            print(f"Initial APIM target bootstrap skipped: {error}", file=sys.stderr)
+            print(f"Initial APIM target bootstrap failed: {error}", file=sys.stderr)
+            return 2
         finally:
             repository.close()
+    else:
+        print(
+            "Initial APIM target bootstrap skipped: automatic APIM registration is not configured.",
+        )
     return 0
 
 

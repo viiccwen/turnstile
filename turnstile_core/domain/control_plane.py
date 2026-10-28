@@ -1133,6 +1133,8 @@ def publication_materialized_named_values(
 
 
 def publication_retry_requires_credential(publication: GatewayPublication) -> bool:
+    if "model_route_addition" in publication.resource_manifest:
+        return False
     if publication.publication_kind in {
         PublicationKind.MODEL_REMOVE,
         PublicationKind.ROUTE_RECONCILE,
@@ -1356,6 +1358,7 @@ class GatewayPublicationView(StrictModel):
         )
         can_authorize_probes = (
             publication.status is PublicationStatus.FAILED
+            and "model_route_addition" not in publication.resource_manifest
             and publication.publication_kind
             in {PublicationKind.MODEL_ADD, PublicationKind.CREDENTIAL_ROTATION}
             and any(

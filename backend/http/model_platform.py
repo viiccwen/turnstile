@@ -835,6 +835,8 @@ def preview_gateway_program_upgrade(
         "current_installation_sha256": document_digest(current),
         "config_sha256": document_digest(config),
         "registration": config.get("fixed_route_program_upgrade"),
+        "initial_installation": original_installation.model_dump(mode="json"),
+        "registration_history": config.get("fixed_route_program_upgrade_history", []),
     }
 
 

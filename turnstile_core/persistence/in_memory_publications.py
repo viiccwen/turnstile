@@ -579,7 +579,7 @@ class InMemoryPublicationRepositoryMixin:
         )
         if publication["status"] != "failed":
             raise ValueError("Only a failed publication can be retried")
-        model_addition = set(publication.get("resource_manifest") or {}) == {"model_route_addition"}
+        model_addition = "model_route_addition" in (publication.get("resource_manifest") or {})
         if "fixed_route_migration" in publication.get("resource_manifest", {}) or model_addition:
             if any(value is not None for value in (
                 credential_ciphertext, desired_spec, desired_spec_sha256, image_probe_authorization,
@@ -594,10 +594,9 @@ class InMemoryPublicationRepositoryMixin:
                               and "probe_request" in item.get("detail", {}))
             if model_addition:
                 gateway = next((item for item in self.gateways if item["id"] == target), None)
-                previous = _managed_program_publication(
-                    previous, (gateway or {}).get("config") or {},
-                )
-            detail = (_model_addition_credential_retry(publication, previous, probe_count)
+            detail = (_model_addition_credential_retry(
+                publication, previous, probe_count, config=(gateway or {}).get("config") or {},
+            )
                 if model_addition else _program_migration_retry(publication, previous, probe_count))
             _validate_gateway_deployment_snapshots(
                 target, publication["desired_spec"], list(self.gateway_deployments.values()),

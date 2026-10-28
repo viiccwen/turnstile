@@ -6,7 +6,7 @@ from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 from uuid import UUID
 from xml.etree import ElementTree
 
@@ -4324,6 +4324,259 @@ def test_retry_credential_evidence_does_not_invent_a_key_for_an_unrelated_resour
     materialized = publication_materialized_named_values(publication, provisioning_completed=True)
     assert publication.desired_spec.bindings[-1].named_value_name in materialized
     assert publication.resource_manifest["named_values"] == [None, False, "unrelated-key"]
+
+
+@pytest.mark.parametrize("replacement", [None, "api_key", "oauth_client_secret", "probes"])
+def test_model_addition_recovery_capability_preserves_original_intent(
+    replacement: str | None,
+) -> None:
+    publication = GatewayControlPlaneService(InMemoryRepository()).publish(
+        external_tenant_foundry_publication(InMemoryRepository()), "unit-owner",
+    ).model_copy(update={
+        "status": PublicationStatus.FAILED, "attempt_count": 1,
+        "resource_manifest": {"model_route_addition": {"version": 1}},
+    })
+    repository = MagicMock()
+    repository.get_gateway_publication.return_value = publication.model_dump(mode="python")
+    repository.requeue_gateway_publication.return_value = publication.model_copy(
+        update={"status": PublicationStatus.QUEUED},
+    ).model_dump(mode="python")
+    service = GatewayControlPlaneService(repository)
+    view = GatewayPublicationView.from_publication(service.publication(publication.id))
+    assert view.retry_requires_credential is False
+    assert view.credential_kind is None
+    write = GatewayPublicationRetry(
+        api_key=SecretStr("unit-replacement") if replacement == "api_key" else None,
+        oauth_client_secret=SecretStr("unit-replacement")
+        if replacement == "oauth_client_secret" else None,
+        authorize_image_probes=replacement == "probes",
+    )
+    if replacement is not None:
+        with pytest.raises(ControlPlaneConflictError, match="cannot replace its intent"):
+            service.retry(publication.id, write, "unit-owner")
+        repository.requeue_gateway_publication.assert_not_called()
+    else:
+        queued = service.retry(publication.id, write, "unit-owner")
+        assert queued.id == publication.id
+        assert queued.desired_spec_sha256 == publication.desired_spec_sha256
+        assert queued.resource_manifest == publication.resource_manifest
+        assert queued.attempt_count == publication.attempt_count
+        assert queued.status is PublicationStatus.QUEUED
+        repository.requeue_gateway_publication.assert_called_once_with(
+            publication.id, "unit-owner", None,
+        )
+
+
+@pytest.mark.parametrize("fault", [
+    None, "probed", "prepared", "leased", "base", "intent", "other_error", "context", "progress",
+])
+@pytest.mark.parametrize("checkpoint", [False, True, "upgraded", "twice_upgraded"])
+def test_budget_denied_model_addition_recovers_through_real_repository(
+    fault: str | None, checkpoint: bool | str,
+) -> None:
+    from copy import deepcopy
+
+    repository = InMemoryRepository()
+    service = GatewayControlPlaneService(repository, apim_principal_id=str(UUID(int=705)))
+    request = foundry_publication()
+    request.provider = ProviderTarget(existing_id=next(
+        item["id"] for item in repository.providers if item["brand_key"] == "microsoft_foundry"
+    ))
+    previous = service.seed_legacy_publication(request, "unit-owner")
+    baseline = repository.get_gateway_publication(previous.id)
+    assert baseline is not None
+    baseline.update(status="active", resource_manifest={"fixed_route_program": {}})
+    repository.effective_gateway_releases[APIM_ID] = previous.id
+    repository.gateway_publication_outbox[0].update(status="completed")
+    binding = previous.desired_spec.bindings[-1]
+    spec = previous.desired_spec.model_copy(update={
+        "bindings": [binding.model_copy(update={
+            "runtime_id": binding.runtime_id or UUID(int=997), "routing_managed": True,
+            "model": binding.model.model_copy(update={"model_key": "unit-recovery-model"}),
+        })],
+        "discovery_models": [previous.desired_spec.discovery_models[-1].model_copy(update={
+            "id": "unit-recovery-model",
+        })],
+    })
+    payload, _ = service._release_payload(spec)
+    manifest = {"model_route_addition": {
+        "version": 1, "program_release_id": str(previous.id), "alias": "unit-recovery-model",
+    }}
+    failed = repository.create_gateway_publication(
+        APIM_ID, payload, document_digest({**manifest, "desired_spec": payload}),
+        "model_add", "unit-owner", expected_base_release_id=previous.id,
+        initial_manifest=manifest,
+    )
+    failed.update(status="failed", attempt_count=1, error_code="ValueError",
+                  error_message="Budget publication target is not enabled")
+    if checkpoint:
+        from turnstile_core.domain.storage_routes import FixedProgramUpgrade
+        from turnstile_core.integrations.apim_storage_routes import fixed_operation_contracts
+
+        contracts = fixed_operation_contracts("/v1/models", "/v1/messages", {})
+        installation = FixedProgramInstallation(
+            program=ProgramIdentity(scope=RouteScope(
+                target_id=str(APIM_ID), api_id="unit-api", gateway_id="managed",
+            ), api_revision="1", instance_id="managed", program_sha256="a" * 64,
+                trust_binding_sha256="b" * 64),
+            target_identity_sha256="c" * 64,
+            storage_endpoint="https://unitstore.table.core.windows.net", storage_table="Routes",
+            gateway_endpoint="https://unit.azure-api.net/llm",
+            publisher_subscription_id="unit-publisher",
+            parent_policy_sha256="d" * 64, operation_contracts=contracts,
+            operation_policies_sha256={name: "e" * 64 for name in contracts},
+            supported_profiles=("openai-v1", "anthropic-messages"), model_additions_enabled=True,
+        )
+        baseline["resource_manifest"]["fixed_route_program"] = installation.model_dump(mode="json")
+        failed["resource_manifest"].update({
+            "route_preparation": {
+                "version": 1,
+                "context_sha256": FixedRoutePublisherFactory._dependency_context(
+                    GatewayPublication.model_validate(failed), installation,
+                ), "connections": {}, "credentials": {},
+            },
+            "route_credentials": {"version": 1, "bindings": {
+                "f" * 64: "https://unitvault.vault.azure.net/secrets/original/" + "1" * 32,
+            }}, "route_last_progress_attempt": 1,
+        })
+        current_installation = installation
+        if checkpoint in {"upgraded", "twice_upgraded"}:
+            current_installation = installation.model_copy(update={
+                "program": installation.program.model_copy(update={"program_sha256": "9" * 64}),
+                "parent_policy_sha256": "8" * 64,
+                "legacy_program_sha256": installation.program.program_sha256,
+            })
+            upgrade = FixedProgramUpgrade(
+                previous_publication_id=str(previous.id),
+                previous_installation_sha256=document_digest(installation),
+                installation=current_installation,
+            )
+            upgrade.require_previous(str(previous.id), installation)
+            gateway = next(row for row in repository.gateways if row["id"] == APIM_ID)
+            gateway.setdefault("config", {})["fixed_route_program_upgrade"] = (
+                upgrade.model_dump(mode="json")
+            )
+            if checkpoint == "twice_upgraded":
+                gateway["config"]["fixed_route_program_upgrade_history"] = [
+                    upgrade.model_dump(mode="json"),
+                ]
+                previous_installation = current_installation
+                current_installation = current_installation.model_copy(update={
+                    "program": current_installation.program.model_copy(update={
+                        "program_sha256": "7" * 64,
+                    }), "parent_policy_sha256": "6" * 64,
+                    "predecessor_program_sha256": (previous_installation.program.program_sha256,),
+                })
+                gateway["config"]["fixed_route_program_upgrade"] = FixedProgramUpgrade(
+                    previous_publication_id=str(previous.id),
+                    previous_installation_sha256=document_digest(previous_installation),
+                    installation=current_installation,
+                ).model_dump(mode="json")
+    outbox = repository.gateway_publication_outbox[-1]
+    outbox.update(status="completed", attempts=1, lease_owner=None, lease_expires_at=None)
+    if fault == "probed":
+        repository.gateway_publication_audit.append({
+            "publication_id": failed["id"], "detail": {"probe_request": {}},
+        })
+    elif fault == "prepared":
+        failed["resource_manifest"]["route_preparation"] = {}
+    elif fault == "leased":
+        outbox["status"] = "leased"
+    elif fault == "base":
+        failed["base_release_id"] = UUID(int=998)
+    elif fault == "intent":
+        failed["desired_spec_sha256"] = "f" * 64
+    elif fault == "other_error":
+        failed["error_message"] = "Unknown outcome"
+    elif fault == "context":
+        failed["resource_manifest"].setdefault("route_preparation", {})["context_sha256"] = "f" * 64
+    elif fault == "progress":
+        failed["resource_manifest"]["route_last_progress_attempt"] = 2
+    preserved, old_outbox = deepcopy(failed), deepcopy(outbox)
+    audit = deepcopy(repository.gateway_publication_audit)
+    if fault is not None:
+        with pytest.raises(ControlPlaneConflictError):
+            service.retry(failed["id"], GatewayPublicationRetry(), "unit-recovery")
+        assert failed == preserved and outbox == old_outbox
+        assert repository.gateway_publication_audit == audit
+    else:
+        recovered = service.retry(failed["id"], GatewayPublicationRetry(), "unit-recovery")
+        assert recovered.id == failed["id"] and recovered.status is PublicationStatus.QUEUED
+        for field in ("desired_spec", "desired_spec_sha256", "resource_manifest", "base_release_id",
+                      "attempt_count", "created_by"):
+            assert failed[field] == preserved[field]
+        assert outbox["status"] == "queued" and outbox["attempts"] == old_outbox["attempts"]
+        assert repository.gateway_publication_audit[:-1] == audit
+        assert repository.gateway_publication_audit[-1]["actor"] == "unit-recovery"
+        if checkpoint:
+            factory = FixedRoutePublisherFactory(
+                repository, MagicMock(), active_fence=MagicMock(),
+                availability_projector=MagicMock(), clock=lambda: 101,
+            )
+            configuration, management = MagicMock(), MagicMock()
+            configuration.settings.apim_usage_observer_url = None
+            management.prepare_route_connection.side_effect = (
+                lambda connection, persist, **kwargs: connection.dependency_sha256
+            )
+            preparer = factory._connection_preparer(
+                recovered, current_installation, configuration, management,
+                "unit-worker", lambda: None,
+            )
+            connection, issued = preparer(recovered.desired_spec.bindings[0])
+            assert connection.scope == current_installation.program.scope and issued == 101
+            management.prepare_route_connection.assert_called_once()
+            assert recovered.resource_manifest == preserved["resource_manifest"]
+            unregistered = current_installation.model_copy(update={
+                "program": current_installation.program.model_copy(update={
+                    "program_sha256": "5" * 64,
+                }),
+            })
+            with pytest.raises(PolicyCompilationError, match="not approved"):
+                factory._connection_preparer(
+                    recovered, unregistered, configuration, management,
+                    "unit-worker", lambda: None,
+                )
+        from turnstile_core.persistence.repository_publications import (
+            PostgreSqlPublicationRepositoryMixin,
+        )
+
+        statements: list[tuple[str, Any]] = []
+
+        def execute_sql(statement: str, parameters: Any) -> Mock:
+            sql = " ".join(statement.split())
+            statements.append((sql, parameters))
+            if sql.startswith("SELECT publication.*"):
+                return Mock(fetchone=lambda: baseline)
+            if sql.startswith("SELECT count(*)"):
+                return Mock(fetchone=lambda: {"total": 0})
+            if sql.startswith("SELECT config"):
+                return Mock(fetchone=lambda: {"config": (
+                    repository.get_gateway_profiles([APIM_ID])[0].get("config") or {}
+                )})
+            if sql.startswith("SELECT id, apim_target_id"):
+                return Mock(fetchall=lambda: list(repository.gateway_deployments.values()))
+            if sql.startswith("SELECT id FROM gateway_publication"):
+                return Mock(fetchone=lambda: None)
+            if sql.startswith("SELECT * FROM gateway_publication_outbox"):
+                return Mock(fetchone=lambda: old_outbox)
+            if sql.startswith("UPDATE gateway_publication SET"):
+                return Mock(fetchone=lambda: failed)
+            return Mock()
+
+        connection = Mock(execute=execute_sql)
+        sql_recovered = PostgreSqlPublicationRepositoryMixin._requeue_gateway_publication(
+            connection, preserved, "unit-recovery", None,
+        )
+        assert sql_recovered["id"] == preserved["id"]
+        updates = [sql for sql, _ in statements if sql.startswith("UPDATE")]
+        assert len(updates) == 2
+        assert all(not any(field in sql for field in (
+            "attempt_count", "attempts=", "resource_manifest", "desired_spec", "created_by",
+        )) for sql in updates)
+        assert not any(sql.startswith("DELETE") for sql, _ in statements)
+        assert statements[-1][1][2].obj["manifest_sha256"] == document_digest(
+            preserved["resource_manifest"],
+        )
 
 
 def test_retry_credential_evidence_is_bound_and_missing_overrides_old_success() -> None:

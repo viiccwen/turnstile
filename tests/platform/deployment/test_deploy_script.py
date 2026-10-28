@@ -430,6 +430,7 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     ])
     for name in (
         "require_prerequisites", "validate_source_snapshot", "gateway_upgrade",
+        "deployment_budget_delegation",
         "validate_flex_consumption_capabilities", "validate_postgres_capabilities",
         "_confirm_deployment", "what_if", "what_if_resource_group", "wait_for_health",
         "wait_for_observer_health", "verify_frontend_asset", "verify_owner_login",
@@ -641,13 +642,17 @@ def test_initial_fixed_program_binds_compiled_policies_before_registration(
     monkeypatch: pytest.MonkeyPatch,
     installation_fails: bool,
 ) -> None:
+    from uuid import UUID
+
     from backend.bootstrap_storage_route import FixedInstallationDescriptor
     from scripts.apim_upgrade import GatewaySnapshot
     from tests.backend.model_platform.test_apim_onboarding import (
         onboarding_configuration,
         onboarding_plan,
     )
+    from turnstile_core.domain.budget_delegation import BudgetDelegationTrust
     from turnstile_core.integrations.apim_onboarding_policy import _render_onboarding_parent
+    from turnstile_core.integrations.apim_policy_components import parse_policy
     from turnstile_core.integrations.apim_storage_routes import fixed_policy_digest
 
     configuration = onboarding_configuration()
@@ -660,6 +665,7 @@ def test_initial_fixed_program_binds_compiled_policies_before_registration(
     outputs = {
         "resourceGroupName": inputs.resource_group_name,
         "apiName": "api-test",
+        "apiPrincipalId": "00000000-0000-4000-8000-000000000091",
         "controlPlaneFunctionName": "control-test",
         "telemetryFunctionName": "telemetry-test",
         "apimName": request.service_name,
@@ -713,7 +719,12 @@ def test_initial_fixed_program_binds_compiled_policies_before_registration(
     monkeypatch.setattr("scripts.deploy.what_if", preview)
     monkeypatch.setattr("scripts.deploy.deploy_template", apply)
     runner = Mock(spec=CommandRunner)
-    runner.run_json.return_value = {"accessToken": "offline-token"}
+    runner.run_json.side_effect = lambda command: (
+        {"properties": {"clientId": "00000000-0000-4000-8000-000000000092",
+         "principalId": outputs["apiPrincipalId"],
+         "tenantId": str(configuration.management_tenant_id)}}
+        if "rest" in command else {"accessToken": "offline-token"}
+    )
 
     if installation_fails:
         with pytest.raises(DeploymentError, match="ARM installation failed"):
@@ -743,6 +754,24 @@ def test_initial_fixed_program_binds_compiled_policies_before_registration(
     assert descriptor.registration.probe_subscription_id == request.probe_subscription_id
     assert descriptor.api_name == "control-test"
     assert descriptor.expected_server == "unit-server.postgres.database.azure.com"
+    parent = parse_policy(parameters["parentPolicy"]["value"])
+    delegation = parent.find(
+        ".//validate-azure-ad-token[@header-name='x-turnstile-delegation-token']",
+    )
+    assert delegation is not None
+    assert delegation.attrib["tenant-id"] == str(configuration.management_tenant_id)
+    assert delegation.findtext("client-application-ids/application-id") == (
+        "00000000-0000-4000-8000-000000000092"
+    )
+    assert delegation.findtext("required-claims/claim[@name='oid']/value") == (
+        outputs["apiPrincipalId"]
+    )
+    trust = BudgetDelegationTrust(
+        tenant_id=configuration.management_tenant_id,
+        audience="https://management.azure.com/",
+        client_ids=(UUID("00000000-0000-4000-8000-000000000092"),),
+        object_ids=(UUID(outputs["apiPrincipalId"]),),
+    )
 
     runtime = runtime_release_parameters(
         SecretMaterial(
@@ -757,6 +786,7 @@ def test_initial_fixed_program_binds_compiled_policies_before_registration(
         {"keep": "publisher"},
         descriptor.model_dump(mode="json"),
         {"keep": "telemetry"},
+        trust,
     )["parameters"]
     assert "TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR" not in runtime["currentApiSettings"]["value"]
     publisher = runtime["currentControlPlaneSettings"]["value"]
@@ -764,6 +794,17 @@ def test_initial_fixed_program_binds_compiled_policies_before_registration(
         descriptor.model_dump(mode="json")
     )
     assert publisher["keep"] == "publisher"
+    api = runtime["currentApiSettings"]["value"]
+    target_id = str(request.gateway_profile_id)
+    assert json.loads(api["BUDGET_DELEGATION_TARGETS"])[target_id] == {
+        "audience": trust.audience,
+        "allowed_origins": [f"https://{request.service_name}.azure-api.net/"],
+    }
+    for current in (api, publisher):
+        assert json.loads(current["BUDGET_EXECUTION_TARGET_IDS"]) == [target_id]
+        assert json.loads(current["BUDGET_DELEGATION_TRUST"]) == {
+            target_id: trust.model_dump(mode="json"),
+        }
     assert runtime["currentTelemetrySettings"]["value"] == {
         "keep": "telemetry",
         "BUDGET_EXECUTION_ENABLED": "true",
@@ -846,6 +887,176 @@ def test_new_fixed_program_can_be_redeployed_without_policy_writes(
         deploy.gateway_upgrade(runner, inputs, outputs, "check")
     writes.assert_not_called()
     assert runner.run_json.call_count == 1
+
+
+@pytest.mark.parametrize("phase", ["complete", "missing", "changed_target"])
+def test_existing_program_delegation_uses_guarded_cutover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    from fastapi import Response
+
+    from backend import bootstrap_storage_route as bootstrap
+    from backend.http.model_platform import preview_gateway_program_upgrade
+    from scripts import deploy
+    from scripts.apim_upgrade import GatewaySnapshot
+    from turnstile_core.config import Settings
+    from turnstile_core.integrations.apim_budget_execution import bind_budget_delegation
+    from turnstile_core.integrations.apim_policy_components import parse_policy, serialize_policy
+    from turnstile_core.integrations.apim_storage_routes import (
+        compact_fixed_policy,
+        fixed_policy_digest,
+        fixed_program_digest,
+    )
+    from turnstile_core.services.storage_route_publisher import _validate_program_cutover
+
+    runtime = Mock(wraps=runtime_release_parameters)
+    monkeypatch.setattr(sys.modules[__name__], "runtime_release_parameters", runtime)
+    with monkeypatch.context() as initialization:
+        test_initial_fixed_program_binds_compiled_policies_before_registration(
+            tmp_path, initialization, False,
+        )
+        descriptor = bootstrap.FixedInstallationDescriptor.model_validate_json(
+            json.dumps(runtime.call_args.args[5]),
+        )
+        inputs = cast(Mock, deploy.deploy_template).call_args.args[1]
+        parameters = cast(Mock, deploy.deploy_template).call_args.args[3]["parameters"]
+        outputs = runtime.call_args.args[1]
+        parent = parameters["parentPolicy"]["value"]
+        trust = runtime.call_args.args[7]
+    policies = {item["name"]: item["policy"]
+                for item in parameters["fixedOperations"]["value"]}
+    installed = bootstrap.installation_record(descriptor, "a" * 64)
+    if phase != "complete":
+        parent = compact_fixed_policy(bind_budget_delegation(
+            parent, None, gateway_profile_id=descriptor.registration.gateway_profile_id,
+        ))
+        contracts = tuple(
+            (name, *contract) for name, contract in installed.operation_contracts.items()
+        )
+        digest = fixed_program_digest(parent, policies, contracts)
+        root = parse_policy(parent)
+        marker = root.find(".//set-variable[@name='routeProgram']")
+        assert marker is not None
+        marker.set("value", digest)
+        parent = serialize_policy(root)
+        installed = installed.model_copy(update={
+            "program": installed.program.model_copy(update={"program_sha256": digest}),
+            "parent_policy_sha256": fixed_policy_digest(parent),
+        })
+    if phase == "changed_target":
+        parent = parent.replace('name="routeTrust"', 'name="changedTrust"')
+    repository = Mock()
+    target_id = descriptor.registration.gateway_profile_id
+    publication_id = "00000000-0000-4000-8000-000000000093"
+    repository.effective_gateway_publication.return_value = {
+        "id": publication_id, "resource_manifest": {"fixed_route_program": installed.model_dump()},
+    }
+    repository.get_gateway_profiles.return_value = [{"id": target_id, "config": {}}]
+    management = Mock()
+    management._read_policy.return_value = (
+        httpx.Response(200, headers={"ETag": '"unit-etag"'}), parent,
+    )
+    management.route_program_operations.return_value = {
+        name: (*contract, policies[name])
+        for name, contract in installed.operation_contracts.items()
+    }
+    monkeypatch.setattr(bootstrap, "AzureApimPublisherClient", Mock(return_value=management))
+    register = Mock()
+    monkeypatch.setattr(bootstrap, "register_verified_program_upgrade", register)
+    settings = Settings.model_construct(budget_delegation_trust={target_id: trust})
+    if phase == "changed_target":
+        with pytest.raises(RuntimeError, match="approved parent changed"):
+            bootstrap.configure_budget_delegation(repository, settings, target_id)
+        register.assert_not_called()
+    else:
+        bootstrap.configure_budget_delegation(repository, settings, target_id)
+        if phase == "complete":
+            register.assert_not_called()
+        else:
+            upgrade = register.call_args.args[2]
+            upgrade.require_previous(publication_id, installed)
+            assert upgrade.installation.program.scope == installed.program.scope
+            assert upgrade.installation.operation_policies_sha256 == (
+                installed.operation_policies_sha256
+            )
+            assert register.call_args.kwargs["expected_parent_etag"] == '"unit-etag"'
+            policy = parse_policy(register.call_args.kwargs["parent_policy"])
+            assert policy.find(
+                ".//validate-azure-ad-token[@header-name='x-turnstile-delegation-token']",
+            ) is not None
+            legacy = policy.find(".//set-variable[@name='routeLegacyProgram']")
+            assert legacy is not None
+            assert legacy.get("value") == installed.program.program_sha256
+            _validate_program_cutover(
+                register.call_args.kwargs["parent_policy"], installed, upgrade.installation,
+                cast(Any, SimpleNamespace(gateway_profile_id=target_id, settings=SimpleNamespace(
+                    ledger_table_endpoint=descriptor.binding.ledger_table_endpoint,
+                    ledger_table_name=descriptor.binding.ledger_table_name,
+                ))), management,
+            )
+            original = descriptor.model_copy(update={
+                "binding": descriptor.binding.model_copy(update={
+                    "program_sha256": installed.program.program_sha256,
+                }),
+                "parent_policy_sha256": installed.parent_policy_sha256,
+            })
+            repository.get_gateway_profiles.return_value = [{
+                "id": target_id, "config": {
+                    "fixed_route_program_upgrade": upgrade.model_dump(mode="json"),
+                },
+            }]
+            registration = preview_gateway_program_upgrade(
+                target_id, repository, "unit-owner", Response(),
+            )
+            for tampered in (
+                None, "behavior", "legacy", "predecessor", "unregistered", "approval_history",
+                "unbound_current",
+            ):
+                candidate = parse_policy(register.call_args.kwargs["parent_policy"])
+                approval = json.loads(json.dumps(registration))
+                if tampered == "behavior":
+                    granted = candidate.find(
+                        ".//set-variable[@name='budgetDelegatedPerson'][@value='@(true)']",
+                    )
+                    assert granted is not None
+                    granted.set("value", "@(false)")
+                elif tampered in {"legacy", "predecessor"}:
+                    name = (
+                        "routeLegacyProgram" if tampered == "legacy" else "routePredecessorPrograms"
+                    )
+                    history = candidate.find(f".//set-variable[@name='{name}']")
+                    assert history is not None
+                    history.set("value", "f" * 64 if tampered == "legacy"
+                                else json.dumps(["f" * 64]))
+                elif tampered == "unregistered":
+                    approval = None
+                elif tampered == "approval_history":
+                    approval["registration"]["installation"]["legacy_program_sha256"] = "f" * 64
+                elif tampered == "unbound_current":
+                    approval["current_installation"]["legacy_program_sha256"] = "f" * 64
+                program_marker = candidate.find(".//set-variable[@name='routeProgram']")
+                assert program_marker is not None
+                program_marker.set("value", fixed_program_digest(
+                    serialize_policy(candidate), policies, contracts,
+                ))
+                snapshot = GatewaySnapshot(
+                    descriptor.binding.api_revision, parameters["apiProperties"]["value"],
+                    serialize_policy(candidate),
+                    {item["name"]: {"method": item["method"], "urlTemplate": item["path"]}
+                     for item in parameters["fixedOperations"]["value"]}, policies,
+                )
+                if tampered:
+                    with pytest.raises(DeploymentError):
+                        deploy._validate_installed_fixed_program(
+                            snapshot, original, inputs, outputs, trust, approval,
+                        )
+                else:
+                    deploy._validate_installed_fixed_program(
+                        snapshot, original, inputs, outputs, trust, approval,
+                    )
 
 
 @pytest.mark.parametrize("phase", ["complete", "failed", "running", "changed_target"])

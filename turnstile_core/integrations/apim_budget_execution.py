@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from copy import deepcopy
+from uuid import UUID
 from xml.etree import ElementTree as ET
 
 from ..domain.budget_delegation import BudgetDelegationTrust
@@ -11,6 +12,7 @@ from ..domain.image_profiles import ImageGenerationProfile
 from .apim_control_plane_contract import PolicyCompilationError
 from .apim_policy_components import (
   TEXT_CONDITION,
+  component_digest,
   parse_policy,
   serialize_policy,
   validate_parent_policy,
@@ -2109,6 +2111,75 @@ def _completion() -> ET.Element:
     return root
 
 
+def _delegation_validation(branch: ET.Element, trust: BudgetDelegationTrust | None) -> None:
+  if trust is None:
+    _deny(branch, "@(true)", "budget_delegation_unavailable")
+    return
+  _deny(
+    branch,
+    '@(context.Subscription == null || !string.IsNullOrWhiteSpace(context.Request.Headers.GetValueOrDefault("Authorization", "")))',
+    "budget_delegation_invalid",
+  )
+  validation = ET.SubElement(branch, "validate-azure-ad-token", {
+    "tenant-id": str(trust.tenant_id), "header-name": "x-turnstile-delegation-token",
+    "output-token-variable-name": "budgetDelegationToken",
+    "failed-validation-httpcode": "401",
+    "failed-validation-error-message": "A registered backend identity is required",
+  })
+  clients = ET.SubElement(validation, "client-application-ids")
+  for client_id in trust.client_ids:
+    ET.SubElement(clients, "application-id").text = str(client_id)
+  ET.SubElement(ET.SubElement(validation, "audiences"), "audience").text = trust.audience
+  claims = ET.SubElement(
+    ET.SubElement(validation, "required-claims"), "claim", {"name": "oid", "match": "any"},
+  )
+  for object_id in trust.object_ids:
+    ET.SubElement(claims, "value").text = str(object_id)
+  _deny(branch, """@{
+    var person = context.Request.Headers.GetValueOrDefault("x-user-id", "");
+    return string.IsNullOrWhiteSpace(person) || person == "unattributed" || person.Length > 255
+    || person.Any(character => char.IsControl(character));
+  }""", "budget_delegation_invalid")
+  _variable(branch, "budgetDelegatedPerson", "@(true)")
+
+
+def bind_budget_delegation(
+  source: str, trust: BudgetDelegationTrust | None, *, gateway_profile_id: UUID,
+) -> str:
+  root = parse_policy(source)
+  branches = [branch for branch in root.findall("./inbound/choose/when") if (
+    branch.get("condition") == '@((bool)context.Variables["budgetDelegationPresented"])'
+  )]
+  if len(branches) != 1:
+    raise PolicyCompilationError("Budget delegation requires one existing validation branch")
+  branch = branches[0]
+  loggers = {node.get("logger-id", "") for node in root.iter("log-to-eventhub")}
+  if len(loggers) != 1 or not next(iter(loggers)):
+    raise PolicyCompilationError("Budget delegation logger identity is ambiguous")
+  expected = ET.Element("when", {
+    "condition": '@((bool)context.Variables["budgetDelegationPresented"])',
+  })
+  _delegation_validation(expected, trust)
+  for node in expected.iter():
+    for marker, value in {
+      "__GATEWAY_PROFILE_ID__": str(gateway_profile_id),
+      "__LOGGER_ID__": next(iter(loggers)),
+    }.items():
+      for name, content in node.attrib.items():
+        node.set(name, content.replace(marker, value))
+      if node.text:
+        node.text = node.text.replace(marker, value)
+  if component_digest(branch, normalize_text_defaults=False) == component_digest(
+    expected, normalize_text_defaults=False,
+  ):
+    return source
+  owner = next(node for node in root.iter() if branch in list(node))
+  index = list(owner).index(branch)
+  owner.remove(branch)
+  owner.insert(index, expected)
+  return serialize_policy(root)
+
+
 def _delegation(inbound: ET.Element, trust: BudgetDelegationTrust | None) -> None:
     marker = inbound.find("set-variable[@name='hasEmployeeToken']")
     employee = inbound.find("./choose/when/validate-azure-ad-token")
@@ -2131,53 +2202,16 @@ def _delegation(inbound: ET.Element, trust: BudgetDelegationTrust | None) -> Non
     branch = ET.SubElement(
         choose, "when", {"condition": '@((bool)context.Variables["budgetDelegationPresented"])'}
     )
-    if trust is None:
-        _deny(branch, "@(true)", "budget_delegation_unavailable")
-    else:
-        _deny(
-            branch,
-            '@(context.Subscription == null || !string.IsNullOrWhiteSpace(context.Request.Headers.GetValueOrDefault("Authorization", "")))',
-            "budget_delegation_invalid",
-        )
-        validation = ET.SubElement(
-            branch,
-            "validate-azure-ad-token",
-            {
-                "tenant-id": str(trust.tenant_id),
-                "header-name": "x-turnstile-delegation-token",
-                "output-token-variable-name": "budgetDelegationToken",
-                "failed-validation-httpcode": "401",
-                "failed-validation-error-message": "A registered backend identity is required",
-            },
-        )
-        clients = ET.SubElement(validation, "client-application-ids")
-        for client_id in trust.client_ids:
-            ET.SubElement(clients, "application-id").text = str(client_id)
-        ET.SubElement(ET.SubElement(validation, "audiences"), "audience").text = trust.audience
-        claims = ET.SubElement(
-            ET.SubElement(validation, "required-claims"), "claim", {"name": "oid", "match": "any"}
-        )
-        for object_id in trust.object_ids:
-            ET.SubElement(claims, "value").text = str(object_id)
-        _deny(
-            branch,
-            """@{
-      var person = context.Request.Headers.GetValueOrDefault("x-user-id", "");
-      return string.IsNullOrWhiteSpace(person) || person == "unattributed" || person.Length > 255
-      || person.Any(character => char.IsControl(character));
-    }""",
-            "budget_delegation_invalid",
-        )
-        _variable(branch, "budgetDelegatedPerson", "@(true)")
+    _delegation_validation(branch, trust)
     inbound.insert(list(inbound).index(marker), choose)
     marker.set(
-        "value", '@((bool)context.Variables["budgetDelegatedPerson"] || ' + original[2:-1] + ")"
+      "value", '@((bool)context.Variables["budgetDelegatedPerson"] || ' + original[2:-1] + ")"
     )
     index = list(employee_parent).index(employee)
     employee_parent.remove(employee)
     normal = ET.Element("choose")
     ET.SubElement(
-        normal, "when", {"condition": '@(!(bool)context.Variables["budgetDelegatedPerson"])'}
+      normal, "when", {"condition": '@(!(bool)context.Variables["budgetDelegatedPerson"])'}
     ).append(employee)
     employee_parent.insert(index, normal)
     delegated_fields = {
