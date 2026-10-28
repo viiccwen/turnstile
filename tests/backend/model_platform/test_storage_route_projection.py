@@ -4182,11 +4182,16 @@ def test_program_upgrade_registration_verifies_native_state_before_conditional_w
     for complete, decision in ((False, False), (True, False), (True, True))
     for fault in (None, "etag", "bytes", "old-proof", "native", "pending-pg", "config-pg",
                   "operation-etag")
-] + [(True, True, "parent-readback")])
+] + [(True, True, "parent-readback")] + [
+    (False, False, state) for state in (
+        "written", "xml-normalized", "foreign-parent", "post-put-verifier", "written-expired",
+    )
+])
 def test_program_upgrade_cutover_holds_proof_guard_until_registration(
     monkeypatch: pytest.MonkeyPatch, fault: str | None, complete_operations: bool, decision: bool,
 ) -> None:
     from contextlib import contextmanager, nullcontext
+    from xml.etree import ElementTree as ET
 
     from pydantic import SecretStr
 
@@ -4210,16 +4215,19 @@ def test_program_upgrade_cutover_holds_proof_guard_until_registration(
     snapshot, program, proof = snapshot_fixture()
     target = UUID(program.scope.target_id)
     head = ActiveRouteHead(approval=snapshot.approval, activated_epoch=1100)
+    old_parent = "<policies><inbound><base /></inbound></policies>"
     previous = FixedProgramInstallation(
         program=program, target_identity_sha256="b" * 64,
         storage_endpoint="https://unitstore.table.core.windows.net", storage_table="Routes",
         gateway_endpoint="https://unit.azure-api.net/llm",
         publisher_subscription_id="unit-publisher",
-        parent_policy_sha256="a" * 64, operation_policies_sha256={"models": "c" * 64},
+        parent_policy_sha256=fixed_policy_digest(old_parent),
+        operation_policies_sha256={"models": "c" * 64},
         operation_contracts={"models": ("GET", "/models")}, supported_profiles=("openai-v1",),
     )
     parent = (
-        '<policies><inbound><set-variable name="routeProgram" value="new" /></inbound></policies>'
+        '<policies><inbound><set-variable name="routeProgram" '
+        'value="@{\n return &quot;new&quot;;\n}" /></inbound></policies>'
     )
     upgrade = FixedProgramUpgrade(
         previous_publication_id=str(UUID(int=75)),
@@ -4276,6 +4284,11 @@ def test_program_upgrade_cutover_holds_proof_guard_until_registration(
         if method == "PUT":
             events.append("operation-put" if "/operations/" in args[0] else "parent-put")
             assert kwargs["extra_headers"] == {"If-Match": '"original"'}
+            if "/operations/" not in args[0]:
+                uploaded = ET.fromstring(kwargs["json_body"]["properties"]["value"])
+                assert fixed_policy_digest(ET.tostring(uploaded, encoding="unicode")) == (
+                    fixed_policy_digest(parent)
+                )
             return Mock(status_code=200)
         if method == "GET":
             assert decision and "/operations/" not in args[0]
@@ -4291,6 +4304,14 @@ def test_program_upgrade_cutover_holds_proof_guard_until_registration(
 
     management._request.side_effect = request
     management._policy_response_value.return_value = parent
+    native_parent = parent if fault in {"written", "written-expired"} else (
+        ET.tostring(ET.fromstring(parent), encoding="unicode") if fault == "xml-normalized"
+        else "<policies><inbound><base /><return-response /></inbound></policies>"
+        if fault == "foreign-parent" else old_parent
+    )
+    management._read_policy.return_value = (
+        Mock(status_code=200, headers={"ETag": '"original"'}), native_parent,
+    )
     management.ensure_operation.side_effect = lambda *args, **options: (
         events.append("operation-create") if options == {"create_only": True} else pytest.fail()
     )
@@ -4299,7 +4320,10 @@ def test_program_upgrade_cutover_holds_proof_guard_until_registration(
     )
     fresh = proof.model_copy(update={"identity": upgrade.installation.program})
     projection.read_program_proof.side_effect = [
-        None if fault == "old-proof" else (proof, 'W/"old"'), (fresh, 'W/"new"'),
+        None if fault == "old-proof" else (
+            proof.model_copy(update={"expires_epoch": 1100}) if fault == "written-expired"
+            else proof, 'W/"old"'
+        ), (fresh, 'W/"new"'),
     ]
     projection.read_active.return_value = (head, 'W/"head"')
     projection.publish_upgraded_program_proof.side_effect = lambda *args: events.append("proof-put")
@@ -4344,6 +4368,8 @@ def test_program_upgrade_cutover_holds_proof_guard_until_registration(
     )
     prior_verifier, next_verifier = Mock(), Mock()
     next_verifier.verify.return_value = fresh
+    if fault == "post-put-verifier":
+        next_verifier.verify.side_effect = ValueError("Injected post-write validation failure")
     if fault == "native":
         prior_verifier.verify.side_effect = ValueError("Original native program changed")
     monkeypatch.setattr(module, "AzureApimPublisherClient", Mock(return_value=management))
@@ -4365,22 +4391,27 @@ def test_program_upgrade_cutover_holds_proof_guard_until_registration(
             if complete_operations else None,
         )
 
-    if fault and (fault != "operation-etag" or complete_operations):
+    recovering = fault in {"written", "xml-normalized", "written-expired"}
+    if fault and not recovering and (fault != "operation-etag" or complete_operations):
         with pytest.raises(ValueError):
             cutover()
         assert not {"operation-put", "operation-create", "new-policy-put", "registration"} & set(
             events,
         )
-        assert ("parent-put" in events) is (fault == "parent-readback")
+        assert ("parent-put" in events) is (fault in {"parent-readback", "post-put-verifier"})
     else:
         cutover()
         assert events == [
             "guard-enter", "database-enter", *(["parent-put", "parent-read"] if decision else []),
             *(["operation-put"] if complete_operations else []),
-            *(["operation-create", "new-policy-put"] if decision else ["parent-put"]),
+            *(["operation-create", "new-policy-put"] if decision else (
+                [] if fault in {"written", "written-expired"} else ["parent-put"]
+            )),
             "proof-put", "registration",
             "database-exit", "guard-exit",
         ]
+        if recovering:
+            prior_verifier.verify.assert_not_called()
     assert events[0] == "guard-enter" and events[-1] == "guard-exit"
 
 

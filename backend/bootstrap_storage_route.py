@@ -549,13 +549,27 @@ def configure_budget_delegation(repository: Any, settings: Settings, target_id: 
         management = AzureApimPublisherClient(settings, client=http)
         path = f"/apis/{installed.program.scope.api_id};rev={installed.program.api_revision}"
         response, parent = management._read_policy(path + "/policies/policy")
-        if fixed_policy_digest(parent) != installed.parent_policy_sha256:
-            raise RuntimeError("Budget delegation current approved parent changed")
+        native_digest = fixed_policy_digest(parent)
+        recovering = native_digest != installed.parent_policy_sha256
+        checkpoint = config.get("budget_delegation_cutover")
+        if recovering:
+            if (not isinstance(checkpoint, dict)
+                    or checkpoint.get("previous_publication_id") != str(previous["id"])
+                    or checkpoint.get("previous_installation_sha256") != document_digest(installed)
+                    or not isinstance(checkpoint.get("parent_policy"), str)
+                    or fixed_policy_digest(checkpoint["parent_policy"])
+                    != installed.parent_policy_sha256):
+                raise RuntimeError("Budget delegation current approved parent changed")
+            parent = checkpoint["parent_policy"]
         candidate = bind_budget_delegation(parent, trust, gateway_profile_id=target_id)
         if candidate == parent:
+            if recovering:
+                raise RuntimeError("Budget delegation current approved parent changed")
             return
         candidate = compact_fixed_policy(candidate)
         if fixed_policy_digest(candidate) == installed.parent_policy_sha256:
+            if recovering:
+                raise RuntimeError("Budget delegation current approved parent changed")
             return
         operations = management.route_program_operations(installed.program.api_revision)
         contracts = fixed_operation_contracts(
@@ -600,6 +614,30 @@ def configure_budget_delegation(repository: Any, settings: Settings, target_id: 
             }),
         )
         upgrade.require_previous(str(previous["id"]), installed)
+        pending = {
+            "previous_publication_id": str(previous["id"]),
+            "previous_installation_sha256": document_digest(installed),
+            "parent_policy": parent,
+            "candidate_parent_policy_sha256": upgrade.installation.parent_policy_sha256,
+        }
+        if recovering:
+            normalized = ET.tostring(ET.fromstring(candidate), encoding="unicode")
+            if (checkpoint != pending or native_digest not in {
+                upgrade.installation.parent_policy_sha256, fixed_policy_digest(normalized),
+            }):
+                raise RuntimeError("Budget delegation current approved parent changed")
+        elif checkpoint != pending:
+            updated = {**config, "budget_delegation_cutover": pending}
+            with repository._connection() as connection, connection.transaction():
+                saved = connection.execute(
+                    """UPDATE gateway_profile SET config = %s, updated_at = now()
+                       WHERE id = %s AND enabled AND implementation = 'apim'
+                       AND config = %s RETURNING id""",
+                    (Jsonb(updated), target_id, Jsonb(config)),
+                ).fetchone()
+                if saved is None:
+                    raise RuntimeError("Budget delegation Gateway configuration changed")
+            config = updated
         register_verified_program_upgrade(
             repository, apim_target_client_config_resolver(repository, settings),
             upgrade, document_digest(config), parent_policy=candidate,

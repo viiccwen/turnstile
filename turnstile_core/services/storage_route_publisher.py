@@ -13,6 +13,7 @@ from time import monotonic, time
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid5
+from xml.etree import ElementTree as ET
 
 import httpx
 from pydantic import Field, SecretStr
@@ -401,15 +402,50 @@ def register_verified_program_upgrade(
                     assert parent_policy is not None
                     if fixed_policy_digest(parent_policy) != installed.parent_policy_sha256:
                         raise PolicyCompilationError("Program cutover parent bytes changed")
+                    path = "/apis/" + quote(installed.program.scope.api_id, safe="")
+                    path += ";rev=" + quote(installed.program.api_revision, safe="")
+                    path += "/policies/policy"
+                    native_response, native_parent = management._read_policy(path)
+                    if (native_response.status_code != 200
+                            or native_response.headers.get("ETag") != expected_parent_etag):
+                        raise PolicyCompilationError(
+                            "Program cutover native parent version changed",
+                        )
+                    native_digest = fixed_policy_digest(native_parent)
+                    candidate_written = native_digest == installed.parent_policy_sha256
+                    normalized = ET.tostring(ET.fromstring(parent_policy), encoding="unicode")
+                    normalized_written = (
+                        native_digest != installed.parent_policy_sha256
+                        and native_digest == fixed_policy_digest(normalized)
+                    )
+                    recovering = candidate_written or normalized_written
+                    if not recovering and native_digest != (
+                        previous_installation.parent_policy_sha256
+                    ):
+                        raise PolicyCompilationError(
+                            "Program cutover native parent is not an approved candidate",
+                        )
+                    if recovering and operation_policies:
+                        raise PolicyCompilationError(
+                            "Program cutover partial Operations require explicit recovery",
+                        )
                     previous_verifier = FixedProgramVerifier(
                         previous_installation, management, probe_key,
                         client, clock=clock,
                     )
-                    previous_verifier.verify()
-                    old_proof = projection.read_program_proof(previous_installation.program)
+                    if not recovering:
+                        previous_verifier.verify()
+                    candidate_proof = None
+                    try:
+                        old_proof = projection.read_program_proof(previous_installation.program)
+                    except RouteProjectionConflict as error:
+                        if not recovering or str(error) != "ROUTE_PROGRAM_PROOF_IDENTITY_CHANGED":
+                            raise
+                        candidate_proof = projection.read_program_proof(installed.program)
+                        old_proof = candidate_proof
                     instant = clock()
                     if (old_proof is None or not old_proof[0].issued_epoch <= instant
-                            or old_proof[0].expires_epoch <= instant + 60):
+                            or not recovering and old_proof[0].expires_epoch <= instant + 60):
                         raise PolicyCompilationError(
                             "Program cutover previous proof window is too short",
                         )
@@ -421,9 +457,6 @@ def register_verified_program_upgrade(
                         parent_policy, previous_installation, installed, config, management,
                         operation_policies,
                     )
-                    path = "/apis/" + quote(installed.program.scope.api_id, safe="")
-                    path += ";rev=" + quote(installed.program.api_revision, safe="")
-                    path += "/policies/policy"
                     observed_parent = management._request("HEAD", path)
                     if (observed_parent.status_code != 200
                             or observed_parent.headers.get("ETag") != expected_parent_etag):
@@ -452,7 +485,9 @@ def register_verified_program_upgrade(
                     if adds_operation:
                         management._request(
                             "PUT", path,
-                            json_body={"properties": {"format": "xml", "value": parent_policy}},
+                            json_body={"properties": {"format": "xml", "value": ET.tostring(
+                                parse_policy(parent_policy), encoding="unicode",
+                            )}},
                             extra_headers={"If-Match": cast(str, expected_parent_etag)},
                         )
                         readback = management._request("GET", path + "?format=xml")
@@ -479,19 +514,28 @@ def register_verified_program_upgrade(
                             continue
                         management._request(
                             "PUT", operation_paths[name],
-                            json_body={"properties": {"format": "xml", "value": policy}},
+                            json_body={"properties": {"format": "xml", "value": ET.tostring(
+                                parse_policy(policy), encoding="unicode",
+                            )}},
                             extra_headers={"If-Match": version},
                         )
-                    if not adds_operation:
+                    if not adds_operation and not candidate_written:
                         management._request(
                             "PUT", path,
-                            json_body={"properties": {"format": "xml", "value": parent_policy}},
+                            json_body={"properties": {"format": "xml", "value": ET.tostring(
+                                parse_policy(parent_policy), encoding="unicode",
+                            )}},
                             extra_headers={"If-Match": cast(str, expected_parent_etag)},
                         )
                     prepared_proof = verifier.verify()
-                    projection.publish_upgraded_program_proof(
-                        upgrade, previous_installation, prepared_proof, old_proof[1], clock(),
-                    )
+                    if candidate_proof is None:
+                        projection.publish_upgraded_program_proof(
+                            upgrade, previous_installation, prepared_proof, old_proof[1], clock(),
+                        )
+                    elif candidate_proof[0].expires_epoch <= clock():
+                        projection.publish_program_proof(
+                            prepared_proof, installed.program, candidate_proof[1], clock(),
+                        )
                 if prepared_proof is None:
                     verifier.verify()
                 proof = projection.read_program_proof(installed.program)

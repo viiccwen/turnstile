@@ -889,10 +889,11 @@ def test_new_fixed_program_can_be_redeployed_without_policy_writes(
     assert runner.run_json.call_count == 1
 
 
-@pytest.mark.parametrize("phase", ["complete", "missing", "changed_target"])
+@pytest.mark.parametrize("phase", ["complete", "missing", "changed_target", "checkpoint_conflict"])
 def test_existing_program_delegation_uses_guarded_cutover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
 ) -> None:
+    from contextlib import nullcontext
     from types import SimpleNamespace
     from typing import Any, cast
 
@@ -955,6 +956,16 @@ def test_existing_program_delegation_uses_guarded_cutover(
         "id": publication_id, "resource_manifest": {"fixed_route_program": installed.model_dump()},
     }
     repository.get_gateway_profiles.return_value = [{"id": target_id, "config": {}}]
+    connection = Mock()
+    connection.transaction.side_effect = lambda: nullcontext()
+    repository._connection.side_effect = lambda: nullcontext(connection)
+    def save_checkpoint(statement: str, parameters: Any) -> Mock:
+        assert "AND config = %s RETURNING id" in statement
+        if phase == "checkpoint_conflict":
+            return Mock(fetchone=Mock(return_value=None))
+        repository.get_gateway_profiles.return_value[0]["config"] = parameters[0].obj
+        return Mock(fetchone=Mock(return_value={"id": target_id}))
+    connection.execute.side_effect = save_checkpoint
     management = Mock()
     management._read_policy.return_value = (
         httpx.Response(200, headers={"ETag": '"unit-etag"'}), parent,
@@ -967,10 +978,13 @@ def test_existing_program_delegation_uses_guarded_cutover(
     register = Mock()
     monkeypatch.setattr(bootstrap, "register_verified_program_upgrade", register)
     settings = Settings.model_construct(budget_delegation_trust={target_id: trust})
-    if phase == "changed_target":
-        with pytest.raises(RuntimeError, match="approved parent changed"):
+    if phase in {"changed_target", "checkpoint_conflict"}:
+        message = ("Gateway configuration changed" if phase == "checkpoint_conflict"
+                   else "approved parent changed")
+        with pytest.raises(RuntimeError, match=message):
             bootstrap.configure_budget_delegation(repository, settings, target_id)
         register.assert_not_called()
+        management._request.assert_not_called()
     else:
         bootstrap.configure_budget_delegation(repository, settings, target_id)
         if phase == "complete":
@@ -1057,6 +1071,296 @@ def test_existing_program_delegation_uses_guarded_cutover(
                     deploy._validate_installed_fixed_program(
                         snapshot, original, inputs, outputs, trust, approval,
                     )
+
+
+@pytest.mark.parametrize("native_state", [
+    "old", "candidate", "normalized", "foreign", "interrupted", "proof_written", "proof_expired",
+    "entry_interrupted", "entry_normalized", "entry_proof_written", "entry_proof_expired",
+    "entry_missing_checkpoint", "entry_changed_trust", "entry_changed_publication",
+    "entry_changed_target", "entry_changed_revision", "entry_changed_source",
+    "entry_changed_candidate", "entry_foreign",
+])
+def test_real_delegation_cutover_xml_roundtrip_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_state: str,
+) -> None:
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from typing import Any, cast
+    from uuid import UUID
+    from xml.etree import ElementTree as ET
+
+    from pydantic import SecretStr
+
+    from backend import bootstrap_storage_route as bootstrap
+    from scripts import deploy
+    from tests.backend.model_platform.control_plane_support import (
+        GatewayControlPlaneService,
+        bedrock_publication,
+    )
+    from turnstile_core.config import Settings
+    from turnstile_core.domain.control_plane import (
+        GatewayReleaseSpec,
+        PublicationKind,
+        PublicationStatus,
+    )
+    from turnstile_core.domain.storage_routes import (
+        ActiveRouteHead,
+        ConfigurationApproval,
+        ProgramCapabilityProof,
+        RouteSnapshot,
+        catalog_digest,
+        configuration_manifests,
+        document_digest,
+    )
+    from turnstile_core.integrations.apim_storage_routes import fixed_policy_digest
+    from turnstile_core.integrations.storage_route_projection import RouteProjectionConflict
+    from turnstile_core.persistence.in_memory import InMemoryRepository
+    from turnstile_core.services import storage_route_publisher as routes
+
+    runtime = Mock(wraps=runtime_release_parameters)
+    monkeypatch.setattr(sys.modules[__name__], "runtime_release_parameters", runtime)
+    with monkeypatch.context() as setup:
+        test_initial_fixed_program_binds_compiled_policies_before_registration(
+            tmp_path, setup, False,
+        )
+        parameters = cast(Mock, deploy.deploy_template).call_args.args[3]["parameters"]
+        descriptor = bootstrap.FixedInstallationDescriptor.model_validate_json(
+            json.dumps(runtime.call_args.args[5]),
+        )
+        old_parent = parameters["parentPolicy"]["value"]
+        trust = runtime.call_args.args[7]
+    target = descriptor.registration.gateway_profile_id
+    previous = bootstrap.installation_record(descriptor, "b" * 64)
+    operations = {item["name"]: (item["method"], item["path"], item["policy"])
+                  for item in parameters["fixedOperations"]["value"]}
+    repository, management = Mock(), Mock()
+    registration = Mock()
+    repository.get_gateway_profiles.return_value = [{"id": target, "config": {}}]
+    connection = Mock()
+    connection.transaction.side_effect = lambda: nullcontext()
+    repository._connection.side_effect = lambda: nullcontext(connection)
+    def save_checkpoint(statement: str, parameters: Any) -> Mock:
+        repository.get_gateway_profiles.return_value[0]["config"] = parameters[0].obj
+        return Mock(fetchone=Mock(return_value={"id": target}))
+    connection.execute.side_effect = save_checkpoint
+    repository.effective_gateway_publication.return_value = {
+        "id": str(UUID(int=75)),
+        "resource_manifest": {"fixed_route_program": previous.model_dump()},
+    }
+    management._read_policy.return_value = (
+        httpx.Response(200, headers={"ETag": '"old"'}), old_parent,
+    )
+    management.route_program_operations.return_value = operations
+    settings = Settings.model_construct(budget_delegation_trust={target: trust.model_copy(
+        update={"client_ids": (UUID(int=94),)},
+    )})
+    with monkeypatch.context() as capture:
+        capture.setattr(bootstrap, "AzureApimPublisherClient", Mock(return_value=management))
+        capture.setattr(bootstrap, "register_verified_program_upgrade", registration)
+        capture.setattr(bootstrap, "apim_target_client_config_resolver", Mock())
+        bootstrap.configure_budget_delegation(repository, settings, target)
+    upgrade = registration.call_args.args[2]
+    candidate = registration.call_args.kwargs["parent_policy"]
+    repository.get_gateway_profiles.return_value = [{"id": target, "config": {}}]
+    version = str(UUID(int=76))
+    _, manifest, dependencies = configuration_manifests(
+        previous.program.scope, version, (), {}, 1100,
+    )
+    approval = ConfigurationApproval(
+        approval_id=str(UUID(int=77)), scope=previous.program.scope, route_version=version,
+        generation=1, manifest_sha256=manifest, dependency_manifest_sha256=dependencies,
+        catalog_sha256=catalog_digest(()), entry_count=0,
+        required_program_sha256=previous.program.program_sha256, required_profiles=(),
+        budget_epoch=str(descriptor.epoch), issued_epoch=1100, activate_before_epoch=1700,
+    )
+    snapshot = RouteSnapshot.prepare(approval, (), {}, 1100)
+    head = ActiveRouteHead(approval=approval, activated_epoch=1100)
+    source = GatewayControlPlaneService(InMemoryRepository()).publish(bedrock_publication(), "unit")
+    source = source.model_copy(update={
+        "id": UUID(int=75), "gateway_profile_id": target, "status": PublicationStatus.ACTIVE,
+        "publication_kind": PublicationKind.ROUTE_RECONCILE, "generation": 1,
+        "base_release_id": None, "apim_revision": previous.program.api_revision,
+        "policy_sha256": previous.program.program_sha256,
+        "desired_spec": GatewayReleaseSpec(
+            gateway_profile_id=target, bindings=[], discovery_models=[],
+        ),
+        "resource_manifest": {"fixed_route_program": previous.model_dump(mode="json"),
+                              "fixed_route_snapshot": snapshot.model_dump(mode="json"),
+                              "fixed_route_head": head.model_dump(mode="json")},
+    })
+    repository.effective_gateway_publication.return_value = source.model_dump(mode="python")
+    repository.model_availability_proof_guard.side_effect = lambda *_, **__: nullcontext()
+    proof = ProgramCapabilityProof(
+        proof_id=str(UUID(int=78)), identity=previous.program,
+        supported_profiles=previous.supported_profiles, issued_epoch=1050, expires_epoch=1170,
+    )
+    already_written = native_state in {"candidate", "proof_written", "proof_expired"}
+    current: dict[str, Any] = {"parent": candidate if already_written else
+               ET.tostring(ET.fromstring(candidate), encoding="unicode")
+               if native_state == "normalized" else
+               '<policies><inbound><return-response /></inbound></policies>'
+               if native_state == "foreign" else old_parent,
+               "etag": '"old"', "proof": proof}
+    if native_state in {"proof_written", "proof_expired"}:
+        current["proof"] = proof.model_copy(update={
+            "identity": upgrade.installation.program,
+                **({"issued_epoch": 900, "expires_epoch": 1020}
+                    if native_state == "proof_expired" else {}),
+        })
+    writes: list[str] = []
+    def request(method: str, path: str, **kwargs: Any) -> httpx.Response:
+        if method == "PUT":
+            assert kwargs["extra_headers"] == {"If-Match": current["etag"]}
+            current["parent"] = ET.tostring(ET.fromstring(
+                kwargs["json_body"]["properties"]["value"],
+            ), encoding="unicode")
+            current["etag"] = '"new"'
+            writes.append(path)
+        return httpx.Response(200, headers={"ETag": current["etag"]})
+    management._request.side_effect = request
+    management._read_policy.side_effect = lambda *_: (
+        httpx.Response(200, headers={"ETag": current["etag"]}), current["parent"],
+    )
+    management.current_revision.return_value = previous.program.api_revision
+    management.revision_api_policy.side_effect = lambda *_: current["parent"]
+    entry = native_state.startswith("entry_")
+    registration_failure = [native_state in {"entry_proof_written", "entry_proof_expired"}]
+    reject = [native_state == "interrupted" or entry and not registration_failure[0]]
+    def probe(request: httpx.Request) -> httpx.Response:
+        is_new = fixed_policy_digest(current["parent"]) == upgrade.installation.parent_policy_sha256
+        if reject[0] and is_new:
+            reject[0] = False
+            return httpx.Response(503)
+        program = upgrade.installation.program if is_new else previous.program
+        headers = {"abi": "2", "nonce": request.headers["x-turnstile-route-probe"],
+                   "target": program.scope.target_id, "api": program.scope.api_id,
+                   "revision": program.api_revision, "gateway": program.scope.gateway_id,
+                   "instance": program.instance_id, "program": program.program_sha256,
+                   "trust": program.trust_binding_sha256}
+        if request.url.path.endswith("/configuration"):
+            headers.update(version=version, generation="1", epoch=str(descriptor.epoch))
+        return httpx.Response(204, headers={"x-turnstile-route-" + name: value
+                                          for name, value in headers.items()})
+    projection = Mock()
+    def read_proof(identity: Any) -> Any:
+        if current["proof"].identity != identity:
+            raise RouteProjectionConflict("ROUTE_PROGRAM_PROOF_IDENTITY_CHANGED")
+        return current["proof"], 'W/"proof"'
+    projection.read_program_proof.side_effect = read_proof
+    projection.read_active.return_value = (head, 'W/"head"')
+    projection.publish_upgraded_program_proof.side_effect = lambda *args: current.update(
+        proof=args[2],
+    )
+    projection.publish_program_proof.side_effect = lambda *args: current.update(proof=args[0])
+    configurations = Mock()
+    configurations.resolve.return_value = SimpleNamespace(
+        gateway_profile_id=target, route_target_identity_sha256=previous.target_identity_sha256,
+        settings=SimpleNamespace(apim_api_id=previous.program.scope.api_id,
+            apim_gateway_url=previous.gateway_endpoint,
+            apim_probe_subscription_id=previous.publisher_subscription_id,
+            apim_probe_subscription_key=SecretStr("unit-key"),
+            ledger_table_endpoint=descriptor.binding.ledger_table_endpoint,
+            ledger_table_name=descriptor.binding.ledger_table_name),
+    )
+    recorded: list[Any] = []
+    def record(value: Any, digest: str, **options: Any) -> None:
+        options["before_record"]()
+        if registration_failure[0]:
+            registration_failure[0] = False
+            raise ValueError("Injected registration failure")
+        recorded.append(value)
+    repository.record_fixed_program_upgrade.side_effect = record
+    real_client = httpx.Client
+    monkeypatch.setattr(routes, "AzureApimPublisherClient", Mock(return_value=management))
+    monkeypatch.setattr(routes, "TableRouteProjection", Mock(return_value=projection))
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: real_client(
+        **kwargs, transport=httpx.MockTransport(probe),
+    ))
+    entry_registration = Mock(side_effect=lambda *args, **kwargs: (
+        routes.register_verified_program_upgrade(*args, **kwargs, clock=lambda: 1100)
+    ))
+    monkeypatch.setattr(bootstrap, "AzureApimPublisherClient", Mock(return_value=management))
+    monkeypatch.setattr(bootstrap, "register_verified_program_upgrade", entry_registration)
+    monkeypatch.setattr(bootstrap, "apim_target_client_config_resolver", lambda *_: configurations)
+    def cutover() -> None:
+        if entry:
+            bootstrap.configure_budget_delegation(repository, settings, target)
+            return
+        routes.register_verified_program_upgrade(
+            repository, configurations, upgrade, document_digest({}), clock=lambda: 1100,
+            parent_policy=candidate, expected_parent_etag=current["etag"],
+        )
+    if native_state == "foreign":
+        with pytest.raises(ValueError):
+            cutover()
+        assert not writes and not recorded
+        return
+    if native_state == "interrupted" or entry:
+        message = "registration failure" if registration_failure[0] else "authenticated probe"
+        with pytest.raises(ValueError, match=message):
+            cutover()
+        assert not recorded and len(writes) == 1
+    if entry:
+        checkpoint = repository.get_gateway_profiles.return_value[0]["config"][
+            "budget_delegation_cutover"
+        ]
+        assert checkpoint["parent_policy"] == old_parent
+        assert checkpoint["candidate_parent_policy_sha256"] == (
+            upgrade.installation.parent_policy_sha256
+        )
+        if native_state == "entry_normalized":
+            current["parent"] = ET.tostring(ET.fromstring(candidate), encoding="unicode")
+            current["etag"] = '"normalized"'
+        elif native_state == "entry_proof_expired":
+            current["proof"] = current["proof"].model_copy(update={
+                "issued_epoch": 900, "expires_epoch": 1020,
+            })
+        elif native_state == "entry_missing_checkpoint":
+            del repository.get_gateway_profiles.return_value[0]["config"][
+                "budget_delegation_cutover"
+            ]
+        elif native_state == "entry_changed_trust":
+            settings = settings.model_copy(update={"budget_delegation_trust": {
+                target: trust.model_copy(update={"client_ids": (UUID(int=95),)}),
+            }})
+        elif native_state == "entry_changed_publication":
+            repository.effective_gateway_publication.return_value["id"] = str(UUID(int=95))
+        elif native_state in {"entry_changed_target", "entry_changed_revision"}:
+            identity = repository.effective_gateway_publication.return_value[
+                "resource_manifest"
+            ]["fixed_route_program"]["program"]
+            if native_state == "entry_changed_target":
+                identity["scope"]["target_id"] = str(UUID(int=95))
+            else:
+                identity["api_revision"] = "other"
+        elif native_state == "entry_changed_source":
+            checkpoint["parent_policy"] = old_parent.replace('name="routeTrust"', 'name="drift"')
+        elif native_state == "entry_changed_candidate":
+            checkpoint["candidate_parent_policy_sha256"] = "f" * 64
+        elif native_state == "entry_foreign":
+            current["parent"] = candidate.replace('name="routeTrust"', 'name="drift"')
+        if native_state in {
+            "entry_missing_checkpoint", "entry_changed_trust", "entry_changed_publication",
+            "entry_changed_target", "entry_changed_revision", "entry_changed_source",
+            "entry_changed_candidate", "entry_foreign",
+        }:
+            with pytest.raises(RuntimeError, match="approved parent changed"):
+                cutover()
+            assert entry_registration.call_count == 1
+            assert not recorded and len(writes) == 1
+            return
+    recovery_etag = current["etag"]
+    cutover()
+    assert len(recorded) == 1
+    assert fixed_policy_digest(current["parent"]) == upgrade.installation.parent_policy_sha256
+    assert len(writes) == (0 if already_written else 2 if native_state == "entry_normalized" else 1)
+    if entry:
+        assert entry_registration.call_count == 2
+        first, second = entry_registration.call_args_list
+        assert first.args[2] == second.args[2] == upgrade
+        assert first.kwargs["parent_policy"] == second.kwargs["parent_policy"] == candidate
+        assert first.args[3] == second.args[3]
+        assert second.kwargs["expected_parent_etag"] == recovery_etag
 
 
 @pytest.mark.parametrize("phase", ["complete", "failed", "running", "changed_target"])
