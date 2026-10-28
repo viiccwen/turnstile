@@ -280,7 +280,8 @@ param postgresTier string = 'Burstable'
 param suffix string = uniqueString(subscription().id, resourceGroup().name)
 
 var effectiveApimResourceGroupName = provisionApimService ? resourceGroup().name : existingApimResourceGroupName
-var provisionApimOutboundNetwork = provisionApimService && apimSkuName == 'StandardV2'
+// Adopted networks are operator-owned; never create subnets in them implicitly.
+var provisionApimOutboundNetwork = provisionApimService && provisionNetwork && apimSkuName == 'StandardV2'
 
 module apim 'modules/apim-service.bicep' = if (provisionApimService) {
   name: '${resourcePrefix}-apim-service'

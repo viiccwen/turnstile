@@ -86,8 +86,8 @@ module apimIntegration 'apim.bicep' = {
 }
 
 module publisherObserverKeyAccess '../modules/observer-named-value-rbac.bicep' = if (!empty(publisherPrincipalId)) {
-  name: 'envoy-publisher-key-${uniqueString(resourceGroupName)}'
-  scope: apimResourceGroup
+  name: 'envoy-publisher-key-${uniqueString(resourceGroup().name)}'
+  scope: resourceGroup(apimResourceGroupName)
   params: {
     apimName: apimName
     observerKeyNamedValue: apimIntegration.outputs.namedValueName

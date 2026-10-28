@@ -815,7 +815,6 @@ resource apiResourceGroupApimContributor 'Microsoft.Authorization/roleAssignment
 
 output apimOutboundSubnetId string = provisionApimOutboundNetwork ? apimOutboundSubnet!.id : ''
 output ledgerTableResourceId string = ledgerTableResourceId
-output routeTableId string = routeTableResourceId
 output routeTableResourceId string = routeTableResourceId
 output routeTableName string = 'ModelRoutes'
 output credentialVaultName string = credentialVault.name

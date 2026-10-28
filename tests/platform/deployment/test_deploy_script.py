@@ -15,7 +15,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
-from typing import cast
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import httpx
@@ -1793,25 +1793,44 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool | str,
     complete_installation: bool, failure_stage: str | None, capsys: pytest.CaptureFixture[str],
 ) -> None:
+    from scripts import deploy
+
     program_ready = failure_stage != "readiness"
+    role_helpers = (
+        "ensure_shared_storage_roles", "ensure_foundry_role",
+        "ensure_adopted_dependency_roles", "ensure_observer_event_hub_role",
+    )
+    role_ids = {name: f"role-assignment-{name}" for name in role_helpers}
+    observer_outputs = {
+        "acrName": "retained-registry",
+        "webAppName": "observer-test",
+        "webAppUrl": "https://observer-test.example.test",
+        "adapterKeyNamedValueName": "turnstile-observer-key",
+    }
     outputs: dict[str, object] = {
         "resourceGroupName": "turnstile-test",
         "apiName": "api-test",
         "apiUrl": "https://api-test.example.test",
         "controlPlaneFunctionName": "control-test",
         "telemetryFunctionName": "telemetry-test",
-        "webAppUrl": "https://observer-test.example.test",
         "apimPrincipalId": "00000000-0000-0000-0000-000000000002",
-        "acrName": "retained-registry",
+        "managedRoleAssignmentIds": sorted(role_ids.values()),
+        **observer_outputs,
     }
     deployed_outputs = dict(outputs)
+    base_outputs = {
+        key: value for key, value in deployed_outputs.items()
+        if key not in observer_outputs and key != "managedRoleAssignmentIds"
+    }
+    if complete_installation and existing is True:
+        base_outputs["controlPlanePrincipalId"] = "00000000-0000-4000-8000-000000000011"
     if existing == "pending":
         outputs["pendingFixedBootstrap"] = {}
     elif existing in {"platform", "observer", "platform-with-observer"}:
         outputs["pendingInstallation"] = "observer" if existing == "observer" else "platform"
         if existing == "platform":
-            outputs.pop("webAppUrl")
-            outputs.pop("acrName")
+            for name in observer_outputs:
+                outputs.pop(name)
     arguments = build_parser().parse_args([
         "plan" if failure_stage == "plan" else "deploy",
         "--subscription", "00000000-0000-0000-0000-000000000001",
@@ -1823,53 +1842,76 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
         "require_prerequisites", "validate_source_snapshot", "gateway_upgrade",
         "deployment_budget_delegation",
         "validate_flex_consumption_capabilities", "validate_postgres_capabilities",
+        "validate_shared_storage_account", "validate_existing_dependencies",
         "_confirm_deployment", "what_if", "what_if_resource_group", "wait_for_health",
         "wait_for_observer_health", "verify_frontend_asset", "verify_owner_login",
         "verify_function_indexing", "verify_telemetry_function_health", "restart_runtime_apps",
     ):
-        monkeypatch.setattr(f"scripts.deploy.{name}", Mock())
+        monkeypatch.setattr(deploy, name, Mock())
     monkeypatch.setattr("scripts.deploy.gateway_upgrade", Mock(return_value=None))
     monkeypatch.setattr("scripts.deploy.load_saved_outputs", Mock(
         return_value=outputs if existing else None,
     ))
     monkeypatch.setattr("scripts.deploy.ExistingCore.from_outputs", Mock(return_value=None))
+    material = SecretMaterial({}, "offline-owner-password")
     monkeypatch.setattr("scripts.deploy.load_or_create_secret_material", Mock(
-        return_value=Mock(owner_password="offline-owner-password"),
+        return_value=material,
     ))
+    monkeypatch.setattr(deploy, "resolve_adopted_secret_material", Mock(return_value=material))
+    monkeypatch.setattr(deploy, "ensure_adopted_apim_prerequisite_role", Mock(return_value=set()))
     for name in (
         "deployment_parameters", "runtime_release_parameters", "observer_parameters",
-        "deploy_template", "build_packages", "current_app_settings",
+        "build_packages", "current_app_settings",
     ):
-        monkeypatch.setattr(f"scripts.deploy.{name}", Mock(return_value={}))
-    monkeypatch.setattr("scripts.deploy.deployment_outputs", Mock(return_value={
-        **{key: value for key, value in deployed_outputs.items()
-              if not complete_installation or existing is not True or key != "acrName"},
-        **({"controlPlanePrincipalId": "00000000-0000-4000-8000-000000000011"}
-              if complete_installation and existing is True else {}),
-    }))
+        monkeypatch.setattr(deploy, name, Mock(return_value={}))
+    upstream_deployment = Mock(side_effect=AssertionError(
+        "Platform lifecycle must use resource-group deployments",
+    ))
+    monkeypatch.setattr(deploy, "deploy_template", upstream_deployment)
     for name in ("source_version", "observer_source_version", "frontend_asset"):
-        monkeypatch.setattr(f"scripts.deploy.{name}", Mock(return_value="offline-candidate"))
+        monkeypatch.setattr(deploy, name, Mock(return_value="offline-candidate"))
     events: list[str] = []
 
-    def record_event(*args: object, event: str) -> None:
+    def record_event(*args: object, event: str) -> set[str]:
         events.append(event)
         if (failure_stage == "packages" and event == "deploy_packages") or (
             failure_stage == "observer" and event == "build_and_start_observer"
         ):
             raise DeploymentError("Checkpoint interruption")
+        return {role_ids[event]} if event in role_ids else set()
 
     for name in (
+        "ensure_shared_storage_resources", *role_helpers,
         "deploy_packages", "build_and_start_observer",
-        "deploy_resource_group_template",
     ):
         monkeypatch.setattr(
-            f"scripts.deploy.{name}",
+            deploy, name,
             Mock(side_effect=lambda *args, event=name, **kwargs: record_event(*args, event=event)),
-            raising=False,
         )
 
+    def apply_template(
+        _runner: CommandRunner, _inputs: DeploymentInputs, template: Path,
+        _document: object, name: str,
+    ) -> dict[str, object]:
+        stage = name.removeprefix("turnstile-")
+        assert template == {
+            "platform": REPOSITORY_ROOT / "infra/main.bicep",
+            "observer": REPOSITORY_ROOT / "infra/envoy-cache-adapter/main.bicep",
+            "runtime-release": REPOSITORY_ROOT / "infra/runtime-release.bicep",
+        }[stage]
+        events.append(f"deploy:{stage}")
+        values = {
+            "platform": base_outputs, "observer": observer_outputs, "runtime-release": {},
+        }[stage]
+        return {"properties": {"outputs": {
+            key: {"value": value} for key, value in values.items()
+        }}}
+
+    monkeypatch.setattr(deploy, "deploy_resource_group_template", Mock(side_effect=apply_template))
     checkpoints: list[dict[str, object]] = []
-    write_outputs = execute.__globals__["_write_outputs"]
+    write_outputs = deploy._write_outputs
+    secure_outputs = Mock(wraps=deploy._secure_private_file)
+    monkeypatch.setattr(deploy, "_secure_private_file", secure_outputs)
 
     def save_checkpoint(inputs: DeploymentInputs, values: dict[str, object]) -> None:
         events.append("_write_outputs")
@@ -1904,29 +1946,85 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     monkeypatch.setattr("scripts.deploy.wait_for_health", readiness)
     monkeypatch.setattr("scripts.deploy.verify_frontend_asset", isolated_frontend_read)
     initializes_program = existing is not True or complete_installation
+    runner = Mock(spec=CommandRunner)
+    runner.run.side_effect = AssertionError("Lifecycle fixture must not run external commands")
+    runner.run_json.side_effect = AssertionError("Lifecycle fixture must not call Azure")
     if failure_stage in {"packages", "observer"} or (initializes_program and not program_ready):
-        with pytest.raises(DeploymentError):
-            execute(arguments, CommandRunner())
+        with pytest.raises(DeploymentError, match=(
+            "Checkpoint interruption" if failure_stage in {"packages", "observer"}
+            else "Initial fixed program is not ready for model publication"
+        )):
+            execute(arguments, runner)
     else:
-        execute(arguments, CommandRunner())
+        execute(arguments, runner)
+
+    runner.run.assert_not_called()
+    runner.run_json.assert_not_called()
+    upstream_deployment.assert_not_called()
+    cast(Mock, deploy.what_if).assert_not_called()
+    loaded_inputs = cast(Mock, deploy.load_or_create_secret_material).call_args.args[0]
+    cast(Mock, deploy.resolve_adopted_secret_material).assert_called_once_with(
+        runner, loaded_inputs, material,
+    )
+    for name in ("validate_shared_storage_account", "validate_existing_dependencies"):
+        cast(Mock, getattr(deploy, name)).assert_called_once_with(runner, loaded_inputs)
+    prerequisite_roles = cast(Mock, deploy.ensure_adopted_apim_prerequisite_role)
+    if not existing and failure_stage != "plan":
+        prerequisite_roles.assert_called_once_with(runner, loaded_inputs, None)
+    else:
+        prerequisite_roles.assert_not_called()
 
     if failure_stage == "plan":
         assert events == []
         assert checkpoints == []
         assert not (tmp_path / "state.outputs.json").exists()
+        assert not arguments.state.exists()
+        secure_outputs.assert_not_called()
+        for name in (
+            "_confirm_deployment", "ensure_shared_storage_resources", *role_helpers,
+            "deploy_resource_group_template", "build_packages", "deploy_packages",
+            "build_and_start_observer", "initialize_fixed_program", "restart_runtime_apps",
+        ):
+            cast(Mock, getattr(deploy, name)).assert_not_called()
+        readiness.assert_not_called()
+        program_readiness.assert_not_called()
+        assert [call.args[4] for call in cast(Mock, deploy.what_if_resource_group).call_args_list] == (
+            ["turnstile-platform"] if not existing else [
+                "turnstile-platform",
+                "turnstile-runtime-release" if observer_outputs_complete(outputs)
+                else "turnstile-observer",
+            ]
+        )
+        assert "Turnstile deployment completed." not in capsys.readouterr().out
         return
     if checkpoints:
         outputs_path = tmp_path / "state.outputs.json"
         assert json.loads(outputs_path.read_text()) == checkpoints[-1]
-        assert stat.S_IMODE(outputs_path.stat().st_mode) == 0o600
+        assert secure_outputs.call_count == len(checkpoints)
+        assert all(call.args == (outputs_path,) for call in secure_outputs.call_args_list)
+        if os.name != "nt":
+            assert stat.S_IMODE(outputs_path.stat().st_mode) == 0o600
+    expected = [
+        "ensure_shared_storage_resources", "deploy:platform", "_write_outputs",
+        *role_helpers[:3], "_write_outputs", "deploy_packages",
+    ]
     if failure_stage in {"packages", "observer"}:
-        expected = ["_write_outputs", "deploy_packages"]
         if failure_stage == "observer":
-            expected.extend(("_write_outputs", "build_and_start_observer"))
+            expected.extend((
+                "deploy:observer", "_write_outputs", "ensure_observer_event_hub_role",
+                "_write_outputs", "build_and_start_observer",
+            ))
         assert events == expected
         assert checkpoints[-1]["pendingInstallation"] == (
             "platform" if failure_stage == "packages" else "observer"
         )
+        assert checkpoints[-1]["managedRoleAssignmentIds"] == sorted(
+            role_ids[name] for name in (
+                role_helpers[:3] if failure_stage == "packages" else role_helpers
+            )
+        )
+        cast(Mock, deploy.initialize_fixed_program).assert_not_called()
+        cast(Mock, deploy.restart_runtime_apps).assert_not_called()
         readiness.assert_not_called()
         program_readiness.assert_not_called()
         assert "Turnstile deployment completed." not in capsys.readouterr().out
@@ -1936,17 +2034,19 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
         "https://api-test.example.test", timeout_seconds=1800, expected_asset="offline-candidate",
     )
     isolated_frontend_read.assert_not_called()
-    expected = []
-    platform_deployed = not existing or (complete_installation and existing is True)
-    if platform_deployed:
-        expected.append("_write_outputs")
-    expected.append("deploy_packages")
+    expected.append("deploy:observer")
     if initializes_program:
         expected.append("_write_outputs")
-    expected.append("build_and_start_observer")
+    expected.extend(("ensure_observer_event_hub_role", "_write_outputs", "build_and_start_observer"))
     if initializes_program:
         expected.append("initialize_fixed_program")
-    expected.append("deploy_resource_group_template")
+        cast(Mock, deploy.initialize_fixed_program).assert_called_once()
+    else:
+        cast(Mock, deploy.initialize_fixed_program).assert_not_called()
+    expected.append("deploy:runtime-release")
+    release_call = cast(Mock, deploy.runtime_release_parameters).call_args
+    assert release_call.args[6] == (descriptor if initializes_program else None)
+    assert release_call.args[7] == ({} if initializes_program else None)
     if initializes_program:
         expected.append("verify_initial_fixed_program")
         owner_email = json.loads(arguments.parameters.read_text())["parameters"][
@@ -1963,20 +2063,31 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     assert ("Turnstile deployment completed." in capsys.readouterr().out) == (
         not initializes_program or program_ready
     )
+    assert checkpoints[1]["managedRoleAssignmentIds"] == sorted(
+        role_ids[name] for name in role_helpers[:3]
+    )
+    assert checkpoints[-1]["managedRoleAssignmentIds"] == sorted(role_ids.values())
     if initializes_program:
         phases = [values["pendingInstallation"] for values in checkpoints
                   if "pendingInstallation" in values]
-        assert phases == (["platform", "observer"] if platform_deployed else ["observer"])
+        initial_phase = (
+            "platform" if not existing or (complete_installation and existing is True)
+            else outputs.get("pendingInstallation")
+        )
+        assert phases == ([initial_phase] * 2 if initial_phase is not None else []) + ["observer"] * 2
         assert checkpoints[-1].get("pendingInstallation") == (
             None if program_ready else "observer"
         )
+    if not initializes_program or program_ready:
+        for name in ("pendingInstallation", "pendingFixedBootstrap", "pendingFixedProgramParameters"):
+            assert name not in checkpoints[-1]
     if complete_installation and program_ready:
-        observer = execute.__globals__["observer_parameters"].call_args.kwargs["existing_observer"]
+        observer = cast(Mock, deploy.observer_parameters).call_args.kwargs["existing_observer"]
         if existing == "platform":
             assert observer is None
         else:
             assert observer["acrName"] == "retained-registry"
-        assert execute.__globals__["_write_outputs"].call_args.args[1] == deployed_outputs
+        assert checkpoints[-1] == deployed_outputs
 
 
 def test_invalid_installation_checkpoint_is_rejected_before_cloud_actions(
@@ -2108,8 +2219,14 @@ def test_initial_fixed_program_binds_compiled_policies_before_registration(
     apply = Mock(
         side_effect=DeploymentError("ARM installation failed") if installation_fails else None
     )
-    monkeypatch.setattr("scripts.deploy.what_if", preview)
-    monkeypatch.setattr("scripts.deploy.deploy_template", apply)
+    monkeypatch.setattr("scripts.deploy.what_if_resource_group", preview)
+    monkeypatch.setattr("scripts.deploy.deploy_resource_group_template", apply)
+    monkeypatch.setattr("scripts.deploy.what_if", Mock(side_effect=AssertionError(
+        "Fixed program must use the APIM resource group, not a subscription deployment",
+    )))
+    monkeypatch.setattr("scripts.deploy.deploy_template", Mock(side_effect=AssertionError(
+        "Fixed program must use the APIM resource group, not a subscription deployment",
+    )))
     runner = Mock(spec=CommandRunner)
     runner.run_json.side_effect = lambda command: (
         {"properties": {"clientId": "00000000-0000-4000-8000-000000000092",
@@ -2129,8 +2246,11 @@ def test_initial_fixed_program_binds_compiled_policies_before_registration(
     )
 
     preview.assert_called_once()
-    apply.assert_called_once_with(*preview.call_args.args)
+    apply.assert_called_once_with(*preview.call_args.args, **preview.call_args.kwargs)
+    assert apply.call_args.kwargs == {"resource_group_name": request.resource_group}
+    assert request.resource_group != inputs.resource_group_name
     parameters = apply.call_args.args[3]["parameters"]
+    assert "apimResourceGroupName" not in parameters
     operations = parameters["fixedOperations"]["value"]
     assert operations[0]["name"] == "anthropic-models"
     assert operations[0]["method"] == "POST"
@@ -2166,6 +2286,7 @@ def test_initial_fixed_program_binds_compiled_policies_before_registration(
     )
 
     runtime = runtime_release_parameters(
+        inputs,
         SecretMaterial(
             {"apimSubscriptionKey": "dashboard-key", "apimProbeSubscriptionKey": "probe-key"}, None
         ),
@@ -2204,6 +2325,9 @@ def test_initial_fixed_program_binds_compiled_policies_before_registration(
     }
     saved = json.loads(inputs.state_path.with_suffix(".outputs.json").read_text())
     assert saved["pendingFixedBootstrap"] == descriptor.model_dump(mode="json")
+    assert saved["pendingFixedProgramParameters"]["parameters"]["apimResourceGroupName"] == {
+        "value": request.resource_group,
+    }
 
 
 @pytest.mark.parametrize("fault", [
@@ -2225,11 +2349,11 @@ def test_new_fixed_program_can_be_redeployed_without_policy_writes(
         test_initial_fixed_program_binds_compiled_policies_before_registration(
             tmp_path, initialization, False,
         )
-        applied = cast(Mock, deploy.deploy_template)
+        applied = cast(Mock, deploy.deploy_resource_group_template)
         inputs = applied.call_args.args[1]
-        outputs = runtime.call_args.args[1]
+        outputs = runtime.call_args.args[2]
         parameters = applied.call_args.args[3]["parameters"]
-        descriptor = runtime.call_args.args[5]
+        descriptor = runtime.call_args.args[6]
     values = {name: entry["value"] for name, entry in parameters.items()}
     operations = values["fixedOperations"]
     current = GatewaySnapshot(
@@ -2270,6 +2394,7 @@ def test_new_fixed_program_can_be_redeployed_without_policy_writes(
     }))
     writes = Mock(side_effect=AssertionError("Redeployment must not rewrite fixed policies"))
     monkeypatch.setattr(deploy, "deploy_template", writes)
+    monkeypatch.setattr(deploy, "deploy_resource_group_template", writes)
     monkeypatch.setattr(deploy, "_write_private_json", writes)
 
     if fault:
@@ -3030,10 +3155,10 @@ def test_partial_fixed_installation_reuses_bound_checkpoint_without_policy_write
         )
         from typing import cast
 
-        applied = cast(Mock, deploy.deploy_template)
+        applied = cast(Mock, deploy.deploy_resource_group_template)
         inputs = applied.call_args.args[1]
         parameters = applied.call_args.args[3]["parameters"]
-        descriptor = runtime.call_args.args[5]
+        descriptor = runtime.call_args.args[6]
         initial_snapshot = cast(Mock, AzureUpgradeBackend.read).return_value
     saved = json.loads(inputs.state_path.with_suffix(".outputs.json").read_text())
     values = {name: entry["value"] for name, entry in parameters.items()}
@@ -3047,19 +3172,29 @@ def test_partial_fixed_installation_reuses_bound_checkpoint_without_policy_write
         current = initial_snapshot
     if phase == "changed_target":
         saved["pendingFixedProgramParameters"]["parameters"]["apimName"]["value"] = "other-apim"
+    original_saved = json.dumps(saved, sort_keys=True)
     monkeypatch.setattr(AzureUpgradeBackend, "read", Mock(return_value=current))
     writes = Mock()
-    monkeypatch.setattr(deploy, "what_if", writes)
-    monkeypatch.setattr(deploy, "deploy_template", writes)
+    monkeypatch.setattr(deploy, "what_if_resource_group", writes)
+    monkeypatch.setattr(deploy, "deploy_resource_group_template", writes)
+    monkeypatch.setattr(deploy, "deploy_template", Mock(side_effect=AssertionError(
+        "Fixed-program retry must use the APIM resource group",
+    )))
     runner = Mock(spec=CommandRunner)
     runner.run_json.return_value = {"accessToken": "offline-token"}
     real_client = httpx.Client
-    monkeypatch.setattr(httpx, "Client", lambda **kwargs: real_client(
-        **kwargs, transport=httpx.MockTransport(lambda _: httpx.Response(
+    readbacks: list[str] = []
+
+    def read_arm(request: httpx.Request) -> httpx.Response:
+        readbacks.append(request.url.path)
+        return httpx.Response(
             200, json={"sku": {"name": "StandardV2"}, "properties": {
                 "provisioningState": "Running" if phase == "running" else "Failed",
             }},
-        )),
+        )
+
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: real_client(
+        **kwargs, transport=httpx.MockTransport(read_arm),
     ))
 
     if phase in {"running", "changed_target"}:
@@ -3068,6 +3203,16 @@ def test_partial_fixed_installation_reuses_bound_checkpoint_without_policy_write
     else:
         assert initialize_fixed_program(runner, inputs, saved, {}) == descriptor
     assert writes.call_count == (2 if phase == "failed" else 0)
+    assert json.dumps(saved, sort_keys=True) == original_saved
+    if phase in {"failed", "running"}:
+        assert readbacks[-1] == (
+            f"/subscriptions/{inputs.subscription}/resourceGroups/{saved['apimResourceGroupName']}"
+            f"/providers/Microsoft.Resources/deployments/{inputs.resource_prefix}-fixed-program"
+        )
+    if phase == "failed":
+        for call in writes.call_args_list:
+            assert call.kwargs == {"resource_group_name": saved["apimResourceGroupName"]}
+            assert "apimResourceGroupName" not in call.args[3]["parameters"]
 
 
 @pytest.mark.parametrize("wrong_binding", [False, True])
@@ -4228,6 +4373,7 @@ def test_gateway_upgrade_uses_only_the_shared_employee_client(
     from xml.etree import ElementTree
 
     from scripts import deploy
+    from scripts.apim_upgrade import GatewaySnapshot
 
     inputs = DeploymentInputs.load(
         "subscription",
@@ -4237,6 +4383,12 @@ def test_gateway_upgrade_uses_only_the_shared_employee_client(
     runner = MagicMock(spec=CommandRunner)
     runner.run_json.return_value = {"accessToken": "unit-test-token"}
     backend = MagicMock()
+    snapshot = GatewaySnapshot(
+        "1", {"path": "turnstile/llm", "subscriptionRequired": False},
+        (REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml").read_text(encoding="utf-8"),
+        {}, {},
+    )
+    backend.read.return_value = snapshot
     monkeypatch.setattr(deploy, "AzureUpgradeBackend", lambda *_: backend)
     plan = MagicMock(return_value=MagicMock(required=False))
     monkeypatch.setattr(deploy, "plan_image_upgrade", plan)
@@ -4251,7 +4403,9 @@ def test_gateway_upgrade_uses_only_the_shared_employee_client(
         "controlPlaneFunctionName": "test-control",
     }, "check")
 
+    backend.read.assert_called_once_with()
     plan.assert_called_once()
+    assert plan.call_args.args[1] is snapshot
     canonical = ElementTree.fromstring(plan.call_args.args[2])
     assert [node.text for node in canonical.iter("application-id")] == [expected_client]
 
@@ -4456,6 +4610,43 @@ def test_command_runner_resolves_windows_command_shims(
     CommandRunner().run(["az", "account", "show"])
 
     assert captured == ["C:/resolved/az.CMD", "account", "show"]
+
+
+@pytest.mark.parametrize("action", ["what-if", "create"])
+@pytest.mark.parametrize("resource_group", [None, "adopted-apim-group"])
+def test_resource_group_deployment_helpers_preserve_the_selected_scope(
+    tmp_path: Path, action: str, resource_group: str | None,
+) -> None:
+    from scripts import deploy
+
+    inputs = DeploymentInputs.load(
+        "subscription", _parameters(tmp_path / "parameters.json"), tmp_path / "state.json",
+    )
+    document = {"parameters": {"apimName": {"value": "adopted-apim"}}}
+    commands: list[list[str]] = []
+
+    class Runner(CommandRunner):
+        def run_json(self, command: Sequence[str], **_kwargs: Any) -> dict[str, Any]:
+            commands.append(list(command))
+            parameter_path = command[command.index("--parameters") + 1].removeprefix("@")
+            assert json.loads(Path(parameter_path).read_text(encoding="utf-8")) == document
+            return {"changes": [], "properties": {"outputs": {}}}
+
+    operation = (
+        deploy.what_if_resource_group if action == "what-if"
+        else deploy.deploy_resource_group_template
+    )
+    operation(
+        Runner(), inputs, Path("infra/apim-upgrade.bicep"), document, "fixed-program",
+        resource_group_name=resource_group,
+    )
+
+    assert len(commands) == 1
+    command = commands[0]
+    assert command[:4] == ["az", "deployment", "group", action]
+    assert command[command.index("--resource-group") + 1] == (
+        resource_group or inputs.resource_group_name
+    )
 
 
 def test_what_if_reads_root_level_changes_and_rejects_delete(tmp_path: Path) -> None:

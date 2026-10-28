@@ -119,6 +119,17 @@ Runtime diagnostics retain the named `runtimeDiagnosticScope` and `publisherProb
 outputs and the configured `apimProbeSubscriptionId`, including when APIM bootstrap is skipped.
 Probe access is scoped to that subscription, not to Dashboard keys or a broader APIM role.
 
+Fresh StandardV2 APIM installations with a managed VNet bind the dedicated outbound subnet
+after the data plane is provisioned. Adopted VNets and existing APIM services retain their
+operator-managed network configuration; this deployment does not create an outbound subnet
+in an adopted VNet. Verify the approved private egress and DNS path before enabling workers.
+
+Fixed-program installation and retry run as resource-group deployments in the actual APIM
+resource group, which may differ from the platform group. Retain the APIM group in the private
+recovery checkpoint, but do not pass it as a template parameter. Initialization permissions on
+the dedicated credential vault and managed usage hub are prepared before worker activation;
+grants on adopted dependencies remain lifecycle-managed at their exact resource scopes.
+
 ## Prepare for v1.2
 
 Turnstile v1.2 is the current public release. Upgrading an existing v1.1 installation requires

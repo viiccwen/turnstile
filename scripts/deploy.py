@@ -2350,11 +2350,14 @@ def what_if_resource_group(
     template: Path,
     parameters: Mapping[str, Any],
     deployment_name: str,
+    *,
+    resource_group_name: str | None = None,
 ) -> Counter[str]:
     with temporary_parameter_file(parameters, inputs.state_path.parent) as parameter_file:
         result = runner.run_json(
             _resource_group_deployment_command(
-                "what-if", inputs, template, parameter_file, deployment_name
+                "what-if", inputs, template, parameter_file, deployment_name,
+                resource_group_name,
             )
         )
     return _what_if_counts(result)
@@ -2379,11 +2382,14 @@ def deploy_resource_group_template(
     template: Path,
     parameters: Mapping[str, Any],
     deployment_name: str,
+    *,
+    resource_group_name: str | None = None,
 ) -> JsonObject:
     with temporary_parameter_file(parameters, inputs.state_path.parent) as parameter_file:
         return runner.run_json(
             _resource_group_deployment_command(
-                "create", inputs, template, parameter_file, deployment_name
+                "create", inputs, template, parameter_file, deployment_name,
+                resource_group_name,
             )
         )
 
@@ -3877,6 +3883,26 @@ def initialize_fixed_program(
     template = REPOSITORY_ROOT / "infra/apim-upgrade.bicep"
     name = f"{inputs.resource_prefix}-fixed-program"
     core = ExistingCore.from_outputs(outputs)
+
+    def install(parameters: Mapping[str, Any]) -> None:
+        # Retain the APIM group in the checkpoint binding, not in the group-scoped
+        # template's ARM parameters. Never rewrite the saved recovery document.
+        document = {
+            **parameters,
+            "parameters": {
+                key: value for key, value in parameters["parameters"].items()
+                if key != "apimResourceGroupName"
+            },
+        }
+        what_if_resource_group(
+            runner, inputs, template, document, name,
+            resource_group_name=core.apim_resource_group_name,
+        )
+        deploy_resource_group_template(
+            runner, inputs, template, document, name,
+            resource_group_name=core.apim_resource_group_name,
+        )
+
     api_id = _output_string(outputs, "apimApiId")
     service_id = (
         f"/subscriptions/{inputs.subscription}/resourceGroups/{core.apim_resource_group_name}"
@@ -3949,6 +3975,7 @@ def initialize_fixed_program(
             _validate_installed_fixed_program(expected, pending_descriptor, inputs, outputs)
             previous = client.get(
                 f"https://management.azure.com/subscriptions/{inputs.subscription}"
+                f"/resourceGroups/{core.apim_resource_group_name}"
                 f"/providers/Microsoft.Resources/deployments/{name}",
                 params={"api-version": "2025-04-01"},
             )
@@ -3957,8 +3984,7 @@ def initialize_fixed_program(
                     raise DeploymentError("Previous fixed program deployment requires readback")
             elif previous.status_code != 404:
                 previous.raise_for_status()
-            what_if(runner, inputs, template, parameters, name)
-            deploy_template(runner, inputs, template, parameters, name)
+            install(parameters)
             return pending_descriptor.model_dump(mode="json")
     if snapshot is None:
         raise DeploymentError("Initial APIM API is missing")
@@ -4058,8 +4084,7 @@ def initialize_fixed_program(
         **outputs, "pendingFixedBootstrap": descriptor.model_dump(mode="json"),
         "pendingFixedProgramParameters": parameters,
     })
-    what_if(runner, inputs, template, parameters, name)
-    deploy_template(runner, inputs, template, parameters, name)
+    install(parameters)
     return descriptor.model_dump(mode="json")
 
 
@@ -4376,11 +4401,7 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         platform_outputs,
         secrets_,
         observer_version,
-        existing_observer=(
-            platform_outputs if saved_outputs is not None and (
-                pending_stage != "platform" or "acrName" in platform_outputs
-            ) else None
-        ),
+        existing_observer=platform_outputs if observer_outputs_complete(platform_outputs) else None,
     )
     what_if_resource_group(
         runner,
@@ -4535,8 +4556,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--complete-installation",
         action="store_true",
         help="Complete fixed-program installation using the original resources and outputs.",
-        )
-        parser.add_argument(
+    )
+    parser.add_argument(
         "--skip-what-if",
         action="store_true",
         help=(
