@@ -97,7 +97,8 @@ class FixedInstallationDescriptor(BaseModel):
         ))
         if (
             str(registration.managed_gateway_url).rstrip("/")
-            != "https://" + registration.service_name + ".azure-api.net/" + registration.api_path
+            != "https://" + registration.service_name.lower() + ".azure-api.net/"
+            + registration.api_path
             or registration.self_hosted_gateway_id is not None
             or self.binding.scope.target_id != str(registration.gateway_profile_id)
             or self.binding.scope.api_id != registration.api_id
@@ -190,7 +191,8 @@ def require_runtime(descriptor: FixedInstallationDescriptor, settings: Settings)
         or settings.apim_service_name != descriptor.registration.service_name
         or settings.apim_resource_group != descriptor.registration.resource_group
         or settings.azure_subscription_id != str(descriptor.registration.subscription_id)
-        or settings.ledger_table_endpoint != descriptor.binding.ledger_table_endpoint
+        or (settings.ledger_table_endpoint or "").rstrip("/")
+        != descriptor.binding.ledger_table_endpoint.rstrip("/")
         or settings.ledger_table_name != descriptor.binding.ledger_table_name
         or settings.apim_probe_subscription_key is None
         or not settings.database_url

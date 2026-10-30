@@ -1044,6 +1044,7 @@ if ($managedRoleAssignmentIds.Count -gt 0) {
     $rbacAdministratorRoleId = 'f58310d9-a9f6-439a-9e8d-f62e7b41a168'
     $keyVaultSecretsOfficerRoleId = 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7'
     $cognitiveServicesUserRoleId = 'a97b65f3-24c7-4388-baec-2e87135dc908'
+    $cognitiveServicesDataReaderRoleId = 'b59867f0-fa02-499b-be73-45a86b5b3e1c'
     $eventHubReceiverRoleId = 'a638d3c7-ab3a-418d-83e6-5f17a39d4fde'
     $eventHubSenderRoleId = '2b629674-e913-4c01-ae53-ef4638d8f975'
     $logAnalyticsReaderRoleId = '73c42c96-874c-492b-b04d-ab87d138a893'
@@ -1107,6 +1108,11 @@ if ($managedRoleAssignmentIds.Count -gt 0) {
             $foundryResourceId,
             [string]$outputDocument.apimPrincipalId,
             $cognitiveServicesUserRoleId
+        )
+        $managedRoleRequirements += ,@(
+            $foundryResourceId,
+            [string]$outputDocument.controlPlanePrincipalId,
+            $cognitiveServicesDataReaderRoleId
         )
     }
     if (-not [bool](Get-DependencyValue $outputDocument 'eventHub' 'provisioned' $true)) {

@@ -225,7 +225,7 @@ uv run python -m scripts.deploy deploy \
 
 1. 使用部署脚本创建的密码Owner登录。
 2. 在 **Model Management → APIM instances** 中确认初始 APIM 的固定程序已就绪，再发布模型。如需接入更多 APIM 实例，可在配置身份具备受限授权、平台前置条件就绪后使用 **Add APIM instance** 初始化。初始化会为目标 APIM 的托管身份授予访问平台 Ledger 账本表、路由表、Event Hub 与凭据 Key Vault 的权限；还需配置实际网络可达性。
-3. 在Model Management中添加指向现有Foundry项目或受支持提供商的连接，再通过Add Model选择已有的provider deployment。
+3. 在Model Management中添加指向现有Foundry项目或受支持提供商的连接，再通过Add Model选择已有的provider deployment。Foundry managed identity 还需要为 Publisher 授予 `Cognitive Services Data Reader`，与 APIM 推理权限分开配置，详见[Foundry 授权说明](docs/deployment.md#managed-identity-authorization)。
 4. 根据需要配置 APIM 原生后端池，以实现故障转移、均衡或加权路由。
 5. 发布并等待candidate验证。同tenant的Foundry managed identity若缺少授权，发布对话框会显示准确的APIM principal、`Cognitive Services User`角色和Foundry资源scope；由有权限的Azure用户完成IAM授权后，在对话框中继续验证。
 6. 执行一次小规模、带归因信息的调用，并确认其遥测记录。

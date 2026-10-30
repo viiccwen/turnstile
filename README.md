@@ -233,7 +233,7 @@ A fresh Turnstile deployment automatically registers its platform-provisioned AP
 
 1. Sign in with the password Owner created by the deployment command.
 2. Verify the initial APIM instance in **Model Management → APIM instances** and confirm its fixed program is ready before publishing models. Additional APIM instances can be initialized through **Add APIM instance** when the configured identity has the required scoped permissions and the platform prerequisites are ready. Initialization grants the target APIM's managed identity access to the platform's Ledger Table, Route Table, Event Hub, and Credential Key Vault; network connectivity must also be configured.
-3. In Model Management, add a connection to an existing Foundry project or supported provider, then choose Add Model for an existing provider deployment.
+3. In Model Management, add a connection to an existing Foundry project or supported provider, then choose Add Model for an existing provider deployment. Foundry managed identity also requires Publisher `Cognitive Services Data Reader` access, separate from APIM inference access; see [Foundry authorization](docs/deployment.md#managed-identity-authorization).
 4. Optionally configure an APIM native backend pool for failover, balanced, or weighted routing.
 5. Publish the gateway change and wait for candidate verification. For same-tenant Foundry managed identity, an authorization pause displays the exact APIM principal, `Cognitive Services User` role, and Foundry resource scope. Grant that role in Azure IAM, then resume verification in the dialog.
 6. Run a small attributed invocation and confirm its telemetry record.

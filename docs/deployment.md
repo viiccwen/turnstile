@@ -17,6 +17,17 @@ same deployment state. Keep an existing server's zone unchanged; changing this p
 does not authorize moving or replacing a database. Adopted PostgreSQL servers are not
 reconfigured by this setting.
 
+If all supported zones lack capacity, `postgresLocation` can select another approved
+region for a **new** managed server. Review data residency, cross-region latency and
+transfer costs first. Azure may retain a failed name's original region even when the
+server returns `ResourceNotFound`. In that case, set `managedPostgresServerName` to a new
+globally unique lowercase server name that includes `resourcePrefix`; its default remains
+`pg-<resourcePrefix>-<suffix>`. This overrides only PostgreSQL naming, including its
+connection string and ownership outputs, without renaming the API or other resources.
+Keep the selected name and region in the same private parameter file for every rerun.
+Never use these overrides to move, replace or abandon an existing database; adopted
+server names continue to come from the adopted resource ID.
+
 ### Observer capacity
 
 `observerLocation` defaults to the platform region. Before an Observer app or plan exists,
@@ -616,13 +627,40 @@ python -m backend.accounts <owner-email> --role owner
 
 ## Customer Foundry onboarding
 
-The deployment output includes the APIM managed-identity principal ID. Turnstile does not grant it access to customer resources and does not create a Foundry project.
+The deployment outputs include both `apimPrincipalId` and `controlPlanePrincipalId`.
+Turnstile does not grant access to customer Foundry resources by default and does not create
+a Foundry project. Optional Foundry grants require customer approval.
 
 Use the authenticated web console to add the existing Foundry Project Endpoint and model deployment. The user does not enter model capabilities: Turnstile derives them from the provider protocol, including `chat`, `tools`, and `streaming` for OpenAI-family Foundry deployments. If the candidate probe lacks access, the publication pauses and displays the exact principal, resource endpoint, and `Cognitive Services User` role. An Azure user authorized on that Foundry account grants the role, then resumes the publication in the same dialog. Model access remains explicit; assign the new model to the intended people before using Invocation Test.
 
 Creating connections or models through direct API calls does not count as frontend E2E evidence.
 
 ### Managed identity authorization
+
+Foundry managed-identity onboarding requires two independently authorized identities:
+
+| Identity | Purpose | Role on the Foundry account |
+| --- | --- | --- |
+| Publisher / Control-plane Function (`controlPlanePrincipalId`) | Read deployment metadata before publication | `Cognitive Services Data Reader` (`b59867f0-fa02-499b-be73-45a86b5b3e1c`) |
+| APIM (`apimPrincipalId`) | Send upstream inference requests and publication probes | `Cognitive Services User` (`a97b65f3-24c7-4388-baec-2e87135dc908`) |
+
+The Publisher directly reads `GET <Project Endpoint>/deployments?api-version=v1` with its own
+`https://ai.azure.com` token. APIM's grant does not authorize this request. Data Reader supplies
+`Microsoft.CognitiveServices/*/read` data actions without inference or key-listing permissions;
+ARM-only `Reader` is insufficient, while `Foundry User` is unnecessarily broad.
+
+To configure both grants during deployment, set the existing orchestrator parameter
+`foundryCognitiveServicesAccountResourceId` to the approved account's ARM resource ID.
+`scripts.deploy` (also used by `deploy-turnstile.ps1`) grants both roles at **account scope**,
+so the Publisher can read metadata across that account's projects. The operator needs
+role-assignment write permission there. These grants are outside the root Bicep What-if;
+their exact IDs are recorded in `managedRoleAssignmentIds` for cleanup. Omitting the parameter
+creates neither grant. No additional parameter or manifest field is required.
+
+For project-only Publisher access, grant Data Reader manually on the intended project rather
+than using the account-scoped deployment option. Allow RBAC propagation and verify metadata
+access as the Publisher; `deployment_metadata_unavailable` 401/403 is separate from APIM
+management or inference authorization. API-key connections use their key for this read.
 
 Enabling a managed identity and granting it Foundry access are separate operations. The API,
 publisher Function and APIM have different identities. APIM authenticates the upstream model
@@ -645,7 +683,8 @@ networking or local authentication.
 Read back the assignment and allow RBAC propagation before resuming the **same** publication.
 Require its real Chat Completions, Responses and compact probes to pass and the publication to
 reach `active`. A Running Function, successful role deployment, or a single Chat response is
-not proof of completed model publication. Do not infer a particular missing permission from
+not proof of completed model publication. Verify both the Publisher metadata read and the
+APIM inference probes. Do not infer a particular missing permission from
 a generic 403 alone.
 
 ### API-key alternative

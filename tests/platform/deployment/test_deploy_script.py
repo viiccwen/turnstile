@@ -1573,7 +1573,7 @@ def test_managed_role_assignment_name_is_stable() -> None:
     ) == "d5ee4e88-fb8e-26a0-77e6-c0fa4d79a75c"
 
 
-def test_foundry_role_is_granted_to_apim_identity(
+def test_foundry_roles_are_granted_to_apim_and_publisher_identities(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     subscription = "00000000-0000-0000-0000-000000000001"
@@ -1606,14 +1606,21 @@ def test_foundry_role_is_granted_to_apim_identity(
     monkeypatch.setattr(runner, "run_json", run_json)
 
     managed = ensure_foundry_role(
-        runner, inputs, {"apimPrincipalId": "apim-principal"}
+        runner, inputs, {
+            "apimPrincipalId": "apim-principal", "controlPlanePrincipalId": "publisher-principal",
+        }
     )
 
-    assert len(managed) == 1
+    assert len(managed) == 2
     assert commands[0][commands[0].index("--role") + 1] == (
         "a97b65f3-24c7-4388-baec-2e87135dc908"
     )
-    assert commands[0][commands[0].index("--scope") + 1] == foundry_id
+    assert commands[1][commands[1].index("--role") + 1] == (
+        "b59867f0-fa02-499b-be73-45a86b5b3e1c"
+    )
+    for command, principal in zip(commands, ("apim-principal", "publisher-principal"), strict=True):
+        assert command[command.index("--scope") + 1] == foundry_id
+        assert command[command.index("--assignee-object-id") + 1] == principal
 
 
 def test_owner_credentials_are_private_and_match_public_email(tmp_path: Path) -> None:
@@ -1676,6 +1683,34 @@ def test_base_parameters_disable_workers_until_observer_exists(tmp_path: Path) -
     assert parameters["keyVaultPrivateDnsLinkName"]["value"] == "turnstile-vnet"
     assert parameters["apimUsageObserver"]["value"]["mode"] == "disabled"
     assert "observerAdapterSharedKey" not in parameters
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_managed_postgres_name_override_survives_parameter_loading_and_resume(
+    tmp_path: Path, resume: bool,
+) -> None:
+    path = _parameters(tmp_path / "parameters.json")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    name = "pg-turnstile-ne-recovery"
+    document["parameters"]["managedPostgresServerName"] = {"value": name}
+    document["parameters"]["postgresLocation"] = {"value": "northeurope"}
+    path.write_text(json.dumps(document), encoding="utf-8")
+    inputs = DeploymentInputs.load("subscription", path, tmp_path / "state.json")
+    answers = iter(("a-secure-owner-password", "a-secure-owner-password"))
+    material = load_or_create_secret_material(
+        inputs,
+        read_password=lambda _: next(answers),
+        require_owner_password=False,
+    )
+
+    parameters = deployment_parameters(
+        inputs, material, resume_existing_environment=resume,
+    )["parameters"]
+
+    assert parameters["managedPostgresServerName"]["value"] == name
+    assert parameters["postgresLocation"]["value"] == "northeurope"
+    assert parameters["provisionPostgres"]["value"] is not resume
+    assert parameters["postgresAdopted"]["value"] is False
 
 
 def test_external_apim_still_provisions_a_clean_platform(tmp_path: Path) -> None:
@@ -2461,13 +2496,13 @@ def test_existing_program_delegation_uses_guarded_cutover(
             tmp_path, initialization, False,
         )
         descriptor = bootstrap.FixedInstallationDescriptor.model_validate_json(
-            json.dumps(runtime.call_args.args[5]),
+            json.dumps(runtime.call_args.args[6]),
         )
-        inputs = cast(Mock, deploy.deploy_template).call_args.args[1]
-        parameters = cast(Mock, deploy.deploy_template).call_args.args[3]["parameters"]
-        outputs = runtime.call_args.args[1]
+        inputs = cast(Mock, deploy.deploy_resource_group_template).call_args.args[1]
+        parameters = cast(Mock, deploy.deploy_resource_group_template).call_args.args[3]["parameters"]
+        outputs = runtime.call_args.args[2]
         parent = parameters["parentPolicy"]["value"]
-        trust = runtime.call_args.args[7]
+        trust = runtime.call_args.args[8]
     policies = {item["name"]: item["policy"]
                 for item in parameters["fixedOperations"]["value"]}
     installed = bootstrap.installation_record(descriptor, "a" * 64)
@@ -2670,17 +2705,18 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
         test_initial_fixed_program_binds_compiled_policies_before_registration(
             tmp_path, setup, False,
         )
-        parameters = cast(Mock, deploy.deploy_template).call_args.args[3]["parameters"]
-        deployment_inputs = cast(Mock, deploy.deploy_template).call_args.args[1]
-        deployment_outputs = {**runtime.call_args.args[1], "apiUrl": "https://api-test.example.test"}
+        parameters = cast(Mock, deploy.deploy_resource_group_template).call_args.args[3]["parameters"]
+        deployment_inputs = cast(Mock, deploy.deploy_resource_group_template).call_args.args[1]
+        deployment_outputs = {**runtime.call_args.args[2], "apiUrl": "https://api-test.example.test"}
         descriptor = bootstrap.FixedInstallationDescriptor.model_validate_json(
-            json.dumps(runtime.call_args.args[5]),
+            json.dumps(runtime.call_args.args[6]),
         )
         old_parent = parameters["parentPolicy"]["value"]
-        trust = runtime.call_args.args[7]
+        trust = runtime.call_args.args[8]
     target = descriptor.registration.gateway_profile_id
     deployment = native_state.startswith("deployment_")
     arm_parameters = json.loads(json.dumps(parameters))
+    arm_parameters["apimResourceGroupName"] = {"value": descriptor.registration.resource_group}
     if native_state == "deployment_source":
         arm_parameters["parentPolicy"]["value"] = old_parent.replace(
             'name="routeTrust"', 'name="drift"',
@@ -3016,9 +3052,16 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
             "require_prerequisites", "validate_source_snapshot", "what_if_resource_group",
             "deploy_resource_group_template", "what_if", "build_and_start_observer",
             "wait_for_observer_health", "verify_owner_login", "verify_telemetry_function_health",
+            "validate_shared_storage_account", "validate_existing_dependencies",
+            "ensure_shared_storage_resources",
             "_confirm_deployment", "_write_outputs",
         ):
             monkeypatch.setattr(deploy, name, Mock())
+        for name in (
+            "ensure_shared_storage_roles", "ensure_foundry_role",
+            "ensure_adopted_dependency_roles", "ensure_observer_event_hub_role",
+        ):
+            monkeypatch.setattr(deploy, name, Mock(return_value=set()))
         completion = Mock()
         monkeypatch.setattr(deploy, "_write_outputs", completion)
         printed = Mock()
@@ -3066,7 +3109,16 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
                     native_state in {"deployment_unknown", "deployment_mismatch"}
                 )
                 assert len(writes) == (native_state != "deployment_etag")
-                completion.assert_not_called()
+                # Platform replay and role ownership checkpoints precede cutover;
+                # failure must not produce the fourth, final completion write.
+                assert completion.call_count == 3
+                assert all(
+                    call.args[1] == {
+                        **deployment_outputs, "webAppUrl": "https://observer.example.test",
+                        **({"managedRoleAssignmentIds": []} if index else {}),
+                    }
+                    for index, call in enumerate(completion.call_args_list)
+                )
                 assert all(call.args != ("Turnstile deployment completed.",)
                            for call in printed.call_args_list)
                 assert repository.effective_gateway_publication.return_value == original_publication
@@ -3240,15 +3292,23 @@ def test_partial_fixed_installation_reuses_bound_checkpoint_without_policy_write
 
 
 @pytest.mark.parametrize("wrong_binding", [False, True])
+@pytest.mark.parametrize("timeout_stage", [None, "login", "preview"])
 def test_initial_fixed_program_readiness_requires_verified_binding_and_logout(
     monkeypatch: pytest.MonkeyPatch,
     wrong_binding: bool,
+    timeout_stage: str | None,
 ) -> None:
     calls: list[str] = []
     client_factory = httpx.Client
+    timeout_path = (
+        "/api/v1/auth/login" if timeout_stage == "login" else
+        "/api/v1/model-management/gateways/unit-target/program-upgrades/preview"
+    )
 
     def respond(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.path)
+        if timeout_stage and request.url.path == timeout_path and calls.count(timeout_path) == 1:
+            raise httpx.ReadTimeout("Offline transient readiness timeout", request=request)
         if request.method == "POST":
             return httpx.Response(200, json={})
         return httpx.Response(
@@ -3271,6 +3331,7 @@ def test_initial_fixed_program_readiness_requires_verified_binding_and_logout(
             transport=httpx.MockTransport(respond),
         ),
     )
+    monkeypatch.setattr("scripts.deploy.time.sleep", lambda _: None)
     descriptor = {
         "registration": {"gateway_profile_id": "unit-target"},
         "binding": {"program_sha256": "a" * 64},
@@ -3281,6 +3342,47 @@ def test_initial_fixed_program_readiness_requires_verified_binding_and_logout(
             verify_initial_fixed_program(*arguments)
     else:
         verify_initial_fixed_program(*arguments)
+    expected = [
+        "/api/v1/auth/login",
+        "/api/v1/model-management/gateways/unit-target/program-upgrades/preview",
+        "/api/v1/auth/logout",
+    ]
+    if timeout_stage:
+        expected.insert(expected.index(timeout_path), timeout_path)
+    assert calls == expected
+
+
+@pytest.mark.parametrize("status", [None, 401, 500])
+def test_initial_fixed_program_readiness_timeout_is_bounded_and_http_errors_are_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int | None,
+) -> None:
+    client_factory = httpx.Client
+    calls: list[str] = []
+    clock = iter([0, 0, 0, 181])
+    monkeypatch.setattr("scripts.deploy.time.monotonic", lambda: next(clock, 181))
+    monkeypatch.setattr("scripts.deploy.time.sleep", lambda _: None)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.method == "POST":
+            return httpx.Response(200)
+        if status is None:
+            raise httpx.ReadTimeout("Offline persistent timeout", request=request)
+        return httpx.Response(status)
+
+    monkeypatch.setattr("scripts.deploy.httpx.Client", lambda **kwargs: client_factory(
+        **kwargs, transport=httpx.MockTransport(respond),
+    ))
+    descriptor = {
+        "registration": {"gateway_profile_id": "unit-target"},
+        "binding": {"program_sha256": "a" * 64},
+    }
+    error = DeploymentError if status is None else httpx.HTTPStatusError
+    with pytest.raises(error):
+        verify_initial_fixed_program(
+            "https://api.example.test", "owner@example.test", "offline", descriptor,
+        )
     assert calls == [
         "/api/v1/auth/login",
         "/api/v1/model-management/gateways/unit-target/program-upgrades/preview",

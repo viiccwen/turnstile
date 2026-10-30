@@ -351,6 +351,24 @@ def test_what_if_rejects_other_resources_and_unresolved_writes(kind: str) -> Non
     }]}, plan, "prepare", plan.revision)
 
 
+def test_upgrade_policy_reader_falls_back_only_for_malformed_raw_xml() -> None:
+    raw = '<policies><inbound><set-variable name="guard" value="@(x == "y")" /></inbound></policies>'
+    xml = '<policies><inbound><set-variable name="guard" value="@(x == &quot;y&quot;)" /></inbound></policies>'
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        form = request.url.params["format"]
+        requests.append(form)
+        return httpx.Response(200, json={
+            "properties": {"value": raw if form == "rawxml" else xml},
+        })
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        backend = AzureUpgradeBackend(client, API_ID, (), lambda *_: None)
+        assert backend._policy(API_ID) == xml
+    assert requests == ["rawxml", "xml"]
+
+
 @pytest.mark.parametrize("policy_content_type", [
     "application/json",
     "application/vnd.ms-azure-apim.policy.raw+xml; charset=utf-8",

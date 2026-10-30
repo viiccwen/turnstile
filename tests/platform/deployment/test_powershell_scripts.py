@@ -268,6 +268,19 @@ def test_remove_accepts_exact_legacy_and_arm_shared_dependency_grants(arm_names:
             digest = hashlib.sha256(f"turnstile|{scope.lower()}|{principal}|{role}".encode()).hexdigest()
             name = f"{digest[:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
         expected.append(f"{scope}/providers/Microsoft.Authorization/roleAssignments/{name}")
+    foundry = (
+        "/subscriptions/sub/resourceGroups/customer/providers/"
+        "Microsoft.CognitiveServices/accounts/foundry"
+    )
+    for principal, role in (
+        ("apim", "a97b65f3-24c7-4388-baec-2e87135dc908"),
+        ("control", "b59867f0-fa02-499b-be73-45a86b5b3e1c"),
+    ):
+        digest = hashlib.sha256(
+            f"turnstile|{foundry.lower()}|{principal}|{role}".encode()
+        ).hexdigest()
+        name = f"{digest[:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
+        expected.append(f"{foundry}/providers/Microsoft.Authorization/roleAssignments/{name}")
     outputs = {
         "telemetryPrincipalId": "telemetry", "controlPlanePrincipalId": "control",
         "apiPrincipalId": "api", "apimPrincipalId": "apim",
@@ -280,7 +293,8 @@ def test_remove_accepts_exact_legacy_and_arm_shared_dependency_grants(arm_names:
     # Restore the opening condition removed by split; execute exactly the production block.
     setup = f"""
 $Subscription = 'sub'; $platformResourceGroup = 'platform'; $storageResourceGroup = 'storage'
-$storageAccountName = 'shared'; $ledgerTableName = 'TurnstileLedger'; $foundryResourceId = ''
+$storageAccountName = 'shared'; $ledgerTableName = 'TurnstileLedger'
+$foundryResourceId = '{foundry}'
 $outputDocument = {_ps_json(outputs)}
 $managedRoleAssignmentIds = @({_ps_json(expected)})
 """

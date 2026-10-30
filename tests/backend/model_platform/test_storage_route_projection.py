@@ -42,10 +42,13 @@ from turnstile_core.integrations.storage_route_projection import (
 from turnstile_core.integrations.table_batch import conditional_batch
 
 
-@pytest.mark.parametrize("fault", [None, "target", "api", "publisher", "endpoint", "operations"])
+@pytest.mark.parametrize("fault", [
+    None, "target", "api", "publisher", "endpoint", "path_case", "scheme", "operations",
+])
 @pytest.mark.parametrize("current_capabilities", [False, True])
+@pytest.mark.parametrize("service_name", ["public-test-apim", "Public-Test-APIM"])
 def test_public_fixed_installation_descriptor_keeps_target_binding(
-    fault: str | None, current_capabilities: bool,
+    fault: str | None, current_capabilities: bool, service_name: str,
 ) -> None:
     from pydantic import ValidationError
 
@@ -64,7 +67,7 @@ def test_public_fixed_installation_descriptor_keeps_target_binding(
             "tenant_id": str(UUID(int=972)),
             "subscription_id": str(UUID(int=973)),
             "resource_group": "public-test-rg",
-            "service_name": "public-test-apim",
+            "service_name": service_name,
             "service_principal_id": str(UUID(int=974)),
             "api_id": "turnstile-llm",
             "api_path": "turnstile/llm",
@@ -112,6 +115,14 @@ def test_public_fixed_installation_descriptor_keeps_target_binding(
         descriptor["binding"]["publisher_subscription_id"] = "other-publisher"
     elif fault == "endpoint":
         descriptor["registration"]["managed_gateway_url"] = "https://other.example.test/api"
+    elif fault == "path_case":
+        descriptor["registration"]["managed_gateway_url"] = (
+            "https://public-test-apim.azure-api.net/Turnstile/llm"
+        )
+    elif fault == "scheme":
+        descriptor["registration"]["managed_gateway_url"] = (
+            "http://public-test-apim.azure-api.net/turnstile/llm"
+        )
     elif fault == "operations":
         policies = descriptor["operation_policies_sha256"]
         policies.pop(next(iter(policies)))

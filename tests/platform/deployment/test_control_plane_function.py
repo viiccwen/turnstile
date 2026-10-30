@@ -239,8 +239,10 @@ def test_disabled_publication_timer_does_not_build_dependencies(monkeypatch: Any
 
 @pytest.mark.parametrize("bootstrap_fails", [False, True])
 @pytest.mark.parametrize("already_installed", [False, True])
+@pytest.mark.parametrize("endpoint_suffix", ["", "/"])
 def test_initial_fixed_program_uses_resolved_target_before_publication(
     monkeypatch: pytest.MonkeyPatch, bootstrap_fails: bool, already_installed: bool,
+    endpoint_suffix: str,
 ) -> None:
     import hashlib
     import json
@@ -258,7 +260,7 @@ def test_initial_fixed_program_uses_resolved_target_before_publication(
         azure_subscription_id=str(UUID(int=972)),
         apim_resource_group="unit-rg", apim_service_name="unit-apim", apim_api_id="unit-api",
         apim_gateway_profile_id=None, apim_probe_subscription_key=SecretStr("offline-key"),
-        ledger_table_endpoint="https://unitstore.table.core.windows.net",
+        ledger_table_endpoint="https://unitstore.table.core.windows.net" + endpoint_suffix,
         ledger_table_name="TurnstileLedger",
     )
     scoped_settings = settings.model_copy(update={"apim_gateway_profile_id": target_id})
@@ -272,7 +274,7 @@ def test_initial_fixed_program_uses_resolved_target_before_publication(
     descriptor.registration.resource_group = "unit-rg"
     descriptor.registration.service_name = "unit-apim"
     descriptor.registration.api_id = "unit-api"
-    descriptor.binding.ledger_table_endpoint = settings.ledger_table_endpoint
+    descriptor.binding.ledger_table_endpoint = "https://unitstore.table.core.windows.net"
     descriptor.binding.ledger_table_name = settings.ledger_table_name
     descriptor.model_dump.return_value = {"target": str(target_id)}
 

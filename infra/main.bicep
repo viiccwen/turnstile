@@ -283,6 +283,11 @@ param postgresSkuName string = 'Standard_B1ms'
 param postgresTier string = 'Burstable'
 param suffix string = uniqueString(subscription().id, resourceGroup().name)
 
+@description('Managed PostgreSQL server name. Override only before creation to recover from a failed allocation; keep the resource prefix and preserve the name on reruns.')
+@minLength(3)
+@maxLength(63)
+param managedPostgresServerName string = 'pg-${resourcePrefix}-${suffix}'
+
 var effectiveApimResourceGroupName = provisionApimService ? resourceGroup().name : existingApimResourceGroupName
 // Adopted networks are operator-owned; never create subnets in them implicitly.
 var provisionApimOutboundNetwork = provisionApimService && provisionNetwork && apimSkuName == 'StandardV2'
@@ -318,6 +323,7 @@ module dataPlane 'modules/data-plane.bicep' = {
     location: location
     provisionApimOutboundNetwork: provisionApimOutboundNetwork
     postgresLocation: postgresLocation
+    managedPostgresServerName: managedPostgresServerName
     resourcePrefix: resourcePrefix
     suffix: suffix
     telemetryStorageName: sharedStorage.name

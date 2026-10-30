@@ -156,6 +156,32 @@ def test_postgres_availability_zone_is_configurable_with_the_existing_default() 
     assert "availabilityZone: '1'" not in DATA_PLANE
 
 
+def test_managed_postgres_name_can_change_without_renaming_other_resources() -> None:
+    for template in (MAIN, DATA_PLANE):
+        assert (
+            "param managedPostgresServerName string = 'pg-${resourcePrefix}-${suffix}'"
+            in template
+        )
+    assert "managedPostgresServerName: managedPostgresServerName" in MAIN
+    assert "var managedPostgresServerName =" not in DATA_PLANE
+    assert (
+        "var effectivePostgresServerName = postgresAdopted ? existingPostgresServerName "
+        ": managedPostgresServerName"
+    ) in DATA_PLANE
+    postgres = DATA_PLANE.split("resource managedPostgres ", 1)[1].split(
+        "\nresource ", 1
+    )[0]
+    assert "name: managedPostgresServerName" in postgres
+    assert "location: postgresLocation" in postgres
+    assert (
+        "resourceId('Microsoft.DBforPostgreSQL/flexibleServers', managedPostgresServerName)"
+        in DATA_PLANE
+    )
+    assert "${effectivePostgresServerName}.postgres.database.azure.com" in DATA_PLANE
+    assert "var apiName = 'api-${resourcePrefix}-${suffix}'" in DATA_PLANE
+    assert "var managedVirtualNetworkName = 'vnet-${resourcePrefix}-${suffix}'" in DATA_PLANE
+
+
 def test_observer_compute_region_does_not_move_the_registry() -> None:
     assert "param registryLocation string = location" in OBSERVER_MAIN
     registry = OBSERVER_MAIN.split("module registry ", 1)[1].split("module app ", 1)[0]

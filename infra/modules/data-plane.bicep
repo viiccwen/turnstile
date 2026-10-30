@@ -7,6 +7,9 @@ param postgresLocation string
 @maxLength(12)
 param resourcePrefix string
 param suffix string
+@minLength(3)
+@maxLength(63)
+param managedPostgresServerName string = 'pg-${resourcePrefix}-${suffix}'
 param telemetryStorageName string
 param telemetryBlobEndpoint string
 param telemetryQueueEndpoint string
@@ -99,7 +102,6 @@ param bootstrapOwnerPasswordHash string
 
 // Keep the vault within 24 characters without renaming valid existing prefixes.
 var credentialVaultName = 'kv-${take(resourcePrefix, 11)}-rt-${take(suffix, 6)}'
-var managedPostgresServerName = 'pg-${resourcePrefix}-${suffix}'
 var managedDatabaseName = 'turnstile'
 var managedEventHubNamespaceName = 'eh-${resourcePrefix}-${suffix}'
 var managedEventHubName = 'token-usage'

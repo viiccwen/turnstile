@@ -158,6 +158,7 @@ STORAGE_TABLE_DATA_READER_ROLE_ID = "76199698-9eea-4c19-bc75-cec21354c6b6"
 RBAC_ADMIN_ROLE_ID = "f58310d9-a9f6-439a-9e8d-f62e7b41a168"
 KEY_VAULT_SECRETS_OFFICER_ROLE_ID = "b86a8fe4-44ce-4948-aee5-eccb2c155cd7"
 COGNITIVE_SERVICES_USER_ROLE_ID = "a97b65f3-24c7-4388-baec-2e87135dc908"
+COGNITIVE_SERVICES_DATA_READER_ROLE_ID = "b59867f0-fa02-499b-be73-45a86b5b3e1c"
 EVENT_HUB_DATA_RECEIVER_ROLE_ID = "a638d3c7-ab3a-418d-83e6-5f17a39d4fde"
 EVENT_HUB_DATA_SENDER_ROLE_ID = "2b629674-e913-4c01-ae53-ef4638d8f975"
 LOG_ANALYTICS_READER_ROLE_ID = "73c42c96-874c-492b-b04d-ab87d138a893"
@@ -2132,6 +2133,12 @@ def ensure_foundry_role(
                 _output_string(outputs, "apimPrincipalId"),
                 "Cognitive Services User",
                 COGNITIVE_SERVICES_USER_ROLE_ID,
+                inputs.foundry_resource_id,
+            ),
+            (
+                _output_string(outputs, "controlPlanePrincipalId"),
+                "Cognitive Services Data Reader",
+                COGNITIVE_SERVICES_DATA_READER_ROLE_ID,
                 inputs.foundry_resource_id,
             ),
         ),
@@ -4153,7 +4160,11 @@ def verify_initial_fixed_program(
             raise DeploymentError("Initial fixed program Owner login timed out")
         try:
             while (remaining := deadline - time.monotonic()) > 0:
-                response = http.get(path, timeout=min(15, remaining))
+                try:
+                    response = http.get(path, timeout=min(15, remaining))
+                except httpx.TimeoutException:
+                    time.sleep(min(3, max(0, deadline - time.monotonic())))
+                    continue
                 if response.status_code == 200:
                     preview = response.json()
                     installation = preview["current_installation"]
