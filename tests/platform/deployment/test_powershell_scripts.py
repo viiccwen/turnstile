@@ -36,7 +36,8 @@ def test_deploy_script_uses_supported_orchestrator() -> None:
     assert "require the top-level adoptedSecrets object" in DEPLOY
     assert "Protect-PrivateFile $parameterPath" in DEPLOY
     assert "adoptedSecrets must contain one JSON object" in DEPLOY
-    assert "adoptedSecrets must contain exactly the five documented JSON keys" in DEPLOY
+    assert "adoptedSecrets must contain the four documented JSON keys" in DEPLOY
+    assert "$_ -ne 'managementApiKey'" in DEPLOY
     assert "adoptedSecrets contains an empty value" in DEPLOY
     for field in (
         "databaseUrl",

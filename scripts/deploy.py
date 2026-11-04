@@ -96,7 +96,6 @@ PasswordReader = Callable[[str], str]
 GENERATED_SECRET_PARAMETER_NAMES = {
     "postgresAdministratorPassword",
     "credentialEncryptionKey",
-    "managementApiKey",
     "apimSubscriptionKey",
     "apimProbeSubscriptionKey",
     "bootstrapOwnerPasswordHash",
@@ -175,7 +174,6 @@ KEY_VAULT_SECRETS_USER_ROLE_ID = "4633458b-17de-408a-b874-0445c86b69e6"
 ADOPTED_SECRET_FIELDS = {
     "databaseUrlOverride": "databaseUrl",
     "credentialEncryptionKey": "credentialEncryptionKey",
-    "managementApiKey": "managementApiKey",
     "apimSubscriptionKey": "apimSubscriptionKey",
     "apimProbeSubscriptionKey": "apimProbeSubscriptionKey",
 }
@@ -497,7 +495,6 @@ class ExistingKeyVault:
     name: str
     database_url: KeyVaultSecretReference
     credential_encryption_key: KeyVaultSecretReference
-    management_api_key: KeyVaultSecretReference
     apim_subscription_key: KeyVaultSecretReference
     apim_probe_subscription_key: KeyVaultSecretReference
 
@@ -509,7 +506,6 @@ class ExistingKeyVault:
             "existingKeyVaultResourceId",
             "existingDatabaseUrlSecretUri",
             "existingCredentialEncryptionKeySecretUri",
-            "existingManagementApiKeySecretUri",
             "existingApimSubscriptionKeySecretUri",
             "existingApimProbeSubscriptionKeySecretUri",
         )
@@ -538,7 +534,6 @@ class ExistingKeyVault:
             credential_encryption_key=secret(
                 "existingCredentialEncryptionKeySecretUri"
             ),
-            management_api_key=secret("existingManagementApiKeySecretUri"),
             apim_subscription_key=secret("existingApimSubscriptionKeySecretUri"),
             apim_probe_subscription_key=secret(
                 "existingApimProbeSubscriptionKeySecretUri"
@@ -590,10 +585,14 @@ class DeploymentInputs:
                 raise DeploymentError("adoptedSecrets must contain one JSON object")
             expected_secret_fields = set(ADOPTED_SECRET_FIELDS.values())
             configured_secret_fields = set(raw_adopted_secrets)
-            if configured_secret_fields != expected_secret_fields:
+            if (
+                not expected_secret_fields <= configured_secret_fields
+                or configured_secret_fields - expected_secret_fields - {"managementApiKey"}
+            ):
                 raise DeploymentError(
                     "adoptedSecrets must contain exactly: "
                     + ", ".join(sorted(expected_secret_fields))
+                    + " (the retired managementApiKey field is accepted but ignored)"
                 )
             if not all(
                 isinstance(raw_adopted_secrets[name], str)
@@ -947,7 +946,6 @@ def load_or_create_secret_material(
     values = {
         "postgresAdministratorPassword": secrets.token_urlsafe(32),
         "credentialEncryptionKey": Fernet.generate_key().decode("ascii"),
-        "managementApiKey": secrets.token_urlsafe(32),
         "apimSubscriptionKey": secrets.token_hex(32),
         "apimProbeSubscriptionKey": secrets.token_hex(32),
         "bootstrapOwnerPasswordHash": hash_password(owner_password),
@@ -1109,12 +1107,6 @@ def deployment_parameters(
         ),
         existingCredentialKeyResourceId=(
             key_vault.credential_encryption_key.resource_id if key_vault else ""
-        ),
-        existingManagementApiKeySecretUri=(
-            key_vault.management_api_key.uri if key_vault else ""
-        ),
-        existingManagementKeyResourceId=(
-            key_vault.management_api_key.resource_id if key_vault else ""
         ),
         existingApimSubscriptionKeySecretUri=(
             key_vault.apim_subscription_key.uri if key_vault else ""

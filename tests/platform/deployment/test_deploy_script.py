@@ -212,7 +212,8 @@ def test_secret_state_is_private_stable_and_excludes_plaintext(tmp_path: Path) -
         "Initial Owner password (minimum 12 characters): ",
         "Repeat Initial Owner password (minimum 12 characters): ",
     ]
-    assert first.values["observerAdapterSharedKey"] != first.values["managementApiKey"]
+    assert "managementApiKey" not in first.values
+    assert first.values["observerAdapterSharedKey"] != first.values["credentialEncryptionKey"]
     assert "a-secure-owner-password" not in inputs.state_path.read_text(encoding="utf-8")
     if os.name != "nt":
         assert stat.S_IMODE(inputs.state_path.stat().st_mode) == 0o600
@@ -251,11 +252,40 @@ def test_resume_rejects_short_owner_password_before_deployment(tmp_path: Path) -
 def test_public_parameter_file_rejects_secure_values(tmp_path: Path) -> None:
     path = _parameters(tmp_path / "parameters.json")
     document = json.loads(path.read_text(encoding="utf-8"))
-    document["parameters"]["managementApiKey"] = {"value": "do-not-store-here"}
+    document["parameters"]["credentialEncryptionKey"] = {"value": "do-not-store-here"}
     path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(DeploymentError, match="Keep secure parameters out"):
         DeploymentInputs.load("subscription", path)
+
+
+@pytest.mark.parametrize("with_retired_key", [False, True])
+def test_existing_secret_state_does_not_require_or_deploy_management_key(
+    tmp_path: Path, with_retired_key: bool,
+) -> None:
+    inputs = DeploymentInputs.load(
+        "00000000-0000-0000-0000-000000000001", _parameters(tmp_path / "parameters.json"),
+        tmp_path / "state.json",
+    )
+    answers = iter(("a-secure-owner-password", "a-secure-owner-password"))
+    original = load_or_create_secret_material(
+        inputs, read_password=lambda _: next(answers), require_owner_password=False,
+    )
+    if with_retired_key:
+        document = json.loads(inputs.state_path.read_text())
+        document["parameters"]["managementApiKey"] = "unit-retired-management-key"
+        inputs.state_path.write_text(json.dumps(document))
+    retained_bytes = inputs.state_path.read_bytes()
+    reused = load_or_create_secret_material(
+        inputs, read_password=lambda _: "not-needed", require_owner_password=False,
+    )
+    assert inputs.state_path.read_bytes() == retained_bytes
+    parameters = deployment_parameters(inputs, reused)["parameters"]
+    assert "managementApiKey" not in parameters
+    for name, value in original.values.items():
+        assert reused.values[name] == value
+    for name in ("credentialEncryptionKey", "apimSubscriptionKey", "apimProbeSubscriptionKey"):
+        assert parameters[name]["value"] == original.values[name]
 
 
 @pytest.mark.parametrize(
@@ -474,8 +504,8 @@ def test_existing_key_vault_secret_uri_must_use_the_configured_vault(
         or name == "existingKeyVaultResourceId"
         or "SecretUri" in name
     }
-    selected["existingManagementApiKeySecretUri"] = (
-        "https://shared-vault.vault.evil.example/secrets/management-api-key"
+    selected["existingCredentialEncryptionKeySecretUri"] = (
+        "https://shared-vault.vault.evil.example/secrets/credential-encryption-key"
     )
     path = _set_parameters(_parameters(tmp_path / "parameters.json"), selected)
 
@@ -483,8 +513,9 @@ def test_existing_key_vault_secret_uri_must_use_the_configured_vault(
         DeploymentInputs.load(subscription, path)
 
 
+@pytest.mark.parametrize("with_retired_key", [False, True])
 def test_adopted_secrets_are_resolved_from_private_parameters_without_rewriting_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_retired_key: bool,
 ) -> None:
     subscription = "00000000-0000-0000-0000-000000000001"
     values = _adopted_dependency_values(subscription)
@@ -495,6 +526,8 @@ def test_adopted_secrets_are_resolved_from_private_parameters_without_rewriting_
         or name == "existingKeyVaultResourceId"
         or "SecretUri" in name
     }
+    if not with_retired_key:
+        selected.pop("existingManagementApiKeySecretUri")
     path = _set_parameters(_parameters(tmp_path / "parameters.json"), selected)
     initial_inputs = DeploymentInputs.load(subscription, path, tmp_path / "state.json")
     answers = iter(("a-secure-owner-password", "a-secure-owner-password"))
@@ -508,10 +541,11 @@ def test_adopted_secrets_are_resolved_from_private_parameters_without_rewriting_
     adopted_secrets = {
         "databaseUrl": "postgresql://user:secret@postgres/db",
         "credentialEncryptionKey": fernet_key,
-        "managementApiKey": "management-secret",
         "apimSubscriptionKey": "dashboard-secret",
         "apimProbeSubscriptionKey": "probe-secret",
     }
+    if with_retired_key:
+        adopted_secrets["managementApiKey"] = "management-secret"
     _set_adopted_secrets(path, adopted_secrets)
     inputs = DeploymentInputs.load(subscription, path, initial_inputs.state_path)
     runner = CommandRunner()
@@ -524,7 +558,8 @@ def test_adopted_secrets_are_resolved_from_private_parameters_without_rewriting_
 
     assert resolved.database_url_override == adopted_secrets["databaseUrl"]
     assert resolved.values["credentialEncryptionKey"] == fernet_key
-    assert resolved.values["managementApiKey"] == "management-secret"
+    assert "managementApiKey" not in resolved.values
+    assert "managementApiKey" not in deployment_parameters(inputs, resolved)["parameters"]
     assert inputs.state_path.read_text(encoding="utf-8") == original_state
     assert "management-secret" not in original_state
     assert "adoptedSecrets" not in inputs.parameters
@@ -5663,7 +5698,8 @@ def test_repository_parameter_examples_expose_the_same_supported_fields() -> Non
         "employeeClientId", "employeeAudience",
         "keyVaultPrivateDnsLinkName",
         *_adopted_dependency_values("subscription"),
-    } <= expected
+    } - {"existingManagementApiKeySecretUri"} <= expected
+    assert "existingManagementApiKeySecretUri" not in expected
     assert {
         name for name in expected if name.startswith("employee") and "ClientId" in name
     } == {"employeeClientId"}

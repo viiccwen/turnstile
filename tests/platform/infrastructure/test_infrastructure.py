@@ -1157,6 +1157,16 @@ def test_example_parameters_are_non_secret_and_environment_neutral() -> None:
         assert forbidden not in serialized
 
 
+def test_management_shared_secret_is_not_provisioned() -> None:
+    for source in (MAIN, DATA_PLANE):
+        assert "managementApiKey" not in source
+        assert "MANAGEMENT_API_KEY" not in source
+        assert "management-api-key" not in source
+    assert "CREDENTIAL_ENCRYPTION_KEY" in DATA_PLANE
+    assert "apim-subscription-key" in DATA_PLANE
+    assert "apim-probe-subscription-key" in DATA_PLANE
+
+
 def test_platform_identities_can_delegate_scoped_apim_dependency_roles() -> None:
     for template, event_hub in (
         (DATA_PLANE, "managedUsageEventHub"),

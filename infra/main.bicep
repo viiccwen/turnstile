@@ -105,8 +105,6 @@ param existingDatabaseUrlSecretUri string = ''
 param existingDatabaseUrlResourceId string = ''
 param existingCredentialEncryptionKeySecretUri string = ''
 param existingCredentialKeyResourceId string = ''
-param existingManagementApiKeySecretUri string = ''
-param existingManagementKeyResourceId string = ''
 param existingApimSubscriptionKeySecretUri string = ''
 param existingApimKeyResourceId string = ''
 param existingApimProbeSubscriptionKeySecretUri string = ''
@@ -173,9 +171,6 @@ param postgresAdministratorPassword string
 
 @secure()
 param credentialEncryptionKey string
-
-@secure()
-param managementApiKey string
 
 @secure()
 param apimSubscriptionKey string
@@ -366,8 +361,6 @@ module dataPlane 'modules/data-plane.bicep' = {
     existingDatabaseUrlResourceId: existingDatabaseUrlResourceId
     existingCredentialEncryptionKeySecretUri: existingCredentialEncryptionKeySecretUri
     existingCredentialKeyResourceId: existingCredentialKeyResourceId
-    existingManagementApiKeySecretUri: existingManagementApiKeySecretUri
-    existingManagementKeyResourceId: existingManagementKeyResourceId
     existingApimSubscriptionKeySecretUri: existingApimSubscriptionKeySecretUri
     existingApimKeyResourceId: existingApimKeyResourceId
     existingApimProbeSubscriptionKeySecretUri: existingApimProbeSubscriptionKeySecretUri
@@ -384,7 +377,6 @@ module dataPlane 'modules/data-plane.bicep' = {
     existingKeyVaultPrivateDnsZoneResourceGroupName: existingKeyVaultPrivateDnsZoneResourceGroupName
     existingKeyVaultPrivateDnsZoneName: existingKeyVaultPrivateDnsZoneName
     credentialEncryptionKey: credentialEncryptionKey
-    managementApiKey: managementApiKey
     apimSubscriptionKey: apimSubscriptionKey
     apimProbeSubscriptionKey: apimProbeSubscriptionKey
     apimPrincipalId: effectiveApimPrincipalId
@@ -630,8 +622,6 @@ output dependencyResources object = {
     databaseUrlSecretResourceId: dataPlane.outputs.databaseUrlSecretResourceId
     credentialEncryptionKeySecretUri: dataPlane.outputs.credentialEncryptionKeySecretUri
     credentialEncryptionKeySecretResourceId: dataPlane.outputs.credentialEncryptionKeySecretResourceId
-    managementApiKeySecretUri: dataPlane.outputs.managementApiKeySecretUri
-    managementApiKeySecretResourceId: dataPlane.outputs.managementApiKeySecretResourceId
     apimSubscriptionKeySecretUri: dataPlane.outputs.apimSubscriptionKeySecretUri
     apimSubscriptionKeySecretResourceId: dataPlane.outputs.apimSubscriptionKeySecretResourceId
     apimProbeSubscriptionKeySecretUri: dataPlane.outputs.apimProbeSubscriptionKeySecretUri

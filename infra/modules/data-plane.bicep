@@ -57,8 +57,6 @@ param existingDatabaseUrlSecretUri string = ''
 param existingDatabaseUrlResourceId string = ''
 param existingCredentialEncryptionKeySecretUri string = ''
 param existingCredentialKeyResourceId string = ''
-param existingManagementApiKeySecretUri string = ''
-param existingManagementKeyResourceId string = ''
 param existingApimSubscriptionKeySecretUri string = ''
 param existingApimKeyResourceId string = ''
 param existingApimProbeSubscriptionKeySecretUri string = ''
@@ -76,8 +74,6 @@ param existingKeyVaultPrivateDnsZoneResourceGroupName string = ''
 param existingKeyVaultPrivateDnsZoneName string = ''
 @secure()
 param credentialEncryptionKey string
-@secure()
-param managementApiKey string
 @secure()
 param apimSubscriptionKey string
 @secure()
@@ -312,14 +308,6 @@ resource credentialKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if
   }
 }
 
-resource managementKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (provisionKeyVault) {
-  parent: managedKeyVault
-  name: 'management-api-key'
-  properties: {
-    value: managementApiKey
-  }
-}
-
 resource apimKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (provisionKeyVault) {
   parent: managedKeyVault
   name: 'apim-subscription-key'
@@ -342,9 +330,6 @@ var effectiveDatabaseUrlSecretUri = provisionKeyVault
 var effectiveCredentialEncryptionKeySecretUri = provisionKeyVault
   ? credentialKeySecret!.properties.secretUri
   : existingCredentialEncryptionKeySecretUri
-var effectiveManagementApiKeySecretUri = provisionKeyVault
-  ? managementKeySecret!.properties.secretUri
-  : existingManagementApiKeySecretUri
 var effectiveApimSubscriptionKeySecretUri = provisionKeyVault
   ? apimKeySecret!.properties.secretUri
   : existingApimSubscriptionKeySecretUri
@@ -680,7 +665,6 @@ resource api 'Microsoft.Web/sites@2024-11-01' = {
         { name: 'DATABASE_URL', value: effectiveDatabaseUrl }
         { name: 'DATA_BACKEND', value: 'postgresql' }
         { name: 'CREDENTIAL_ENCRYPTION_KEY', value: credentialEncryptionKey }
-        { name: 'MANAGEMENT_API_KEY', value: managementApiKey }
         { name: 'APIM_PRINCIPAL_ID', value: apimPrincipalId }
         { name: 'DATABRICKS_OAUTH_ENABLED', value: string(databricksOAuthEnabled) }
         { name: 'AZURE_TENANT_ID', value: subscription().tenantId }
@@ -979,8 +963,6 @@ output keyVaultName string = effectiveKeyVaultName
 output keyVaultProvisioned bool = provisionKeyVault
 output databaseUrlSecretUri string = effectiveDatabaseUrlSecretUri
 output databaseUrlSecretResourceId string = provisionKeyVault ? databaseUrlSecret!.id : existingDatabaseUrlResourceId
-output managementApiKeySecretUri string = effectiveManagementApiKeySecretUri
-output managementApiKeySecretResourceId string = provisionKeyVault ? managementKeySecret!.id : existingManagementKeyResourceId
 output apimSubscriptionKeySecretUri string = effectiveApimSubscriptionKeySecretUri
 output apimSubscriptionKeySecretResourceId string = provisionKeyVault ? apimKeySecret!.id : existingApimKeyResourceId
 output apimProbeSubscriptionKeySecretUri string = effectiveApimProbeSubscriptionKeySecretUri

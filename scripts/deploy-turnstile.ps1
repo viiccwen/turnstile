@@ -38,7 +38,6 @@ $ErrorActionPreference = 'Stop'
 $adoptedSecretFields = @(
     'databaseUrl',
     'credentialEncryptionKey',
-    'managementApiKey',
     'apimSubscriptionKey',
     'apimProbeSubscriptionKey'
 )
@@ -115,9 +114,10 @@ if ($null -ne $adoptedSecretsProperty) {
     $configuredNames = @($adoptedSecretDocument.PSObject.Properties.Name)
     $expectedNames = @($adoptedSecretFields)
     $missingNames = @($expectedNames | Where-Object { $_ -notin $configuredNames })
-    $unexpectedNames = @($configuredNames | Where-Object { $_ -notin $expectedNames })
+    # Retain old private parameter files without deploying the retired management key.
+    $unexpectedNames = @($configuredNames | Where-Object { $_ -notin $expectedNames -and $_ -ne 'managementApiKey' })
     if ($missingNames.Count -or $unexpectedNames.Count) {
-        throw 'adoptedSecrets must contain exactly the five documented JSON keys.'
+        throw 'adoptedSecrets must contain the four documented JSON keys; the retired managementApiKey is optional and ignored.'
     }
     foreach ($field in $expectedNames) {
         $value = [string]$adoptedSecretDocument.PSObject.Properties[$field].Value
