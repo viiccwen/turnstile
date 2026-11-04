@@ -73,6 +73,7 @@ import {
   formatLatency,
   LoadingState,
   PanelTitle,
+  requestCost,
 } from "./dashboard-shared"
 import {
   DropdownMenu,
@@ -83,7 +84,7 @@ import {
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "../../../components/ui/dropdown-menu"
-import { usageWindow } from "../api"
+import { usageWindow, type UsageWindowRange } from "../api"
 import { getIntlLocale, useLocale, type LocalePreference } from "../../../locales/index"
 import { estimateRequestCost, hasModelPrices, priceRequests, requestCostCalculation } from "../../../lib/pricing"
 import { useAuth } from "../../../providers/auth-provider"
@@ -144,9 +145,9 @@ export function FinOpsDashboard({
 }: {
   initialTab?: AnalyticsTab
   onToggleSidebar: () => void
-  days: number
+  days: UsageWindowRange
   scope: FinOpsScope
-  onDaysChange: (days: number) => void
+  onDaysChange: (days: UsageWindowRange) => void
   onScopeChange: (scope: FinOpsScope) => void
   onOpenRequest: (requestId: string) => void
 }) {
@@ -164,7 +165,7 @@ export function FinOpsDashboard({
   const agents = entities?.agents ?? []
   const users = entities?.users.filter((item) => !scope.department_id || item.parent_id === scope.department_id) ?? []
   const updateScope = (patch: Partial<FinOpsScope>) => onScopeChange({ ...scope, ...patch })
-  const activeFilterCount = Object.values(scope).filter(Boolean).length + (days === 30 ? 0 : 1)
+  const activeFilterCount = Object.values(scope).filter(Boolean).length + (days === "month" ? 0 : 1)
   const refreshCurrentPage = async () => {
     setIsRefreshing(true)
     try {
@@ -183,7 +184,7 @@ export function FinOpsDashboard({
       <Button variant="ghost" size="icon-sm" className="finops-header-refresh" aria-label="刷新当前页面数据" title="刷新当前页面数据" disabled={isRefreshing} onClick={() => void refreshCurrentPage()}><RefreshCw className={isRefreshing ? "spin" : undefined} size={15} /></Button>
     </header>
     {tab !== "invoke" && <div className="finops-filterbar">
-      <FilterMenuField label="时间范围" icon={Clock3} value={String(days)} active={days !== 30} allowAll={false} options={[{ value: "7", label: "近 7 天" }, { value: "30", label: "近 30 天" }, { value: "90", label: "近 90 天" }]} onChange={(next) => next && onDaysChange(Number(next))} />
+      <FilterMenuField label="时间范围" icon={Clock3} value={String(days)} active={days !== "month"} allowAll={false} options={[{ value: "month", label: "本月" }, { value: "7", label: "近 7 天" }, { value: "30", label: "近 30 天" }, { value: "90", label: "近 90 天" }]} onChange={(next) => next && onDaysChange(next === "month" ? next : Number(next))} />
       {entities && <>
         <FilterMenuField label="组织" icon={Building2} value={scope.organization_id} options={entities.organizations.map((item) => ({ value: item.id, label: item.name }))} onChange={(organization_id) => updateScope({ organization_id, department_id: undefined, agent_id: undefined, user_id: undefined })} />
         <FilterMenuField label="部门" icon={Users} value={scope.department_id} options={entities.departments.map((item) => ({ value: item.id, label: item.name }))} onChange={(department_id) => updateScope({ department_id, agent_id: undefined, user_id: undefined })} />
@@ -195,7 +196,7 @@ export function FinOpsDashboard({
         <FilterMenuField label="智能体" icon={Bot} value={scope.agent_id} options={agents.map((item) => ({ value: item.id, label: item.name }))} onChange={(agent_id) => updateScope({ agent_id })} />
         <FilterMenuField label="人员" icon={UserRound} value={scope.user_id} options={users.map((item) => ({ value: item.id, label: item.name }))} onChange={(user_id) => updateScope({ user_id })} />
       </>}
-      {activeFilterCount > 0 && <Button variant="ghost" size="sm" className="finops-clear" onClick={() => { onDaysChange(30); onScopeChange({}) }}><X size={14} />重置</Button>}
+      {activeFilterCount > 0 && <Button variant="ghost" size="sm" className="finops-clear" onClick={() => { onDaysChange("month"); onScopeChange({}) }}><X size={14} />重置</Button>}
     </div>}
     <div className="finops-scroll-region">
       {tab !== "invoke" && unpricedModels.length > 0 && <PricingCoverageNotice modelKeys={unpricedModels.map((model) => model.model_key)} />}
@@ -235,6 +236,7 @@ function ExecutiveOverview({ filters, costAvailable: configuredCostAvailable }: 
   const anomalies = useQuery(finopsQueries.anomalies(filters))
   const departments = useQuery(finopsQueries.distribution(filters, "department"))
   const models = useQuery(finopsQueries.distribution(filters, "model"))
+  const registry = useQuery(finopsQueries.registry())
   const agents = useQuery(finopsQueries.distribution(filters, "agent"))
   const users = useQuery(finopsQueries.distribution(filters, "user"))
   const runtimes = useQuery(finopsQueries.distribution(filters, "runtime"))
@@ -250,19 +252,20 @@ function ExecutiveOverview({ filters, costAvailable: configuredCostAvailable }: 
   const estimatedCost = totals.estimated_cost
   const costAvailable = configuredCostAvailable || estimatedCost > 0
   const signals = (anomalies.data ?? []).slice(0, 5)
+  const comparison = filters.range === "month" ? "较上月同期" : "较上期"
   return <div className="finops-grid">
     <section className="finops-kpis span-3">
-      <Kpi label="总 Token" value={compact.format(totals.total_tokens)} change={overview.data.changes_percent.total_tokens} icon={Zap} />
-      <Kpi label="总调用次数" value={compact.format(totals.total_requests)} change={overview.data.changes_percent.total_requests} icon={Activity} />
+      <Kpi label="总 Token" value={compact.format(totals.total_tokens)} change={overview.data.changes_percent.total_tokens} comparison={comparison} icon={Zap} />
+      <Kpi label="总调用次数" value={compact.format(totals.total_requests)} change={overview.data.changes_percent.total_requests} comparison={comparison} icon={Activity} />
       <Kpi label="估算成本" value={!costAvailable ? "未计价" : currency.format(estimatedCost)} change={null} note={costAvailable ? "按入库时单价结算" : undefined} icon={CircleDollarSign} />
-      <Kpi label="平均延迟" value={formatLatency(totals.average_latency_ms)} change={overview.data.changes_percent.average_latency_ms} icon={Clock3} />
-      <Kpi label="错误率" value={`${totals.error_rate.toFixed(1)}%`} change={overview.data.changes_percent.error_rate} icon={ShieldAlert} />
+      <Kpi label="平均延迟" value={formatLatency(totals.average_latency_ms)} change={overview.data.changes_percent.average_latency_ms} comparison={comparison} icon={Clock3} />
+      <Kpi label="错误率" value={`${totals.error_rate.toFixed(1)}%`} change={overview.data.changes_percent.error_rate} comparison={comparison} icon={ShieldAlert} />
     </section>
     <UsageActivityCard filters={filters} costAvailable={costAvailable} />
     <DistributionRankingPanel className="span-2" title="运行时用量结构" meta={`${runtimes.data?.items.length ?? 0} 个运行时`} items={runtimes.data?.items ?? []} costAvailable={costAvailable} metricMode="auto" emptyTitle="暂无运行时数据" emptyDetail="当前范围暂无用量数据。" />
     <section className="finops-panel"><PanelTitle title="重点治理信号" meta={`${signals.length} 项`} />{signals.length ? <div className="anomaly-list">{signals.map((item) => <div key={item.id}><span className={`anomaly-dot ${item.severity}`} /><div><b>{item.title}</b><p>{item.description}</p></div><strong>{item.actual_value.toFixed(1)}</strong></div>)}</div> : <EmptyState title="暂无异常" detail="当前范围未触发治理阈值。" />}</section>
     <DistributionRankingPanel className="overview-distribution-panel" title="部门用量结构" meta={`${departments.data?.items.length ?? 0} 个部门`} items={departments.data?.items ?? []} costAvailable={costAvailable} metricMode="auto" emptyTitle="暂无部门数据" emptyDetail="当前范围暂无用量数据。" />
-    <DistributionRankingPanel className="overview-distribution-panel" title="模型用量结构" meta={`${new Set(models.data?.items.map((item) => item.name) ?? []).size} 个模型`} items={models.data?.items ?? []} costAvailable={costAvailable} metricMode="auto" emptyTitle="暂无模型数据" emptyDetail="当前范围暂无用量数据。" />
+    <DistributionRankingPanel className="overview-distribution-panel" title="模型用量结构" meta={`${new Set(models.data?.items.map(distributionKey) ?? []).size} 个模型`} items={withConnectionNames(models.data?.items ?? [], registry.data?.models)} costAvailable={costAvailable} metricMode="auto" emptyTitle="暂无模型数据" emptyDetail="当前范围暂无用量数据。" />
     <section className="finops-panel"><PanelTitle title="请求健康度" meta={`P95 ${formatLatency(totals.p95_latency_ms)}`} /><RequestHealthChart totals={totals} /></section>
     <div className="overview-ranking-grid span-3">
       <DistributionRankingPanel title="智能体 Token 排行" meta={`${agents.data?.items.length ?? 0} 个智能体`} items={agents.data?.items ?? []} costAvailable={costAvailable} metricMode="tokens" color="var(--chart-1)" emptyTitle="暂无智能体数据" emptyDetail="当前范围暂无用量数据。" />
@@ -272,8 +275,8 @@ function ExecutiveOverview({ filters, costAvailable: configuredCostAvailable }: 
   </div>
 }
 
-function Kpi({ label, value, change, note, icon: Icon }: { label: string; value: string; change: number | null; note?: string; icon: typeof Activity }) {
-  return <div><span className="finops-kpi-icon"><Icon size={16} /></span><label>{label}</label><strong>{value}</strong><small className={change != null && change > 0 ? "up" : ""}>{note ?? (change == null ? "无上期数据" : `${change > 0 ? "+" : ""}${change.toFixed(1)}% 较上期`)}</small></div>
+function Kpi({ label, value, change, comparison = "较上期", note, icon: Icon }: { label: string; value: string; change: number | null; comparison?: string; note?: string; icon: typeof Activity }) {
+  return <div><span className="finops-kpi-icon"><Icon size={16} /></span><label>{label}</label><strong>{value}</strong><small className={change != null && change > 0 ? "up" : ""}>{note ?? (change == null ? "无上期数据" : `${change > 999 ? "> 999" : `${change > 0 ? "+" : ""}${change.toFixed(1)}`}% ${comparison}`)}</small></div>
 }
 
 function RankingLimitSelect({ value, onChange, label }: { value: RankingLimit; onChange: (value: RankingLimit) => void; label: string }) {
@@ -387,6 +390,24 @@ function RequestLatencyChart({ totals, percentage = false }: { totals: Executive
 
 type DistributionRankingItem = { id: string; name: string; total_tokens: number; cache_read_tokens?: number; total_requests: number; estimated_cost: number; share_percent: number }
 
+// Same-named records (two deployments of one model name) stay apart; unattributed rows keep their names.
+function distributionKey(item: Pick<DistributionRankingItem, "id" | "name">) {
+  return item.id && item.id !== "unattributed" ? item.id : item.name
+}
+
+// Same-named models on different connections are told apart by their connection name.
+function withConnectionNames<Item extends Pick<DistributionRankingItem, "id" | "name">>(
+  items: Item[], models: readonly ManagedModel[] = [],
+): Item[] {
+  const connections = new Map(models.map((model) => [model.id, model.runtime_name]))
+  const counts = new Map<string, number>()
+  for (const item of items) counts.set(item.name, (counts.get(item.name) ?? 0) + 1)
+  return items.map((item) => {
+    const connection = (counts.get(item.name) ?? 0) > 1 ? connections.get(item.id) : undefined
+    return connection ? { ...item, name: `${item.name} · ${connection}` } : item
+  })
+}
+
 function tokenRankingTooltip(value: string | number, payload?: unknown) {
   const row = payload as DistributionRankingItem | undefined
   const total = Number(value).toLocaleString(getIntlLocale())
@@ -455,13 +476,14 @@ function MetricRankingPanel({ title, meta, className, rows, valueLabel, valueFor
 function DistributionBars({ items, costAvailable, metricMode = "auto", color, limit = 5 }: { items: DistributionRankingItem[]; costAvailable: boolean; metricMode?: "auto" | "tokens" | "requests"; color?: string; limit?: RankingLimit }) {
   const grouped = new Map<string, { id: string; name: string; total_tokens: number; cache_read_tokens: number; total_requests: number; estimated_cost: number; share_percent: number }>()
   for (const item of items) {
-    const current = grouped.get(item.name) ?? { ...item, id: item.name, total_tokens: 0, cache_read_tokens: 0, total_requests: 0, estimated_cost: 0, share_percent: 0 }
+    const key = distributionKey(item)
+    const current = grouped.get(key) ?? { ...item, id: key, total_tokens: 0, cache_read_tokens: 0, total_requests: 0, estimated_cost: 0, share_percent: 0 }
     current.total_tokens += item.total_tokens
     current.cache_read_tokens += item.cache_read_tokens ?? 0
     current.total_requests += item.total_requests
     current.estimated_cost += item.estimated_cost
     current.share_percent += item.share_percent
-    grouped.set(item.name, current)
+    grouped.set(key, current)
   }
   const merged = [...grouped.values()]
   const useRequests = metricMode === "requests"
@@ -612,6 +634,7 @@ function ModelUsage({ filters, costAvailable }: { filters: UsageFilters; costAva
   // dimension costs a single request and nothing the second time.
   const grouped = useQuery(finopsQueries.distribution(filters, dimension, "model"))
   const models = useQuery(finopsQueries.distribution(filters, "model"))
+  const registry = useQuery(finopsQueries.registry())
   const overview = useQuery(finopsQueries.executiveOverview(filters))
   if (grouped.isLoading || models.isLoading || overview.isLoading) return <LoadingState />
   if (grouped.error || models.error || overview.error) return <ErrorState error={grouped.error ?? models.error ?? overview.error} />
@@ -638,7 +661,7 @@ function ModelUsage({ filters, costAvailable }: { filters: UsageFilters; costAva
     {/* Models take the wide column because they are the one axis every other panel here
         shares -- the cross-tab and both quality charts are model-keyed -- so this column
         stays put while the one beside it changes with the dimension switch. */}
-    <DistributionRankingPanel className="span-2" title="模型 Token 排行" meta={`${new Set(models.data?.items.map((item) => item.name) ?? []).size} 个模型`} items={models.data?.items ?? []} costAvailable={costAvailable} emptyTitle="暂无模型数据" emptyDetail="当前筛选范围暂无用量数据。" />
+    <DistributionRankingPanel className="span-2" title="模型 Token 排行" meta={`${new Set(models.data?.items.map(distributionKey) ?? []).size} 个模型`} items={withConnectionNames(models.data?.items ?? [], registry.data?.models)} costAvailable={costAvailable} emptyTitle="暂无模型数据" emptyDetail="当前筛选范围暂无用量数据。" />
     <DistributionRankingPanel title={current.rankingTitle} meta={`${grouped.data?.items.length ?? 0} ${current.unit}`} items={grouped.data?.items ?? []} costAvailable={costAvailable} emptyTitle={current.emptyTitle} emptyDetail="当前筛选范围暂无用量数据。" />
     <div className="model-mix-heading span-3">
       <div><h2>{current.heading}</h2><span>{modelSummary}</span></div>
@@ -1135,6 +1158,27 @@ export function requestTraceFailed(request: UsageRequestSummary): boolean {
     || (request.status_code != null && request.status_code >= 400);
 }
 
+function requestTraceMatches(
+  item: UsageRequestSummary,
+  search: string,
+  status: "all" | "success" | "error",
+): boolean {
+  const matchesStatus = status === "all"
+    || (item.status_code !== null && (status === "success" ? !requestTraceFailed(item) : requestTraceFailed(item)));
+  return matchesStatus && (!search || [
+    item.request_id,
+    item.correlation_id,
+    item.trace_id,
+    item.upstream_request_id,
+    item.agent_name,
+    item.model_name,
+    item.router_name,
+    item.selected_model_name,
+    item.user_name,
+    item.project_name,
+  ].some((value) => value?.toLocaleLowerCase().includes(search)));
+}
+
 function RequestTrace({
   filters,
   models,
@@ -1154,10 +1198,14 @@ function RequestTrace({
   const overview = useQuery(finopsQueries.executiveOverview(filters))
   const volumeTrend = useQuery(finopsQueries.trends(filters, "none", "day"))
   const detail = useQuery(finopsQueries.requestDetail(selected ?? ""))
-  const firstRequestId = requestRows[0] ? requestTraceId(requestRows[0]) : null
+  const normalizedSearch = searchText.trim().toLocaleLowerCase();
+  const matchingRows = requestRows.filter((item) => requestTraceMatches(item, normalizedSearch, statusFilter))
+  const firstMatchingId = matchingRows[0] ? requestTraceId(matchingRows[0]) : null
+  const selectedMatches = matchingRows.some((item) => requestTraceId(item) === selected)
   useEffect(() => {
-    if (!selected && firstRequestId) setSelected(firstRequestId)
-  }, [firstRequestId, selected])
+    // The detail follows the filter; a deep link outside the loaded rows stays selected.
+    if (firstMatchingId && !selectedMatches) setSelected(firstMatchingId)
+  }, [firstMatchingId, selectedMatches])
   const loadNextPage = () => {
     if (!query.hasNextPage || query.isFetchingNextPage || loadingNextPageRef.current) return
     loadingNextPageRef.current = true
@@ -1186,24 +1234,7 @@ function RequestTrace({
       attemptPositions.set(requestTraceId(item), { index: index + 1, total: attempts.length });
     });
   }
-  const normalizedSearch = searchText.trim().toLocaleLowerCase();
-  const visibleRows = pricedRows.filter((item) => {
-    const matchesStatus = statusFilter === "all"
-      || (item.status_code !== null && (statusFilter === "success" ? !requestTraceFailed(item) : requestTraceFailed(item)));
-    const matchesSearch = !normalizedSearch || [
-      item.request_id,
-      item.correlation_id,
-      item.trace_id,
-      item.upstream_request_id,
-      item.agent_name,
-      item.model_name,
-      item.router_name,
-      item.selected_model_name,
-      item.user_name,
-      item.project_name,
-    ].some((value) => value?.toLocaleLowerCase().includes(normalizedSearch));
-    return matchesStatus && matchesSearch;
-  });
+  const visibleRows = pricedRows.filter((item) => requestTraceMatches(item, normalizedSearch, statusFilter));
   const totals = overview.data?.totals;
   const windowRequests = totals?.total_requests ?? 0;
   const clientErrors = totals?.client_error_requests ?? 0;
@@ -1434,10 +1465,16 @@ function RequestTraceDetail({
       { label: "缓存读取", value: cacheRead, className: "cached" },
       { label: "输出", value: request.completion_tokens, className: "completion" },
     ];
+  // The gateway admission check fails open so a ledger outage cannot stop employees working.
+  // That trade-off is only acceptable while it stays visible: a degraded request must not look
+  // identical to one that was actually checked against a budget.
+  const admissionWarning = budgetAdmissionWarnings[request.budget_admission ?? ""];
+  const modelWarning = modelAdmissionWarnings[request.model_admission ?? ""];
+  const blockedBeforeModel = admissionWarning?.tone === "blocked" || modelWarning?.tone === "blocked";
   // Gateway-log reconciliation measures input/output but cannot measure streamed cache usage.
   // Keep those known buckets visible without presenting the legacy numeric cache zero as fact.
-  const inputOutputMeasured = request.usage_available
-    ?? (!request.estimated || Boolean(request.reconciled_at));
+  const inputOutputMeasured = blockedBeforeModel || (request.usage_available
+    ?? (!request.estimated || Boolean(request.reconciled_at)));
   const cacheUsageUnmeasured = request.ingest_error === "stream_cache_usage_unavailable";
   const state = usageState(!inputOutputMeasured, request.timestamp);
   const usagePlaceholder = state === "pending" ? "待对账" : "不可用";
@@ -1450,11 +1487,6 @@ function RequestTraceDetail({
   const traceSteps = request.ingest_source === "policy"
     ? [request.request_source, "Cloud API 策略"]
     : [request.request_source, request.provider, request.runtime, request.ingest_source].filter(Boolean);
-  // The gateway admission check fails open so a ledger outage cannot stop employees working.
-  // That trade-off is only acceptable while it stays visible: a degraded request must not look
-  // identical to one that was actually checked against a budget.
-  const admissionWarning = budgetAdmissionWarnings[request.budget_admission ?? ""];
-  const modelWarning = modelAdmissionWarnings[request.model_admission ?? ""];
   const routerTotalLatency = request.router_attempts.reduce(
     (total, attempt) => total + (attempt.latency_ms ?? 0), 0,
   );
@@ -1600,7 +1632,7 @@ function RequestTraceDetail({
         <div><dt>判路由开销</dt><dd>{decisionOverheadLabel}</dd></div>
         <div><dt>模型推理耗时</dt><dd>{formatLatency(routerCandidateLatency || request.latency_ms)}{routerCandidateAttempts.length > 1 ? ` (${routerCandidateAttempts.length} 次尝试)` : ""}</dd></div>
         <div><dt>端到端耗时 / Token</dt><dd>{formatLatency(routerTotalLatency)} · {routerTotalTokens.toLocaleString(getIntlLocale())}</dd></div>
-        <div><dt>总估算费用</dt><dd>{costAvailable ? currency.format(routerTotalCost) : "未计价"}</dd></div>
+        <div><dt>总估算费用</dt><dd>{costAvailable ? requestCost.format(routerTotalCost) : "未计价"}</dd></div>
       </dl>
       <div className="trace-router-gantt" aria-label="路由执行时序甘特图">
         <div className="trace-router-gantt-title">
@@ -1692,14 +1724,14 @@ function RequestTraceDetail({
                 <div><dt>步骤类型</dt><dd>路由分类器</dd></div>
                 <div><dt>判路由置信度</dt><dd>{attempt.decision_confidence != null ? `${(attempt.decision_confidence * 100).toFixed(1)}%` : "—"}</dd></div>
                 <div><dt>Token (入/出)</dt><dd>{attempt.total_tokens == null ? "—" : `${attempt.total_tokens.toLocaleString(getIntlLocale())} (${attempt.input_tokens ?? 0}/${attempt.output_tokens ?? 0})`}</dd></div>
-                <div><dt>判路由费用</dt><dd>{attempt.estimated_cost == null ? "—" : currency.format(attempt.estimated_cost)}</dd></div>
+                <div><dt>判路由费用</dt><dd>{attempt.estimated_cost == null ? "—" : requestCost.format(attempt.estimated_cost)}</dd></div>
                 <div><dt>状态</dt><dd>{attempt.status_code ? `HTTP ${attempt.status_code}` : "未调用"}</dd></div>
                 <div><dt>决策耗时</dt><dd>{attempt.latency_ms == null ? "—" : formatLatency(attempt.latency_ms)}</dd></div>
               </> : <>
                 <div><dt>候选优先级</dt><dd>{attempt.priority != null ? `P${attempt.priority}` : "—"}</dd></div>
                 <div><dt>{attempt.strategy_type === "weighted" ? "分流权重" : "路由限制"}</dt><dd>{attempt.strategy_type === "weighted" && attempt.weight != null ? `${attempt.weight}%` : attempt.max_cost_per_million != null ? `≤ $${attempt.max_cost_per_million}/M` : attempt.max_latency_ms != null ? `≤ ${attempt.max_latency_ms}ms` : "无额外上限"}</dd></div>
                 <div><dt>Token (入/出)</dt><dd>{attempt.total_tokens == null ? "—" : `${attempt.total_tokens.toLocaleString(getIntlLocale())} (${attempt.input_tokens ?? 0}/${attempt.output_tokens ?? 0})`}</dd></div>
-                <div><dt>推理费用</dt><dd>{attempt.estimated_cost == null ? "—" : currency.format(attempt.estimated_cost)}</dd></div>
+                <div><dt>推理费用</dt><dd>{attempt.estimated_cost == null ? "—" : requestCost.format(attempt.estimated_cost)}</dd></div>
                 <div><dt>状态</dt><dd>{attempt.status_code ? `HTTP ${attempt.status_code}` : attempt.outcome === "cost_limit_exceeded" ? "成本约束跳过" : attempt.outcome === "unavailable" ? "不可用" : "未调用"}</dd></div>
                 <div><dt>推理耗时</dt><dd>{attempt.latency_ms == null ? "—" : formatLatency(attempt.latency_ms)}</dd></div>
               </>}
@@ -1745,7 +1777,7 @@ function RequestTraceDetail({
         {tokenSegments.map((item) => <div className={`trace-token-fact ${item.className}`} key={item.label}><dt>{item.label}</dt><dd>{tokenValue(item)}</dd></div>)}
         <div className="trace-token-cost">
           <dt>估算费用</dt>
-          <dd>{!inputOutputMeasured ? usagePlaceholder : costAvailable ? `${cacheUsageUnmeasured ? "≥ " : ""}${currency.format(request.estimated_cost)}` : "未计价"}</dd>
+          <dd>{!inputOutputMeasured ? usagePlaceholder : costAvailable || blockedBeforeModel ? `${cacheUsageUnmeasured ? "≥ " : ""}${requestCost.format(request.estimated_cost)}` : "未计价"}</dd>
           {inputOutputMeasured && costAvailable && <dd className="trace-cost-calculation"><RequestCostCalculation request={request} /></dd>}
         </div>
       </dl>
@@ -1839,7 +1871,7 @@ export function TraceRow({
       </div>
       <small>{state === "measured" ? `${compact.format(item.total_tokens)} tokens` : placeholder}</small>
       <strong>
-        {state !== "measured" ? placeholder : costAvailable ? currency.format(item.estimated_cost) : "未计价"}
+        {state !== "measured" ? placeholder : costAvailable ? requestCost.format(item.estimated_cost) : "未计价"}
       </strong>
     </button>
   );

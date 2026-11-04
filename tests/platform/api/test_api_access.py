@@ -80,6 +80,11 @@ def test_health() -> None:
     client.cookies.clear()
     assert client.get("/health").json() == {"status": "ok"}
 
+def test_health_identifies_the_serving_process() -> None:
+    first, second = client.get("/health"), client.get("/health")
+    assert first.headers["X-Turnstile-Instance"]
+    assert first.headers["X-Turnstile-Instance"] == second.headers["X-Turnstile-Instance"]
+
 def test_every_business_api_route_requires_the_shared_session_dependency() -> None:
     # APIM and GitHub Copilot are physically separate routers. Both depend on the same
     # session/CSRF boundary, while only the OAuth callback remains public.
@@ -342,7 +347,7 @@ def test_browser_write_requires_an_allowed_origin() -> None:
     )
 
     assert blocked.status_code == 403
-    assert blocked.json() == {"detail": "不允许从该来源执行写操作。"}
+    assert blocked.json() == {"detail": "Writes from this origin are not allowed."}
     assert allowed.status_code == 200
     assert login.status_code == 403
     assert entra.status_code == 403

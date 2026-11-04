@@ -468,7 +468,7 @@
                   <set-header name="Content-Type" exists-action="override">
                     <value>application/json</value>
                   </set-header>
-                  <set-body>{"error":"model_not_assigned"}</set-body>
+                  <set-body>{"type":"error","error":{"type":"permission_error","code":"model_not_assigned","param":"model","message":"The requested model is not assigned to you"}}</set-body>
                 </return-response>
               </when>
             </choose>
@@ -745,6 +745,10 @@
           state[&quot;applicationSlug&quot;] = &quot;&quot;;
           state[&quot;applicationName&quot;] = &quot;&quot;;
           state[&quot;applicationType&quot;] = &quot;&quot;;
+          state[&quot;organizationId&quot;] = &quot;unattributed&quot;;
+          state[&quot;organizationName&quot;] = &quot;unattributed&quot;;
+          state[&quot;departmentId&quot;] = &quot;unattributed&quot;;
+          state[&quot;departmentName&quot;] = &quot;unattributed&quot;;
           try
           {
             var response = (IResponse)context.Variables[&quot;applicationMapRead&quot;];
@@ -771,6 +775,10 @@
               state[&quot;applicationSlug&quot;] = (string)row[&quot;ApplicationSlug&quot;] ?? &quot;&quot;;
               state[&quot;applicationName&quot;] = (string)row[&quot;ApplicationName&quot;] ?? &quot;&quot;;
               state[&quot;applicationType&quot;] = (string)row[&quot;ApplicationType&quot;] ?? &quot;&quot;;
+              state[&quot;organizationId&quot;] = (string)row[&quot;OrganizationId&quot;] ?? &quot;unattributed&quot;;
+              state[&quot;organizationName&quot;] = (string)row[&quot;OrganizationName&quot;] ?? &quot;unattributed&quot;;
+              state[&quot;departmentId&quot;] = (string)row[&quot;DepartmentId&quot;] ?? &quot;unattributed&quot;;
+              state[&quot;departmentName&quot;] = (string)row[&quot;DepartmentName&quot;] ?? &quot;unattributed&quot;;
             }
           }
           catch (Exception) { }
@@ -833,6 +841,18 @@
         </choose>
         <choose>
           <when condition="@((string)context.Variables[&quot;applicationAdmission&quot;] == &quot;ok&quot;)">
+            <set-header name="x-org-id" exists-action="override">
+              <value>@((bool)context.Variables[&quot;hasEmployeeToken&quot;] ? context.Request.Headers.GetValueOrDefault(&quot;x-org-id&quot;, &quot;unattributed&quot;) : (string)((JObject)context.Variables[&quot;applicationMapState&quot;])[&quot;organizationId&quot;])</value>
+            </set-header>
+            <set-header name="x-org-name" exists-action="override">
+              <value>@((bool)context.Variables[&quot;hasEmployeeToken&quot;] ? context.Request.Headers.GetValueOrDefault(&quot;x-org-name&quot;, &quot;unattributed&quot;) : (string)((JObject)context.Variables[&quot;applicationMapState&quot;])[&quot;organizationName&quot;])</value>
+            </set-header>
+            <set-header name="x-department-id" exists-action="override">
+              <value>@((bool)context.Variables[&quot;hasEmployeeToken&quot;] ? context.Request.Headers.GetValueOrDefault(&quot;x-department-id&quot;, &quot;unattributed&quot;) : (string)((JObject)context.Variables[&quot;applicationMapState&quot;])[&quot;departmentId&quot;])</value>
+            </set-header>
+            <set-header name="x-department-name" exists-action="override">
+              <value>@((bool)context.Variables[&quot;hasEmployeeToken&quot;] ? context.Request.Headers.GetValueOrDefault(&quot;x-department-name&quot;, &quot;unattributed&quot;) : (string)((JObject)context.Variables[&quot;applicationMapState&quot;])[&quot;departmentName&quot;])</value>
+            </set-header>
             <set-variable name="applicationLedgerPartition" value="@(&quot;app|&quot; + (string)((JObject)context.Variables[&quot;applicationMapState&quot;])[&quot;applicationId&quot;] + &quot;|&quot; + DateTime.UtcNow.ToString(&quot;yyyy-MM&quot;))" />
             <set-variable name="applicationLedgerUrl" value="@{
               var partition = (string)context.Variables[&quot;applicationLedgerPartition&quot;];
@@ -1089,7 +1109,24 @@
                   <set-header name="x-application-budget-remaining-tokens" exists-action="override">
                     <value>@(((long)context.Variables[&quot;applicationLedgerRemaining&quot;]).ToString())</value>
                   </set-header>
-                  <set-body>@(new JObject(new JProperty(&quot;error&quot;, (string)context.Variables[&quot;applicationDenialReason&quot;])).ToString(Newtonsoft.Json.Formatting.None))</set-body>
+                  <set-header name="x-request-id" exists-action="override">
+                    <value>@((string)context.Variables[&quot;callerRequestId&quot;])</value>
+                  </set-header>
+                  <set-body>@{
+                    var reason = (string)context.Variables[&quot;applicationDenialReason&quot;];
+                    var model = reason == &quot;application_model_not_assigned&quot;;
+                    return new JObject(
+                      new JProperty(&quot;type&quot;, &quot;error&quot;),
+                      new JProperty(&quot;error&quot;, new JObject(
+                        new JProperty(&quot;type&quot;, model ? &quot;permission_error&quot; : &quot;insufficient_quota&quot;),
+                        new JProperty(&quot;code&quot;, reason),
+                        new JProperty(&quot;param&quot;, model ? (JToken)new JValue(&quot;model&quot;) : JValue.CreateNull()),
+                        new JProperty(&quot;message&quot;, model
+                          ? &quot;The requested model is not assigned to this application&quot;
+                          : &quot;The application token budget cannot admit this request&quot;)
+                      ))
+                    ).ToString(Newtonsoft.Json.Formatting.None);
+                  }</set-body>
                 </return-response>
               </when>
             </choose>
@@ -1463,6 +1500,7 @@ __USAGE_OBSERVER_HEADERS__
           ?? (long?)usage?[&quot;cache_read_input_tokens&quot;]
           ?? (long?)usage?[&quot;cached_tokens&quot;] ?? 0;
         var cacheWrite = (long?)usage?[&quot;prompt_tokens_details&quot;]?[&quot;cache_write_tokens&quot;]
+          ?? (long?)usage?[&quot;input_tokens_details&quot;]?[&quot;cache_write_tokens&quot;]
           ?? (long?)usage?[&quot;cache_creation_input_tokens&quot;] ?? 0;
         // OpenAI reports prompt_tokens INCLUDING its cached subset, while Anthropic's
         // input_tokens EXCLUDES it. Both are normalized to the exclusive form so that

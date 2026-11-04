@@ -11,12 +11,12 @@ from typing import Literal, Protocol
 from urllib.parse import quote
 from uuid import UUID, uuid4
 from xml.etree import ElementTree as ET
-from xml.sax.saxutils import escape as xml_escape
 
 import httpx
 from pydantic import Field, SecretStr, model_validator
 
 from ..domain.image_profiles import (
+    DEFAULT_IMAGE_GENERATION_LIMITS,
     ImageGenerationLimits,
     ImageGenerationProfile,
     create_image_profile,
@@ -25,19 +25,23 @@ from ..domain.storage_routes import (
     ActiveRouteHead,
     Digest,
     FixedProgramInstallation,
+    FixedProgramUpgrade,
     Identifier,
     ModelRouteHead,
     ProgramCapabilityProof,
     ProgramIdentity,
     RouteModel,
+    RouteProfile,
     RouteScope,
     canonical_document,
+    document_digest,
     text_digest,
 )
 from .apim_control_plane_contract import PolicyCompilationError
 from .apim_policy_components import (
     NATIVE_STREAM_REQUEST,
     component_digest,
+    encode_policy_xml,
     expression_token_spans,
     expression_tokens,
     parse_policy,
@@ -143,6 +147,7 @@ class FixedProgramVerifier:
         for capability, enabled in {
             "OAuth": installed.oauth_enabled, "Pool": installed.pool_enabled,
             "Decision": installed.decision_enabled,
+            "Router": installed.router_enabled,
             "ModelAdditions": installed.model_additions_enabled,
             "NativeGatewayScope": installed.native_gateway_scope,
         }.items():
@@ -194,15 +199,24 @@ class FixedProgramVerifier:
             raise PolicyCompilationError("Fixed route program complete digest changed")
         self._probe(configuration=None)
         checked_at = self._clock()
-        if type(checked_at) is not int or not started <= checked_at < started + 30:
+        if type(checked_at) is not int or checked_at < started:
             raise PolicyCompilationError(
                 "Fixed route program verification exceeded its time window",
+            )
+        # Management evidence read from `started` backs a proof for at most 150 seconds: a
+        # 30-second verification budget plus the 120-second proof lifetime. Slow management
+        # reads shorten the proof instead of failing it, so the evidence age bound is unchanged.
+        expires_epoch = min(checked_at + 120, started + 150)
+        if checked_at >= expires_epoch:
+            raise PolicyCompilationError(
+                "Fixed route program verification exceeded its time window after "
+                f"{checked_at - started} of 150 seconds",
             )
         self._verified_parent = parent
         return ProgramCapabilityProof(
             proof_id=str(uuid4()), identity=program,
             supported_profiles=installed.supported_profiles,
-            issued_epoch=checked_at, expires_epoch=checked_at + 120,
+            issued_epoch=checked_at, expires_epoch=expires_epoch,
         )
 
     def confirm(self, head: ActiveRouteHead) -> None:
@@ -268,6 +282,11 @@ class FixedProgramVerifier:
             raise PolicyCompilationError("Fixed route authenticated probe identity changed")
 
 
+FULL_PROGRAM_PROFILES: tuple[RouteProfile, ...] = (
+    "openai-v1", "anthropic-messages", "openai-images", "microsoft-decision",
+)
+
+
 class FixedRouteBinding(RouteModel):
     scope: RouteScope
     api_revision: Identifier
@@ -290,6 +309,7 @@ class FixedRouteBinding(RouteModel):
     image_limits: ImageGenerationLimits | None = None
     oauth_enabled: bool = Field(default=False, exclude_if=lambda value: value is False)
     pool_enabled: bool = Field(default=False, exclude_if=lambda value: value is False)
+    router_enabled: bool = Field(default=False, exclude_if=lambda value: value is False)
     decision_enabled: bool = Field(default=False, exclude_if=lambda value: value is False)
     model_additions_enabled: bool = Field(default=False, exclude_if=lambda value: value is False)
     native_gateway_scope: bool = Field(default=False, exclude_if=lambda value: value is False)
@@ -1177,6 +1197,8 @@ def fixed_reader(binding: FixedRouteBinding) -> ET.Element:
         "routeRequestAdapters": json.dumps(binding.supported_adapters, separators=(",", ":")),
     }.items():
         variable(branch, name, value)
+    if binding.router_enabled:
+        variable(branch, "routeRouterEnabled", "@(true)")
     if binding.native_gateway_scope:
         variable(branch, "routeNativeGatewayScopeEnabled", "@(true)")
     if binding.decision_enabled:
@@ -1756,6 +1778,11 @@ REWRITE_FIXED_MODEL = r"""@{
     return body.ToString(Newtonsoft.Json.Formatting.None);
 }"""
 
+POOL_RATE_LIMITED_BODY = canonical_document({"type": "error", "error": {
+    "type": "rate_limit_error", "code": "rate_limit_exceeded", "param": None,
+    "message": "Every deployment for this model is rate limited; retry after Retry-After",
+}})
+
 
 def observer_headers(parent: ET.Element) -> None:
     for name, value in (
@@ -1812,13 +1839,26 @@ def observer_headers(parent: ET.Element) -> None:
         )
 
 
-def fixed_operation(operation: str, binding: FixedRouteBinding) -> str:
+def fixed_operation(
+    operation: str, binding: FixedRouteBinding, *, logger_id: str = "__LOGGER_ID__",
+    usage_identity: str = "__ROUTER_USAGE_IDENTITY__",
+) -> str:
     if operation not in FIXED_OPERATIONS or (
         operation == "microsoft-decision" and not binding.decision_enabled
     ):
         raise PolicyCompilationError("Unsupported fixed route operation")
     root = ET.Element("policies")
     inbound = ET.SubElement(root, "inbound")
+    router_outbound = None
+    if binding.router_enabled and operation == "chat-completions":
+        from .apim_router_global_policy import fixed_router_operation_stages
+
+        router_inbound, router_outbound = fixed_router_operation_stages(
+            binding.ledger_table_endpoint, binding.ledger_table_name, binding.scope.api_id,
+            binding.scope.target_id, logger_id=logger_id, usage_identity=usage_identity,
+        )
+        variable(inbound, "turnstileRouterEngineVersion", "@(2)")
+        inbound.append(router_inbound)
     ET.SubElement(inbound, "base")
     if operation == "images-generations" and binding.image_limits is None:
         deny(inbound, "@(true)", "route_image_capacity_unavailable")
@@ -1931,22 +1971,16 @@ def fixed_operation(operation: str, binding: FixedRouteBinding) -> str:
         pooled = ET.SubElement(choices, "when", {
             "condition": f'@({route}["connection"]["pool"] is JObject)',
         })
-        retry_choices = ET.SubElement(pooled, "choose")
-        budgeted = ET.SubElement(retry_choices, "when", {
-            "condition": '@(context.Variables.ContainsKey("executionReceiptHeader"))',
-        })
-        ET.SubElement(budgeted, "forward-request", {
-            "timeout": "120", "buffer-request-body": "true",
-            "buffer-response": "true" if operation == "microsoft-decision" else "false",
-            "fail-on-error-status-code": "false",
-        })
-        unbudgeted = ET.SubElement(retry_choices, "otherwise")
-        retry_node = ET.SubElement(unbudgeted, "retry", {
+        # A 429 consumed no tokens, so a budgeted request retries within its one reservation.
+        retry_node = ET.SubElement(pooled, "retry", {
             "condition": "@(context.Response != null && context.Response.StatusCode == 429)",
             "count": "1",
             "interval": "1",
             "first-fast-retry": "true",
         })
+        # APIM keeps the previous member's backend headers; only some members set these.
+        for name in ("x-turnstile-pool-deployment", "api-key", "x-api-key"):
+            ET.SubElement(retry_node, "set-header", {"name": name, "exists-action": "delete"})
         ET.SubElement(retry_node, "forward-request", {
             "timeout": "120", "buffer-request-body": "true",
             "buffer-response": "true" if operation == "microsoft-decision" else "false",
@@ -1968,6 +2002,15 @@ def fixed_operation(operation: str, binding: FixedRouteBinding) -> str:
     )
     outbound = ET.SubElement(root, "outbound")
     ET.SubElement(outbound, "base")
+    if router_outbound is not None:
+        outbound.extend(list(router_outbound))
+    if binding.pool_enabled and operation != "images-generations":
+        # The provider's 429 body names the member deployment and region.
+        limited = ET.SubElement(ET.SubElement(outbound, "choose"), "when", {
+            "condition": f'@(context.Response.StatusCode == 429 && {route}["connection"]["pool"] is JObject)',
+        })
+        header_value(limited, "Content-Type", "application/json")
+        ET.SubElement(limited, "set-body").text = POOL_RATE_LIMITED_BODY
     if operation == "anthropic-messages":
         from .apim_policy_compiler import ApimPolicyCompiler
 
@@ -2355,6 +2398,7 @@ def fixed_probe(parent: ET.Element, *, configuration: bool) -> None:
 
 
 def _baseline_root(source: str, binding: FixedRouteBinding | None = None) -> ET.Element:
+    from .apim_budget_execution import eventhub_logger_id
     from .apim_model_availability import (
         _admission_locations,
         admission_guard,
@@ -2376,7 +2420,9 @@ def _baseline_root(source: str, binding: FixedRouteBinding | None = None) -> ET.
         raise PolicyCompilationError("Fixed route ABI cannot be composed twice")
     if binding is not None and binding.native_gateway_scope:
         for branch, anchor in _admission_locations(root):
-            guard = serialize_policy(admission_guard(native_gateway_scope=True))
+            guard = serialize_policy(admission_guard(
+                native_gateway_scope=True, logger_id=eventhub_logger_id(root),
+            ))
             for parameter, value in (
                 ("__GATEWAY_PROFILE_ID__", binding.scope.target_id),
                 ("__LEDGER_TABLE_ENDPOINT__", binding.ledger_table_endpoint),
@@ -2394,6 +2440,7 @@ def upgrade_fixed_program_parent(
     from copy import deepcopy
 
     from .apim_budget_execution import _admission, _completion, budget_execution_fence
+    from .apim_model_availability import _admission_locations, admission_guard
     from .apim_policy_components import compose_image_parent_policy
 
     if policy_document_digest(source) != previous_document_sha256:
@@ -2404,6 +2451,10 @@ def upgrade_fixed_program_parent(
     loggers = {node.get("logger-id", "") for node in root.iter("log-to-eventhub")}
     if len(loggers) != 1 or not next(iter(loggers)):
         raise PolicyCompilationError("Fixed program upgrade logger identity is ambiguous")
+    for branch, anchor in _admission_locations(root):
+        branch[list(branch).index(anchor) + 1] = admission_guard(
+            logger_id=next(iter(loggers)),
+        )
     markers = root.findall(".//set-variable[@name='executionModelId']")
     if len(markers) != 1:
         raise PolicyCompilationError("Fixed program upgrade admission is ambiguous")
@@ -2457,6 +2508,21 @@ def upgrade_fixed_program_parent(
     for index, node in enumerate(expected_branch):
         if node.tag == "set-header" and node.get("name") in attribution_headers:
             actual_branch.insert(index, deepcopy(node))
+    for marker, subject in (
+        ('"modelAdmission"', "model"), ('"applicationDenialReason"', "application"),
+    ):
+        denials = [
+            [node for node in policy.iter("when")
+             if marker in node.get("condition", "") and node.find("return-response") is not None]
+            for policy in (root, outcome_template)
+        ]
+        if [len(nodes) for nodes in denials] != [1, 1]:
+            raise PolicyCompilationError(f"Fixed program upgrade {subject} denial is ambiguous")
+        actual_denial, expected_denial = denials[0][0], denials[1][0]
+        denial_response = actual_denial.find("return-response")
+        expected_response = expected_denial.find("return-response")
+        assert denial_response is not None and expected_response is not None
+        actual_denial[list(actual_denial).index(denial_response)] = deepcopy(expected_response)
     for node, expected_node in zip(usage_nodes, expected_usage, strict=True):
         node.set("value", expected_node.attrib["value"])
         if "stream_usage_breakdown_unavailable" in node.get("value", ""):
@@ -2500,25 +2566,168 @@ def upgrade_fixed_program_parent(
     return candidate
 
 
+def prepare_budget_delegation_upgrade(
+    installed: FixedProgramInstallation, publication_id: str, candidate: str,
+    operations: dict[str, tuple[str, str, str]],
+    *, enable_pool: bool = False, enable_router: bool = False,
+    enable_decision: bool = False, image_limits: ImageGenerationLimits | None = None,
+) -> tuple[FixedProgramUpgrade, str]:
+    contracts = fixed_operation_contracts(
+        installed.operation_contracts["models"][1],
+        installed.operation_contracts["anthropic-messages"][1],
+        installed.retired_operations,
+        decision_enabled=installed.decision_enabled or enable_decision,
+    )
+    capabilities: dict[str, object] = {}
+    if enable_decision or image_limits is not None:
+        capabilities = {
+            "supported_profiles": (
+                *installed.supported_profiles,
+                *(("openai-images",) if image_limits is not None else ()),
+                *(("microsoft-decision",) if enable_decision else ()),
+            ),
+            "image_limits": image_limits or installed.image_limits,
+            "decision_enabled": installed.decision_enabled or enable_decision,
+            "operation_contracts": contracts,
+        }
+    root = parse_policy(compact_fixed_policy(candidate))
+    marker = root.find(".//set-variable[@name='routeProgram']")
+    if marker is None:
+        raise RuntimeError("Budget delegation program identity is missing")
+    predecessor = installed.program.program_sha256
+    legacy = installed.legacy_program_sha256 or predecessor
+    predecessors = tuple(value for value in (
+        *installed.predecessor_program_sha256, predecessor,
+    ) if value != legacy)
+    owner = next(node for node in root.iter() if marker in list(node))
+    history = owner.find("set-variable[@name='routeLegacyProgram']")
+    if history is None:
+        history = ET.Element("set-variable", {"name": "routeLegacyProgram"})
+        owner.insert(list(owner).index(marker), history)
+    history.set("value", legacy)
+    # Match fixed_reader: predecessors follow the legacy marker and are omitted when empty.
+    for node in owner.findall("set-variable[@name='routePredecessorPrograms']"):
+        owner.remove(node)
+    if predecessors:
+        owner.insert(list(owner).index(history) + 1, ET.Element("set-variable", {
+            "name": "routePredecessorPrograms",
+            "value": json.dumps(predecessors, separators=(",", ":")),
+        }))
+    digest = fixed_program_digest(
+        serialize_policy(root), {name: operation[2] for name, operation in operations.items()},
+        tuple((name, *contract) for name, contract in contracts.items()),
+    )
+    marker.set("value", digest)
+    candidate = serialize_policy(root)
+    upgrade = FixedProgramUpgrade(
+        previous_publication_id=publication_id,
+        previous_installation_sha256=document_digest(installed),
+        installation=installed.model_copy(update={
+            "program": installed.program.model_copy(update={"program_sha256": digest}),
+            "parent_policy_sha256": fixed_policy_digest(candidate),
+            "legacy_program_sha256": legacy,
+            "predecessor_program_sha256": predecessors,
+            "operation_policies_sha256": {
+                name: fixed_policy_digest(operation[2]) for name, operation in operations.items()
+            },
+            **({"pool_enabled": True} if enable_pool or enable_router else {}),
+            **({"router_enabled": True} if enable_router else {}),
+            **capabilities,
+        }),
+    )
+    upgrade.require_previous(publication_id, installed)
+    return upgrade, candidate
+
+
+def prepare_capability_upgrade(
+    installed: FixedProgramInstallation, publication_id: str, parent: str,
+    operations: Mapping[str, tuple[str, str, str]], ledger_endpoint: str, ledger_table: str,
+    observer_key: str | None, *, enable_decision: bool, enable_images: bool,
+) -> tuple[FixedProgramUpgrade, str, dict[str, str]]:
+    # Other operations keep their installed bytes; the cutover checks them against the live API.
+    from .apim_budget_execution import eventhub_logger_id, usage_identity_expression
+
+    decision = enable_decision and not installed.decision_enabled
+    images = enable_images and installed.image_limits is None
+    if not (decision or images):
+        raise PolicyCompilationError("Program capabilities are already enabled")
+    previous = installed_route_binding(installed, ledger_endpoint, ledger_table, observer_key)
+    enabled = FixedRouteBinding.model_validate_json(previous.model_copy(update={
+        "supported_profiles": (
+            *previous.supported_profiles,
+            *(("openai-images",) if images else ()),
+            *(("microsoft-decision",) if decision else ()),
+        ),
+        "image_limits": DEFAULT_IMAGE_GENERATION_LIMITS if images else previous.image_limits,
+        "decision_enabled": previous.decision_enabled or decision,
+    }).model_dump_json())
+    root = parse_policy(parent)
+    bursts = {node.get("increment-count") for node in root.iter("rate-limit-by-key")
+              if node.get("counter-key", "").startswith('@($"finops:images:')}
+    if images and bursts != {str(DEFAULT_IMAGE_GENERATION_LIMITS.burst_reservation_tokens)}:
+        raise PolicyCompilationError("Installed image burst cap differs from the image capacity")
+    if {name: operation[:2] for name, operation in operations.items()} != dict(
+        installed.operation_contracts,
+    ):
+        raise PolicyCompilationError("Installed program operations differ from its approval")
+    logger_id, usage_identity = eventhub_logger_id(root), usage_identity_expression(root)
+    for name in set(FIXED_OPERATIONS) & set(operations):
+        if component_digest(parse_policy(operations[name][2]), normalize_text_defaults=False) != (
+            component_digest(parse_policy(fixed_operation(
+                name, previous, logger_id=logger_id, usage_identity=usage_identity,
+            )), normalize_text_defaults=False)
+        ):
+            raise PolicyCompilationError(
+                "Installed program is not current; wait for the Control-plane refresh",
+            )
+    policies = {name: operation[2] for name, operation in operations.items()}
+    for name in (("images-generations",) if images else ()) + (
+        ("microsoft-decision",) if decision else ()
+    ):
+        policies[name] = compact_fixed_policy(fixed_operation(
+            name, enabled, logger_id=logger_id, usage_identity=usage_identity,
+        ))
+    baseline = serialize_policy(_without_fixed_route_parent(parent, previous))
+    contracts = fixed_operation_contracts(
+        enabled.models_path, enabled.messages_path, enabled.retired_operations,
+        decision_enabled=enabled.decision_enabled,
+    )
+    upgrade, candidate = prepare_budget_delegation_upgrade(
+        installed, publication_id,
+        compact_fixed_policy(compose_fixed_route_parent(baseline, enabled)),
+        {name: (method, path, policies[name]) for name, (method, path) in contracts.items()},
+        enable_decision=decision,
+        image_limits=DEFAULT_IMAGE_GENERATION_LIMITS if images else None,
+    )
+    return upgrade, candidate, policies
+
+
 def refresh_fixed_budget_execution_policy(
     source: str, binding: FixedRouteBinding, canonical_parent: str,
 ) -> str:
+    from .apim_budget_execution import eventhub_logger_id
     from .apim_model_availability import _admission_locations, admission_guard
 
     current = refresh_fixed_connection_approval_policy(source, binding)
     root = _without_fixed_route_parent(current, binding)
     if binding.native_gateway_scope:
-        guards = [serialize_policy(admission_guard(native_gateway_scope=native))
+        guards = [serialize_policy(admission_guard(
+            native_gateway_scope=native, logger_id=eventhub_logger_id(root),
+        ))
                   for native in (True, False)]
+        legacy = serialize_policy(admission_guard(native_gateway_scope=True))
         for parameter, value in (
             ("__GATEWAY_PROFILE_ID__", binding.scope.target_id),
             ("__LEDGER_TABLE_ENDPOINT__", binding.ledger_table_endpoint),
             ("__LEDGER_TABLE_NAME__", binding.ledger_table_name),
         ):
             guards = [guard.replace(parameter, value) for guard in guards]
+            legacy = legacy.replace(parameter, value)
         for parent, anchor in _admission_locations(root):
             index = list(parent).index(anchor) + 1
-            if component_digest(parent[index]) != component_digest(parse_policy(guards[0])):
+            if component_digest(parent[index]) not in {
+                component_digest(parse_policy(guards[0])), component_digest(parse_policy(legacy)),
+            }:
                 raise PolicyCompilationError("Fixed native availability guard changed")
             parent[index] = parse_policy(guards[1])
     for claim in root.findall(".//validate-azure-ad-token/required-claims/claim[@name='scp']"):
@@ -2730,6 +2939,105 @@ def _without_fixed_route_parent(
     return root
 
 
+def installed_route_binding(
+    installation: FixedProgramInstallation, ledger_endpoint: str | None, ledger_table: str,
+    observer_key: str | None,
+) -> FixedRouteBinding:
+    values = installation.model_dump(mode="python", include={
+        "publisher_subscription_id", "supported_profiles", "image_limits", "oauth_enabled",
+        "pool_enabled", "decision_enabled", "model_additions_enabled", "native_gateway_scope",
+        "router_enabled",
+        "legacy_program_sha256", "predecessor_program_sha256", "supported_adapters",
+        "trusted_vault_origins", "retired_operations",
+    })
+    return FixedRouteBinding.model_validate({
+        **values, "scope": installation.program.scope,
+        "api_revision": installation.program.api_revision,
+        "table_endpoint": installation.storage_endpoint, "table_name": installation.storage_table,
+        "ledger_table_endpoint": ledger_endpoint, "ledger_table_name": ledger_table,
+        "trust_binding_sha256": installation.program.trust_binding_sha256,
+        "program_sha256": installation.program.program_sha256,
+        "observer_key_named_value": observer_key,
+        "models_path": installation.operation_contracts["models"][1],
+        "messages_path": installation.operation_contracts["anthropic-messages"][1],
+    })
+
+
+def upgrade_fixed_pool_program(
+    source: str, binding: FixedRouteBinding, *, enable_router: bool = False,
+) -> FixedRouteProgram:
+    from copy import deepcopy
+
+    from .apim_budget_execution import eventhub_logger_id, usage_identity_expression
+
+    root = parse_policy(source)
+    identities = root.findall(".//set-variable[@name='routeProgram']")
+    if len(identities) != 1:
+        raise PolicyCompilationError("Program upgrade identity is ambiguous")
+    reader = next(node for node in root.iter() if identities[0] in list(node))
+    expected_reader = fixed_reader(binding).find("when")
+    assert expected_reader is not None
+    history = {"routeLegacyProgram", "routePredecessorPrograms"}
+    for name in history:
+        expected = expected_reader.find(f"set-variable[@name='{name}']")
+        observed = reader.findall(f"set-variable[@name='{name}']")
+        if expected is not None:
+            if len(observed) != 1 or observed[0].attrib != expected.attrib:
+                raise PolicyCompilationError("Program upgrade predecessor history changed")
+        elif observed and (len(observed) != 1 or observed[0].get("value") != "[]"):
+            raise PolicyCompilationError("Program upgrade predecessor history changed")
+        for node in observed:
+            reader.remove(node)
+    for index, node in enumerate(expected_reader):
+        if node.tag == "set-variable" and node.get("name") in history:
+            reader.insert(index, deepcopy(node))
+    source = serialize_policy(root)
+    baseline = _without_fixed_route_parent(source, binding)
+    enabled = binding.model_copy(update={
+        "pool_enabled": True, **({"router_enabled": True} if enable_router else {}),
+    })
+    root = parse_policy(source)
+    inbound = root.find("inbound")
+    assert inbound is not None
+    marker = inbound.find("set-variable[@name='storageRouteAbi']")
+    assert marker is not None
+    index = list(inbound).index(marker)
+    inbound[index + 1] = fixed_reader(enabled)
+    inbound[index + 2] = route_metadata(enabled)
+    plan = root.find(".//set-variable[@name='executionPlan']")
+    assert plan is not None
+    owner = next(node for node in root.iter() if plan in list(node))
+    owner[list(owner).index(plan) + 3] = provider_credential_stage(enabled)
+    contracts = tuple((name, *contract) for name, contract in fixed_operation_contracts(
+        binding.models_path, binding.messages_path, binding.retired_operations,
+        decision_enabled=binding.decision_enabled,
+    ).items())
+    operations = {
+        name: compact_fixed_policy(
+            fixed_operation(name, enabled, logger_id=eventhub_logger_id(root),
+                            usage_identity=usage_identity_expression(root))
+            if name in FIXED_OPERATIONS else
+            retired_operation() if name in binding.retired_operations else auxiliary_operation()
+        ) for name, _, _ in contracts
+    }
+    digest = fixed_program_digest(
+        compact_fixed_policy(serialize_policy(root)), operations, contracts,
+    )
+    identity = root.find(".//set-variable[@name='routeProgram']")
+    assert identity is not None
+    identity.set("value", digest)
+    enabled = enabled.model_copy(update={"program_sha256": digest})
+    parent = compact_fixed_policy(serialize_policy(root))
+    restored = _without_fixed_route_parent(parent, enabled)
+    if component_digest(restored, normalize_text_defaults=False) != component_digest(
+        baseline, normalize_text_defaults=False,
+    ):
+        raise PolicyCompilationError("Pool upgrade changed protected authentication or accounting")
+    return FixedRouteProgram(
+        enabled, text_digest(serialize_policy(baseline)), parent, tuple(operations.items()), contracts,
+    )
+
+
 def validate_fixed_route_parent(
     candidate: str,
     baseline: str,
@@ -2839,34 +3147,7 @@ def compact_fixed_policy(source: str) -> str:
             node.text = compact(node.text)
         if node.tail:
             node.tail = compact(node.tail)
-    def encode(node: ET.Element) -> str:
-        if not isinstance(node.tag, str) or "{" in node.tag or any("{" in key for key in node.attrib):
-            raise PolicyCompilationError("Fixed policy contains unsupported XML namespaces")
-        parts = ["<" + node.tag]
-        for name, value in node.attrib.items():
-            escaped = xml_escape(value, {
-                "\r": "&#13;", "\n": "&#10;", "\t": "&#9;",
-            }).replace("&gt;", ">")
-            double = escaped.replace('"', "&quot;")
-            single = escaped.replace("'", "&apos;")
-            quoted = '"' + double + '"' if len(double) <= len(single) else "'" + single + "'"
-            parts.append(" " + name + "=" + quoted)
-        if len(node) == 0 and not node.text:
-            parts.append("/>")
-        else:
-            text = node.text or ""
-            encoded_text = xml_escape(text, {"\r": "&#13;"})
-            if "]]>" not in text and "\r" not in text and len(text) + 12 < len(encoded_text):
-                encoded_text = "<![CDATA[" + text + "]]>"
-            parts.extend([">", encoded_text])
-            parts.extend(encode(child) for child in node)
-            parts.append("</" + node.tag + ">")
-        parts.append(xml_escape(node.tail or "", {"\r": "&#13;"}))
-        return "".join(parts)
-
-    candidate = encode(root)
-    if ET.canonicalize(candidate) != ET.canonicalize(ET.tostring(root, encoding="unicode")):
-        raise PolicyCompilationError("Fixed policy XML encoding changed its parsed values")
+    candidate = encode_policy_xml(root)
     if component_digest(parse_policy(candidate), normalize_text_defaults=False) != before:
         raise PolicyCompilationError("Fixed policy compaction changed executable tokens")
     return candidate
@@ -2932,6 +3213,7 @@ class FixedRouteProgram:
             image_limits=self.binding.image_limits,
             oauth_enabled=self.binding.oauth_enabled,
             pool_enabled=self.binding.pool_enabled,
+            router_enabled=self.binding.router_enabled,
             decision_enabled=self.binding.decision_enabled,
             model_additions_enabled=self.binding.model_additions_enabled,
             native_gateway_scope=self.binding.native_gateway_scope,
@@ -2994,6 +3276,8 @@ def compile_fixed_route_program(
     *,
     canonical_parent: str,
 ) -> FixedRouteProgram:
+    from .apim_budget_execution import eventhub_logger_id, usage_identity_expression
+
     binding = FixedRouteBinding.model_validate_json(binding.model_dump_json(), strict=True)
     validate_parent_policy(baseline, canonical_parent, image_program_profiles(binding))
     baseline_root = _baseline_root(baseline)
@@ -3008,7 +3292,10 @@ def compile_fixed_route_program(
         table_name=binding.ledger_table_name,
     )
     operations = {
-        name: compact_fixed_policy(fixed_operation(name, binding)) for name in FIXED_OPERATIONS
+        name: compact_fixed_policy(fixed_operation(
+            name, binding, logger_id=eventhub_logger_id(baseline_root),
+            usage_identity=usage_identity_expression(baseline_root),
+        )) for name in FIXED_OPERATIONS
         if name != "microsoft-decision" or binding.decision_enabled
     }
     operations.update(
@@ -3046,6 +3333,8 @@ def validate_fixed_route_program(
     *,
     canonical_parent: str,
 ) -> None:
+    from .apim_budget_execution import eventhub_logger_id, usage_identity_expression
+
     validate_parent_policy(baseline, canonical_parent, image_program_profiles(expected))
     if candidate.binding != expected or candidate.baseline_sha256 != text_digest(baseline):
         raise PolicyCompilationError("Fixed program source or target binding changed")
@@ -3072,9 +3361,12 @@ def validate_fixed_route_program(
         or candidate.operation_contracts != contracts
     ):
         raise PolicyCompilationError("Fixed program operation set is incomplete or changed")
+    baseline_root = parse_policy(baseline)
     for name, policy in operations.items():
         expected_policy = (
-            fixed_operation(name, expected) if name in FIXED_OPERATIONS
+            fixed_operation(name, expected, logger_id=eventhub_logger_id(baseline_root),
+                            usage_identity=usage_identity_expression(baseline_root))
+            if name in FIXED_OPERATIONS
             else retired_operation() if name in expected.retired_operations else auxiliary_operation()
         )
         validate_executable_policy(policy)

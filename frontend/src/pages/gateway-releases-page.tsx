@@ -36,6 +36,7 @@ import {
   AlertDialogTitle,
 } from "../components/ui/alert-dialog"
 import { Button } from "../components/ui/button"
+import { publicationCapabilityMessage } from "../components/model-management/model-publication-dialog"
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "../components/ui/dialog"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select"
 import {
@@ -289,9 +290,12 @@ function PublicationFailureNotice({ failure, publicationId }: {
     publisher_authorization_failed: "Azure 拒绝了 Publisher 的 APIM 管理请求。请核对发布身份的授权。",
     parent_policy_changed: "APIM 父策略与排队时的快照不一致，请核对变化后再重试。",
     credential_source_missing: "APIM 凭据资源尚未创建，请重新提供 API Key 后重试。",
+    gateway_capability_unavailable: publicationCapabilityMessage(failure.profile),
     deployment_not_found: "选定连接中不存在该部署，请使用实际部署名称而不是模型名称。",
     deployment_metadata_unavailable: "无法读取部署目录，请核对连接认证和目录权限。",
     upstream_request_failed: "模型验证请求失败，请核对部署名称、接口路径和 HTTP 状态。",
+    credential_unreadable: "无法读取连接的 API Key，请重新提供 API Key 后重试。",
+    credential_vault_unavailable: "凭据 Key Vault 未配置或未获此网关程序批准，请联系部署管理员检查安装。",
     publication_failed: "发布未完成，请使用任务 ID 查询诊断记录。",
   }
   return <div className="gateway-publication-failure" role="alert">
@@ -688,10 +692,10 @@ export function GatewayReleasesPage({
       : <div className="gateway-release-layout" style={{ "--gateway-release-pane-width": `${width}px` } as React.CSSProperties}>
         {!isMobile && <aside className="gateway-release-list-pane">{releaseListContent(false)}</aside>}
         <button className="runtime-pane-handle" type="button" role="separator" aria-label="调整发布列表宽度" aria-orientation="vertical" aria-valuemin={minWidth} aria-valuemax={maxWidth} aria-valuenow={width} onPointerDown={startResize} onKeyDown={resizeWithKeyboard} onDoubleClick={resetWidth} />
-        <main className="gateway-release-detail">
+        <section className="gateway-release-detail">
           {releaseActionError && <div className="gateway-release-action-error" role="alert"><AlertTriangle size={14} /><span>{String(releaseActionError)}</span></div>}
           <ReleaseDetail release={detail.data} loading={detail.isLoading} canManage={user?.role === "owner"} operationsEnabled={operationsEnabled} busy={busy} operation={releaseOperation} onPin={() => detail.data && protectionMutation.mutate(detail.data)} onCheck={() => detail.data && integrityMutation.mutate(detail.data.id)} onRollback={() => detail.data && setRollbackId(detail.data.id)} showMobileActions={isMobile} />
-        </main>
+        </section>
       </div>}
     {isMobile && releases.data && items.length > 0 && <Dialog open={releaseDrawerOpen} onOpenChange={onReleaseDrawerOpenChange}>
       <DialogContent className="apim-native-route-drawer gateway-release-drawer" finalFocus={false}>

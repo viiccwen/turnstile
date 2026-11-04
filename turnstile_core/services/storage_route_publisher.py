@@ -74,12 +74,15 @@ from ..domain.storage_routes import (
 from ..integrations.apim_control_plane_contract import (
     BackendCircuitBreakerResource,
     BackendResource,
+    CredentialSourceMissingError,
+    GatewayCapabilityUnavailableError,
     OAuthCredentialResource,
     PolicyCompilationError,
     RetryablePublicationError,
 )
 from ..integrations.apim_policy_components import (
     component_digest,
+    encode_policy_xml,
     parse_policy,
     validate_policy_upload,
 )
@@ -261,8 +264,23 @@ def _validate_program_cutover(
     installed: FixedProgramInstallation, config: ApimTargetClientConfig,
     management: AzureApimPublisherClient,
     operation_policies: Mapping[str, str] | None = None,
+    *, previous_publication_id: str | None = None, original_parent_policy: str | None = None,
 ) -> None:
-    from ..integrations.apim_storage_routes import FixedRouteBinding, fixed_operation
+    from ..integrations.apim_budget_execution import (
+        bind_budget_delegation,
+        eventhub_logger_id,
+        usage_identity_expression,
+    )
+    from ..integrations.apim_storage_routes import (
+        FixedRouteBinding,
+        auxiliary_operation,
+        fixed_operation,
+        installed_route_binding,
+        prepare_budget_delegation_upgrade,
+        refresh_fixed_budget_execution_policy,
+        retired_operation,
+        upgrade_fixed_pool_program,
+    )
 
     validate_policy_upload(
         parent_policy,
@@ -273,9 +291,23 @@ def _validate_program_cutover(
         table_name=config.settings.ledger_table_name,
     )
     operations = management.route_program_operations(previous.program.api_revision)
-    if (set(operations) != set(previous.operation_contracts)
-            or any((method, path) != previous.operation_contracts[name]
-                   or fixed_policy_digest(policy) != previous.operation_policies_sha256[name]
+    enables_pool = ((installed.pool_enabled and not previous.pool_enabled)
+                    or (installed.router_enabled and not previous.router_enabled))
+    enables_decision = installed.decision_enabled and not previous.decision_enabled
+    enables_images = installed.image_limits is not None and previous.image_limits is None
+    refreshes = original_parent_policy is not None
+    rewrites = bool(operation_policies) and (
+        enables_pool or refreshes or enables_decision or enables_images
+    )
+    # A resumed Decision cutover may have created its Operation before the interruption.
+    if (set(operations) not in ([set(previous.operation_contracts)] + (
+            [set(installed.operation_contracts)] if enables_decision and rewrites else []))
+            or any((method, path) != installed.operation_contracts[name]
+                   or fixed_policy_digest(policy) not in {
+                       previous.operation_policies_sha256.get(name),
+                       installed.operation_policies_sha256[name] if rewrites
+                       else previous.operation_policies_sha256.get(name),
+                   }
                    for name, (method, path, policy) in operations.items())):
         raise PolicyCompilationError("Program cutover operation contract changed")
     contracts = fixed_operation_contracts(
@@ -284,11 +316,73 @@ def _validate_program_cutover(
         decision_enabled=installed.decision_enabled,
     )
     selected = {name: operation[2] for name, operation in operations.items()}
+    pool_binding = installed_route_binding(
+        installed, config.settings.ledger_table_endpoint, config.settings.ledger_table_name,
+        config.settings.apim_usage_observer_key_named_value,
+    ) if enables_pool else None
+    refreshed_operations = None
+    if original_parent_policy is not None:
+        from ..integrations.apim_model_availability import compose_availability_parent
+        from ..integrations.apim_onboarding_policy import onboarding_canonical_parent
+        from ..services.apim_onboarding import onboarding_template_path
+
+        if (previous_publication_id is None
+                or fixed_policy_digest(original_parent_policy) != previous.parent_policy_sha256):
+            raise PolicyCompilationError("Program refresh requires its approved original parent")
+        binding = installed_route_binding(
+            previous, config.settings.ledger_table_endpoint, config.settings.ledger_table_name,
+            config.settings.apim_usage_observer_key_named_value,
+        )
+        canonical = compose_availability_parent(onboarding_canonical_parent(
+            onboarding_template_path(config.settings).read_text(encoding="utf-8"),
+            binding.scope.api_id,
+        ))
+        canonical = bind_budget_delegation(
+            canonical, config.settings.budget_delegation_trust.get(config.gateway_profile_id),
+            gateway_profile_id=config.gateway_profile_id,
+        )
+        refreshed = upgrade_fixed_pool_program(
+            refresh_fixed_budget_execution_policy(original_parent_policy, binding, canonical),
+            binding,
+        )
+        refreshed_operations = dict(refreshed.operation_policies)
+        expected, expected_parent = prepare_budget_delegation_upgrade(
+            previous, previous_publication_id, refreshed.parent_policy,
+            {name: (method, path, refreshed_operations[name])
+             for name, method, path in refreshed.operation_contracts},
+        )
+        if expected.installation != installed or fixed_policy_digest(expected_parent) != (
+            installed.parent_policy_sha256
+        ):
+            raise PolicyCompilationError("Program refresh changed its compiler-bound artifact")
     if operation_policies:
+        parent = parse_policy(parent_policy)
         if set(operation_policies) != set(contracts):
             raise PolicyCompilationError("Program cutover operation set changed")
         for name, policy in operation_policies.items():
-            if name not in selected:
+            if refreshed_operations is not None:
+                original = parse_policy(refreshed_operations[name])
+            elif pool_binding is not None:
+                original = parse_policy(
+                    retired_operation() if name in installed.retired_operations else
+                    auxiliary_operation() if name in {
+                        "models", "storage-route-program-probe",
+                        "storage-route-configuration-probe",
+                    } else fixed_operation(
+                        name, pool_binding, logger_id=eventhub_logger_id(parent),
+                        usage_identity=usage_identity_expression(parent),
+                    )
+                )
+            elif name == "images-generations" and enables_images:
+                original = parse_policy(fixed_operation(
+                    name, installed_route_binding(
+                        installed, config.settings.ledger_table_endpoint,
+                        config.settings.ledger_table_name,
+                        config.settings.apim_usage_observer_key_named_value,
+                    ), logger_id=eventhub_logger_id(parent),
+                    usage_identity=usage_identity_expression(parent),
+                ))
+            elif name not in selected or name == "microsoft-decision" and enables_decision:
                 if (name != "microsoft-decision" or previous.decision_enabled
                         or not installed.decision_enabled):
                     raise PolicyCompilationError("Program cutover adds an unsupported Operation")
@@ -306,7 +400,10 @@ def _validate_program_cutover(
                     "oauth_enabled": installed.oauth_enabled, "decision_enabled": True,
                     "observer_key_named_value": config.settings.apim_usage_observer_key_named_value,
                 })
-                original = parse_policy(fixed_operation(name, binding))
+                original = parse_policy(fixed_operation(
+                    name, binding, logger_id=eventhub_logger_id(parent),
+                    usage_identity=usage_identity_expression(parent),
+                ))
             else:
                 original = parse_policy(selected[name])
             for guard in original.findall(".//set-variable[@name='routeDispatchReady']"):
@@ -333,6 +430,7 @@ def register_verified_program_upgrade(
     parent_policy: str | None = None, expected_parent_etag: str | None = None,
     operation_policies: Mapping[str, str] | None = None,
     expected_operation_etags: Mapping[str, str | None] | None = None,
+    original_parent_policy: str | None = None,
 ) -> None:
     from ..persistence.repository_support import (
         _fixed_program_upgrade_config,
@@ -418,14 +516,35 @@ def register_verified_program_upgrade(
                         native_digest != installed.parent_policy_sha256
                         and native_digest == fixed_policy_digest(normalized)
                     )
-                    recovering = candidate_written or normalized_written
-                    if not recovering and native_digest != (
+                    enables_capability = (
+                        installed.pool_enabled and not previous_installation.pool_enabled
+                        or installed.router_enabled and not previous_installation.router_enabled
+                        or installed.decision_enabled and not previous_installation.decision_enabled
+                        or installed.image_limits is not None
+                        and previous_installation.image_limits is None
+                    )
+                    rewrites_operations = (
+                        enables_capability or original_parent_policy is not None
+                    ) and bool(operation_policies)
+                    native_operations = management.route_program_operations(
+                        previous_installation.program.api_revision,
+                    ) if rewrites_operations else {}
+                    written_operations = any(
+                        fixed_policy_digest(value[2]) == (
+                            installed.operation_policies_sha256.get(name)
+                        )
+                        and installed.operation_policies_sha256.get(name)
+                        != previous_installation.operation_policies_sha256.get(name)
+                        for name, value in native_operations.items()
+                    )
+                    recovering = candidate_written or normalized_written or written_operations
+                    if not (candidate_written or normalized_written) and native_digest != (
                         previous_installation.parent_policy_sha256
                     ):
                         raise PolicyCompilationError(
                             "Program cutover native parent is not an approved candidate",
                         )
-                    if recovering and operation_policies:
+                    if recovering and operation_policies and not rewrites_operations:
                         raise PolicyCompilationError(
                             "Program cutover partial Operations require explicit recovery",
                         )
@@ -456,6 +575,8 @@ def register_verified_program_upgrade(
                     _validate_program_cutover(
                         parent_policy, previous_installation, installed, config, management,
                         operation_policies,
+                        previous_publication_id=upgrade.previous_publication_id,
+                        original_parent_policy=original_parent_policy,
                     )
                     observed_parent = management._request("HEAD", path)
                     if (observed_parent.status_code != 200
@@ -485,8 +606,8 @@ def register_verified_program_upgrade(
                     if adds_operation:
                         management._request(
                             "PUT", path,
-                            json_body={"properties": {"format": "xml", "value": ET.tostring(
-                                parse_policy(parent_policy), encoding="unicode",
+                            json_body={"properties": {"format": "xml", "value": encode_policy_xml(
+                                parse_policy(parent_policy),
                             )}},
                             extra_headers={"If-Match": cast(str, expected_parent_etag)},
                         )
@@ -514,16 +635,16 @@ def register_verified_program_upgrade(
                             continue
                         management._request(
                             "PUT", operation_paths[name],
-                            json_body={"properties": {"format": "xml", "value": ET.tostring(
-                                parse_policy(policy), encoding="unicode",
+                            json_body={"properties": {"format": "xml", "value": encode_policy_xml(
+                                parse_policy(policy),
                             )}},
                             extra_headers={"If-Match": version},
                         )
                     if not adds_operation and not candidate_written:
                         management._request(
                             "PUT", path,
-                            json_body={"properties": {"format": "xml", "value": ET.tostring(
-                                parse_policy(parent_policy), encoding="unicode",
+                            json_body={"properties": {"format": "xml", "value": encode_policy_xml(
+                                parse_policy(parent_policy),
                             )}},
                             extra_headers={"If-Match": cast(str, expected_parent_etag)},
                         )
@@ -571,6 +692,11 @@ def _default_route_clock() -> int:
 _PROGRAM_RENEW_BACKOFF_SECONDS = 300.0
 _PROGRAM_RENEW_BACKOFF_LOCK = Lock()
 _PROGRAM_RENEW_BACKOFF_UNTIL: dict[tuple[UUID, str], float] = {}
+# Releases that absorb the target's active model additions into one route set.
+_FULL_ROUTE_RELEASES = frozenset({
+    PublicationKind.ROUTE_RECONCILE, PublicationKind.MODEL_REMOVE,
+    PublicationKind.CREDENTIAL_ROTATION,
+})
 
 
 class FixedRoutePublisherFactory:
@@ -960,8 +1086,8 @@ class FixedRoutePublisherFactory:
                         ),),
                     )
             acquire_proof()
-            started = self._clock()
             proof = port._verifier.verify()
+            started = self._clock()
             port.projection.require_current_connections(snapshot, installation.program, started)
             observed_head = port.projection.read_active()
             if observed_head is None or observed_head[0] != head:
@@ -1390,6 +1516,7 @@ class FixedRoutePublisherFactory:
                 with _PROGRAM_RENEW_BACKOFF_LOCK:
                     if _PROGRAM_RENEW_BACKOFF_UNTIL.get(backoff_key, 0.0) > now_mono:
                         continue
+            attempt_started = monotonic()
             try:
                 with repository.model_availability_proof_guard(target_id, wait=False):
                     installed, config = self.installed(target_id, UUID(str(current["id"])))
@@ -1425,8 +1552,9 @@ class FixedRoutePublisherFactory:
                         )
                 network_error = error
                 logging.getLogger(__name__).warning(
-                    "Fixed route proof renewal failed target=%s error_type=%s",
-                    target_id, type(error).__name__,
+                    "Fixed route proof renewal failed target=%s error_type=%s "
+                    "elapsed_seconds=%.1f",
+                    target_id, type(error).__name__, monotonic() - attempt_started,
                 )
             except Exception as error:
                 if use_backoff:
@@ -1435,9 +1563,13 @@ class FixedRoutePublisherFactory:
                             monotonic() + _PROGRAM_RENEW_BACKOFF_SECONDS
                         )
                     last_error = error
+                    from .model_availability import loggable_reason
+
                     logging.getLogger(__name__).warning(
-                        "Fixed route proof renewal failed target=%s error_type=%s",
-                        target_id, type(error).__name__,
+                        "Fixed route proof renewal failed target=%s error_type=%s "
+                        "elapsed_seconds=%.1f reason=%s",
+                        target_id, type(error).__name__, monotonic() - attempt_started,
+                        loggable_reason(error),
                     )
                 else:
                     raise
@@ -1646,7 +1778,6 @@ class FixedRoutePublisherFactory:
         snapshots = [(publication, scope, len(scopes)) for publication in publications
                  for scopes in (recorded_route_scopes(publication),) for scope in scopes]
         runtimes = {str(row["id"]): row for row in self._repository.registry()["runtimes"]}
-        started = self._clock()
         completed = 0
         with (
             repository.model_availability_proof_guard(target_id, wait=wait),
@@ -1654,6 +1785,7 @@ class FixedRoutePublisherFactory:
         ):
             base_port, base_management = readers.enter_context(self._open(installed, config))
             base_proof = base_port._verifier.verify()
+            started = self._clock()
             fence = self._active_fence(target_id)
             if (fence.get("protocol_version") != 2 or fence.get("mode") != "active"
                     or fence.get("gateway_profile_id") != str(target_id)):
@@ -1782,10 +1914,7 @@ class FixedRoutePublisherFactory:
                 for row in self._repository.active_model_route_publications(
                     publication.gateway_profile_id,
                 )
-            ) if publication.publication_kind in {
-                PublicationKind.ROUTE_RECONCILE,
-                PublicationKind.MODEL_REMOVE,
-            } else (),
+            ) if publication.publication_kind in _FULL_ROUTE_RELEASES else (),
         )
 
     @staticmethod
@@ -1890,6 +2019,38 @@ class FixedRoutePublisherFactory:
             for prior in previous.desired_spec.bindings
         )
 
+    def _runtime_rotation_matches(
+        self, publication: GatewayPublication, binding: GatewayModelBinding,
+        config: Mapping[str, Any],
+    ) -> bool:
+        from ..services.route_publication import route_credential_source
+
+        recorded = config.get("key_vault_secret_id")
+        if (
+            recorded is None
+            or publication.publication_kind is not PublicationKind.CREDENTIAL_ROTATION
+            or publication.base_release_id is None
+        ):
+            return False
+        row = self._repository.get_gateway_publication(publication.base_release_id)
+        if row is None:
+            return False
+        previous = GatewayPublication.model_validate(row)
+        if (previous.id != publication.base_release_id
+                or previous.gateway_profile_id != publication.gateway_profile_id):
+            return False
+        inherited = self._inherited_credential_bindings(publication, previous)
+        return any(
+            prior.runtime_id == binding.runtime_id
+            and prior.auth_strategy == binding.auth_strategy
+            and prior.named_value_name == config.get("named_value_name")
+            and recorded == (
+                str(prior.key_vault_secret_id) if prior.key_vault_secret_id is not None
+                else inherited.get(route_credential_source(prior))
+            )
+            for prior in self._previous_credential_sources(publication, previous)
+        )
+
     def _preflight_dependencies(
         self, publication: GatewayPublication, installation: FixedProgramInstallation,
         registry: Mapping[str, Sequence[dict[str, Any]]] | None = None,
@@ -1937,16 +2098,18 @@ class FixedRoutePublisherFactory:
                         raise PolicyCompilationError("Fixed route Pool member Runtime changed")
             runtime = next((item for item in runtimes if item["id"] == binding.runtime_id), None)
             config = runtime.get("config") if runtime is not None else None
+            profile = profiles.get(binding.api_format)
             if (
                 runtime is None or runtime.get("enabled") is not True
                 or str(runtime.get("gateway_profile_id")) != str(publication.gateway_profile_id)
-                or not isinstance(config, dict)
-                or profiles.get(binding.api_format) not in installation.supported_profiles
+                or not isinstance(config, dict) or profile is None
                 or binding.serving_deployments and all(
                     deployment.native_gateway_id != installation.program.scope.gateway_id
                        for deployment in binding.serving_deployments)
             ):
                 raise PolicyCompilationError("Fixed route dependency preflight is unsupported")
+            if profile not in installation.supported_profiles:
+                raise GatewayCapabilityUnavailableError(profile)
             adapter = binding_request_adapter(binding)
             if adapter is not None and adapter not in installation.supported_adapters:
                 raise PolicyCompilationError("Fixed route Bedrock adapter is not installed")
@@ -1981,16 +2144,30 @@ class FixedRoutePublisherFactory:
         self, publication: GatewayPublication, previous: GatewayPublication,
     ) -> dict[str, str]:
         inherited = self._credential_bindings(previous)
-        if publication.publication_kind in {
-            PublicationKind.ROUTE_RECONCILE,
-            PublicationKind.MODEL_REMOVE,
-        }:
+        if publication.publication_kind in _FULL_ROUTE_RELEASES:
             for row in self._repository.active_model_route_publications(
                 publication.gateway_profile_id,
             ):
                 if row.get("id") != publication.id:
                     inherited.update(credential_bindings(row.get("resource_manifest") or {}))
         return inherited
+
+    def _previous_credential_sources(
+        self, publication: GatewayPublication, previous: GatewayPublication,
+    ) -> tuple[GatewayModelBinding, ...]:
+        from ..services.route_publication import pool_member_bindings
+
+        releases = (previous, *(
+            GatewayPublication.model_validate(row)
+            for row in self._repository.active_model_route_publications(
+                publication.gateway_profile_id,
+            )
+            if row.get("id") != publication.id
+        )) if publication.publication_kind in _FULL_ROUTE_RELEASES else (previous,)
+        return tuple(
+            source for release in releases for binding in release.desired_spec.bindings
+            for source in pool_member_bindings(binding) or (binding,)
+        )
 
     def _prepare_credentials(
         self, publication: GatewayPublication, previous: GatewayPublication,
@@ -2012,26 +2189,7 @@ class FixedRoutePublisherFactory:
                 raise PolicyCompilationError("Route credential bindings have no source")
             return publication, {}
         inherited = self._inherited_credential_bindings(publication, previous)
-        addition_bindings = tuple(
-            source
-            for row in (
-                self._repository.active_model_route_publications(publication.gateway_profile_id)
-                if publication.publication_kind in {
-                    PublicationKind.ROUTE_RECONCILE,
-                    PublicationKind.MODEL_REMOVE,
-                } else ()
-            )
-            if row.get("id") != publication.id
-            for binding in GatewayPublication.model_validate(row).desired_spec.bindings
-            for source in pool_member_bindings(binding) or (binding,)
-        )
-        previous_bindings = (
-            *tuple(
-                source for binding in previous.desired_spec.bindings
-                for source in pool_member_bindings(binding) or (binding,)
-            ),
-            *addition_bindings,
-        )
+        previous_bindings = self._previous_credential_sources(publication, previous)
         previous_sources = {
             route_credential_source(binding) for binding in previous_bindings
             if binding.auth_strategy in {
@@ -2062,7 +2220,9 @@ class FixedRoutePublisherFactory:
                     prior.runtime_id == binding.runtime_id
                     and prior.auth_strategy == binding.auth_strategy
                     and prior.named_value_name == config.get("named_value_name")
-                    and prior.key_vault_secret_id == binding.key_vault_secret_id
+                    and (prior.key_vault_secret_id == binding.key_vault_secret_id
+                         or prior.key_vault_secret_id is not None
+                         and str(prior.key_vault_secret_id) == config.get("key_vault_secret_id"))
                     for prior in previous_bindings
                 )
             )
@@ -2621,6 +2781,7 @@ class FixedRoutePublisherFactory:
         if checkpoint.context_sha256 != context:
             raise PolicyCompilationError("Route connection preparation context changed")
         stored = deepcopy(raw)
+        issued: dict[str, int] = {}
 
         def prepare(binding: GatewayModelBinding) -> tuple[ConnectionRevision, int]:
             nonlocal checkpoint, stored
@@ -2637,7 +2798,10 @@ class FixedRoutePublisherFactory:
             prior = checkpoint.connections.get(key)
             if prior is not None and prior.connection != connection:
                 raise PolicyCompilationError("Route connection preparation changed")
-            instant = prior.issued_epoch if prior is not None else self._clock()
+            # Aliases sharing one connection must carry one identical approval.
+            instant = prior.issued_epoch if prior is not None else issued.setdefault(
+                key, self._clock(),
+            )
 
             def validate_pool_intent(raw_intent: Mapping[str, Any]) -> dict[str, Any]:
                 intent = _PoolWriteIntent.model_validate_json(canonical_document(raw_intent))
@@ -3185,6 +3349,7 @@ class FixedRoutePublisherFactory:
         client: httpx.Client,
         installation: FixedProgramInstallation,
         *, binding: GatewayModelBinding | None = None,
+        previous: GatewayPublication | None = None,
     ) -> dict[str, Any] | None:
         from ..integrations.gateway_connection_probe import foundry_deployment_metadata
         from .route_publication import route_credential_source
@@ -3234,10 +3399,24 @@ class FixedRoutePublisherFactory:
                         )
                 else:
                     secret_id = materialized_secret_id
+                    if secret_id is None and previous is not None:
+                        source = route_credential_source(binding)
+                        secret_id = self._inherited_credential_bindings(
+                            publication, previous,
+                        ).get(source)
+                        if secret_id is None and any(
+                            prior.auth_strategy in {
+                                AuthStrategy.NAMED_VALUE_API_KEY,
+                                AuthStrategy.NAMED_VALUE_BEARER,
+                            } and route_credential_source(prior) == source
+                            for prior in self._previous_credential_sources(publication, previous)
+                        ):
+                            assert binding.named_value_name is not None
+                            return {"api-key": management.route_credential_value(
+                                binding.named_value_name,
+                            ).get_secret_value()}
                     if secret_id is None:
-                        raise PolicyCompilationError(
-                            "Deployment metadata requires a materialized credential"
-                        )
+                        raise CredentialSourceMissingError(str(binding.named_value_name))
                     self._require_credential_vault(secret_id, installation)
                     if self._cipher is None or installation.credential_vault_origin is None:
                         raise PolicyCompilationError("Deployment credential vault is unavailable")
@@ -3602,7 +3781,10 @@ class FixedRoutePublisherFactory:
                 publication, installed, previous, projection=port.projection,
             )
             if credentials is None:
-                self._validate_deployment(publication, management, port._client, installed)
+                self._validate_deployment(
+                    publication, management, port._client, installed,
+                    previous=connection_source,
+                )
                 publication, credentials = self._prepare_credentials(
                     publication, connection_source, installed, management, worker_id, heartbeat,
                     registry=registry,
@@ -3916,6 +4098,7 @@ class FixedRoutePublisherFactory:
             _binding_route_contract,
             _binding_route_origin,
             binding_public_count_path,
+            route_credential_source,
         )
 
         runtimes = (registry if registry is not None else self._repository.registry())["runtimes"]
@@ -4002,12 +4185,30 @@ class FixedRoutePublisherFactory:
                 baseline is not None or initial_migration or addition is not None
             )
             if renew:
+                declared_secret = (str(binding.key_vault_secret_id)
+                                   if binding.key_vault_secret_id else None)
+                materialized_secret = (
+                    self._credential_bindings(publication).get(route_credential_source(binding))
+                    if binding.auth_strategy in {
+                        AuthStrategy.NAMED_VALUE_API_KEY, AuthStrategy.NAMED_VALUE_BEARER,
+                    } else None
+                )
+                if (declared_secret is not None
+                    and materialized_secret not in {None, declared_secret}):
+                    raise PolicyCompilationError("Fixed route declared credential version changed")
+                # Activation records the credential, so a never-activated connection has none yet.
+                accepted_secrets = (
+                    {declared_secret} if declared_secret is not None
+                    else {None, materialized_secret}
+                )
                 if (
                     runtime_config.get("control_plane_managed") is not True
                     or not self._runtime_destination_matches(publication, binding, runtime_config)
                     or runtime_config.get("auth_strategy") != binding.auth_strategy.value
-                    or runtime_config.get("key_vault_secret_id")
-                    != (str(binding.key_vault_secret_id) if binding.key_vault_secret_id else None)
+                    or (runtime_config.get("key_vault_secret_id") not in accepted_secrets
+                        and not self._runtime_rotation_matches(
+                            publication, binding, runtime_config,
+                        ))
                     or binding.api_format is not ApiFormat.MICROSOFT_DECISION
                     and runtime_config.get("managed_identity_resource")
                     != binding.managed_identity_resource

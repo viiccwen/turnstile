@@ -128,6 +128,7 @@ from turnstile_core.integrations.apim_policy_components import (
     expression_token_spans,
     parse_policy,
     validate_executable_policy,
+    validate_native_stream_policy,
 )
 from turnstile_core.integrations.apim_storage_routes import (
     FixedProgramVerifier,
@@ -259,6 +260,100 @@ def test_publication_failure_is_structured_and_never_echoes_raw_errors(
     if expected == "publisher_permissions_missing":
         assert result.request_id == UUID("00000000-0000-4000-8000-000000000123")
         assert result.missing_actions == ["Microsoft.ApiManagement/service/apis/write"]
+
+
+@pytest.mark.parametrize("error_code", ["PolicyCompilationError", "opaque upstream secret"])
+def test_generic_publication_failure_names_the_publication(
+    error_code: str,
+) -> None:
+    # "Publication failed" alone left no reference to look up in the logs.
+    repository = InMemoryRepository()
+    publication = GatewayControlPlaneService(repository).publish(
+        external_tenant_foundry_publication(repository), "unit-owner",
+    )
+    failed = publication.model_copy(update={
+        "status": PublicationStatus.FAILED, "error_code": error_code,
+        "error_message": "Fixed route dependency preflight is unsupported",
+    })
+
+    result = publication_failure(failed)
+
+    assert result is not None and result.code == "publication_failed"
+    assert str(publication.id) in result.message
+    assert error_code not in result.message
+    assert "preflight" not in result.message
+
+
+@pytest.mark.parametrize(("error_code", "message", "expected"), [
+    ("PolicyCompilationError", "Route credential has no approved original source",
+     "credential_source_missing"),
+    ("PolicyCompilationError", "Deployment metadata credential is unavailable",
+     "credential_unreadable"),
+    ("PolicyCompilationError", "Route publication credential is unavailable",
+     "credential_unreadable"),
+    ("PolicyCompilationError", "Deployment credential vault is unavailable",
+     "credential_vault_unavailable"),
+    ("PolicyCompilationError", "Route credential materialization is unavailable",
+     "credential_vault_unavailable"),
+    ("PolicyCompilationError", "Route credential Vault is not approved for this program",
+     "credential_vault_unavailable"),
+    ("ValueError", "Route publication credential is unavailable", "publication_failed"),
+    ("PolicyCompilationError", "opaque upstream secret", "publication_failed"),
+])
+def test_known_credential_failures_have_safe_reasons(
+    error_code: str, message: str, expected: str,
+) -> None:
+    repository = InMemoryRepository()
+    publication = GatewayControlPlaneService(repository).publish(
+        external_tenant_foundry_publication(repository), "unit-owner",
+    )
+    failed = publication.model_copy(update={
+        "status": PublicationStatus.FAILED, "error_code": error_code, "error_message": message,
+    })
+    result = publication_failure(failed)
+    assert result is not None and result.code == expected
+    assert message not in result.model_dump_json()
+    if expected == "publication_failed":
+        assert str(publication.id) in result.message
+    view = GatewayPublicationView.from_publication(failed)
+    assert view.failure is not None and view.failure.code == expected
+
+
+@pytest.mark.parametrize(("details", "expected"), [
+    ({"http_status": 400, "upstream_code": "PermissionDenied", "auth": "managed_identity"},
+     "returned HTTP 400 (PermissionDenied). "
+     "Check that the Publisher managed identity can read this Foundry project."),
+    ({"http_status": 401, "upstream_code": "PermissionDenied"},
+     "returned HTTP 401 (PermissionDenied)."),
+    ({"http_status": 500, "auth": "managed_identity"}, "returned HTTP 500."),
+    ({"http_status": 403, "upstream_code": "private code with spaces"}, None),
+    ({"http_status": 403, "auth": "private"}, None),
+])
+def test_deployment_directory_failure_keeps_the_upstream_code_and_identity_hint(
+    details: dict[str, object], expected: str | None,
+) -> None:
+    repository = InMemoryRepository()
+    publication = GatewayControlPlaneService(repository).publish(
+        external_tenant_foundry_publication(repository), "unit-owner",
+    )
+    failed = publication.model_copy(update={
+        "status": PublicationStatus.FAILED, "error_code": "PolicyCompilationError",
+        "error_message": "Deployment validation failed: " + json.dumps({
+            "code": "deployment_metadata_unavailable", "deployment": "unit-deployment",
+            **details,
+        }),
+    })
+    result = publication_failure(failed)
+    assert result is not None and "private" not in result.model_dump_json()
+    if expected is None:
+        assert result.code == "publication_failed"
+        return
+    assert result.code == "deployment_metadata_unavailable"
+    assert result.http_status == details["http_status"]
+    assert result.message == (
+        "Deployment 'unit-deployment' could not be verified; the deployment directory "
+        + expected
+    )
 
 
 def test_legacy_publication_hash_omits_only_empty_deployment_fields() -> None:
@@ -932,6 +1027,131 @@ def test_fixed_program_verifier_requires_current_management_and_exact_authentica
         with pytest.raises(ValueError, match="authenticated probe identity changed"):
             verifier.verify()
         assert requests == ["HEAD", "HEAD"]
+
+
+def _timed_program_verifier(
+    parent_seconds: float, operation_seconds: float, fault: str | None = None,
+) -> FixedProgramVerifier:
+    scope = RouteScope(target_id=str(UUID(int=1)), api_id="unit-api", gateway_id="managed")
+    contracts = fixed_operation_contracts()
+    operation = ("<policies><inbound><base/></inbound><backend><base/></backend>"
+                 "<outbound><base/></outbound><on-error><base/></on-error></policies>")
+    parent = operation.replace("<inbound><base/>", '<inbound><base/><set-variable '
+                                'name="routeProgram" value="' + "0" * 64 + '"/>'
+                                '<set-variable name="routeVaultOrigins" value="[]"/>')
+    policies = {name: operation for name in contracts}
+    digest = fixed_program_digest(parent, policies, tuple((name, *route)
+                                                          for name, route in contracts.items()))
+    parent = parent.replace("0" * 64, digest)
+    identity = ProgramIdentity(scope=scope, api_revision="1", instance_id="managed",
+                                program_sha256=digest, trust_binding_sha256="a" * 64)
+    installed = FixedProgramInstallation(
+        program=identity, target_identity_sha256="b" * 64,
+        storage_endpoint="https://unitstore.table.core.windows.net",
+        storage_table="TurnstileRoutes", gateway_endpoint="https://unit-apim.example.test/llm",
+        publisher_subscription_id="unit-only",
+        parent_policy_sha256=fixed_policy_digest(parent), supported_profiles=("openai-v1",),
+        operation_contracts=contracts,
+        operation_policies_sha256={
+            name: fixed_policy_digest(policy) for name, policy in policies.items()
+        },
+    )
+    now = [1000.0]
+    changed = operation.replace("<base/></inbound>", '<base/><set-variable name="unitChanged" '
+                                'value="1"/></inbound>')
+
+    def read_parent(_revision: str) -> str:
+        now[0] += parent_seconds
+        return changed if fault == "parent" else parent
+
+    def read_operations(_revision: str) -> dict[str, tuple[str, str, str]]:
+        now[0] += operation_seconds * len(contracts)
+        return {name: (*contract, changed if fault == "operation" and name == "models"
+                       else policies[name]) for name, contract in contracts.items()}
+
+    def probe(request: httpx.Request) -> httpx.Response:
+        fields = {"abi": "2", "target": scope.target_id, "api": scope.api_id, "revision": "1",
+                  "nonce": "0" * 32 if fault == "nonce"
+                  else request.headers["x-turnstile-route-probe"],
+                  "gateway": "managed", "instance": "managed",
+                  "program": "f" * 64 if fault == "program" else digest,
+                  "trust": identity.trust_binding_sha256}
+        return httpx.Response(204, headers={"x-turnstile-route-" + name: value
+                                            for name, value in fields.items()})
+
+    management = MagicMock()
+    management.current_revision.return_value = "2" if fault == "revision" else "1"
+    management.revision_api_policy.side_effect = read_parent
+    management.route_program_operations.side_effect = read_operations
+    return FixedProgramVerifier(
+        installed, management, SecretStr("unit-only"),
+        httpx.Client(transport=httpx.MockTransport(probe)), clock=lambda: int(now[0]),
+    )
+
+
+def test_fixed_program_verifier_bounds_evidence_age_on_slow_management_reads() -> None:
+    fast = _timed_program_verifier(5, 0.5).verify()
+    assert (fast.issued_epoch, fast.expires_epoch) == (1009, 1129)
+    slow = _timed_program_verifier(25, 1.5).verify()
+    assert (slow.issued_epoch, slow.expires_epoch) == (1038, 1150)
+    last = _timed_program_verifier(149, 0).verify()
+    assert (last.issued_epoch, last.expires_epoch) == (1149, 1150)
+    with pytest.raises(ValueError, match="time window after 150 of 150 seconds"):
+        _timed_program_verifier(150, 0).verify()
+    with pytest.raises(ValueError, match="exceeded its time window"):
+        _timed_program_verifier(-1, 0).verify()
+    for fault, message in {
+        "nonce": "authenticated probe identity changed",
+        "program": "authenticated probe identity changed",
+        "parent": "parent changed",
+        "operation": "operation changed",
+        "revision": "revision changed",
+    }.items():
+        with pytest.raises(ValueError, match=message):
+            _timed_program_verifier(25, 1.5, fault).verify()
+
+
+@pytest.mark.parametrize("parent_seconds", [25, 150])
+def test_program_proof_renewal_completes_or_reports_slow_management_reads(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, parent_seconds: int,
+) -> None:
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import turnstile_core.services.storage_route_publisher as publisher_module
+
+    verifier = _timed_program_verifier(parent_seconds, 1.5)
+    program = verifier.installation.program
+    target_id = UUID(program.scope.target_id)
+    repository, port = Mock(), Mock()
+    repository.list_apim_targets.return_value = [{"gateway_profile_id": target_id}]
+    repository.get_gateway_profiles.return_value = []
+    repository.effective_gateway_publication.return_value = {
+        "id": UUID(int=512), "gateway_profile_id": target_id, "status": "active",
+        "resource_manifest": {"fixed_route_program": {}},
+    }
+    repository.model_availability_proof_guard.return_value = nullcontext()
+    port._verifier = verifier
+    port.projection.read_program_proof.return_value = None
+    factory = publisher_module.FixedRoutePublisherFactory(
+        repository, Mock(), active_fence=Mock(), availability_projector=Mock(),
+    )
+    monkeypatch.setattr(publisher_module, "_PROGRAM_RENEW_BACKOFF_UNTIL", {})
+    monkeypatch.setattr(factory, "installed", Mock(return_value=(
+        SimpleNamespace(program=program, native_gateway_scope=False), Mock(),
+    )))
+    monkeypatch.setattr(factory, "_open", Mock(return_value=nullcontext((port, Mock()))))
+    if parent_seconds == 25:
+        factory.renew_program_proofs()
+        published = port.projection.publish_program_proof.call_args.args[0]
+        assert (published.issued_epoch, published.expires_epoch) == (1038, 1150)
+    else:
+        with pytest.raises(ValueError, match="after 163 of 150 seconds"):
+            factory.renew_program_proofs()
+        port.projection.publish_program_proof.assert_not_called()
+        assert ("reason=Fixed route program verification exceeded its time window after "
+                "163 of 150 seconds") in caplog.text
+        assert "elapsed_seconds=" in caplog.text and "unit-only" not in caplog.text
 
 
 def test_fixed_program_operations_and_digest_preserve_exact_source_native_contract() -> None:
@@ -1913,6 +2133,363 @@ def test_fixed_route_program_promotion_once_never_replays_started_intent() -> No
     verify.assert_called_once_with("2")
 
 
+@pytest.mark.parametrize("pool_enabled", [False, True])
+@pytest.mark.parametrize("auth_strategy", [
+    AuthStrategy.NAMED_VALUE_API_KEY, AuthStrategy.NAMED_VALUE_BEARER,
+])
+@pytest.mark.parametrize("published,fault", [
+    *((True, fault) for fault in (
+        None, "runtime-version", "missing-mapping", "mapped-version", "declared-conflict",
+    )),
+    (False, None), (False, "missing-mapping"), (False, "declared-conflict"),
+])
+def test_connection_renewal_uses_activated_materialized_credential(
+    pool_enabled: bool, auth_strategy: AuthStrategy, published: bool, fault: str | None,
+) -> None:
+    from tests.backend.model_platform.test_storage_route_projection import snapshot_fixture
+    from turnstile_core.persistence.repository_support import _activated_runtime_credentials
+    from turnstile_core.services.route_publication import (
+        pool_member_bindings,
+        route_credential_source,
+    )
+
+    publication, _ = budget_publication_contract_fixture()
+    snapshot, program, _ = snapshot_fixture()
+    target = UUID(program.scope.target_id)
+    binding = publication.desired_spec.bindings[0].model_copy(update={
+        "runtime_id": UUID(int=923), "api_format": ApiFormat.OPENAI_CHAT,
+        "auth_strategy": auth_strategy, "named_value_name": "unit-runtime-key",
+        "key_vault_secret_id": None,
+    })
+    assert binding.backend_url is not None
+    runtime_config = {
+        **binding.runtime_config, "control_plane_managed": True,
+        "backend_url": str(binding.backend_url), "backend_path": binding.backend_path,
+        "api_format": binding.api_format.value, "auth_strategy": binding.auth_strategy.value,
+        "managed_identity_resource": binding.managed_identity_resource,
+    }
+    if pool_enabled:
+        pool = GatewayBackendPoolConfig(members=[GatewayBackendPoolMember(
+            runtime_id=UUID(int=923 + index), runtime_name=f"unit-runtime-{index}",
+            backend_url=binding.backend_url, auth_strategy=binding.auth_strategy,
+            named_value_name=binding.named_value_name, priority=0, weight=1,
+        ) for index in range(2)], rate_limit=GatewayRateLimitResilience(
+            max_attempts_per_request=2, retry_interval_seconds=1, first_fast_retry=True,
+            circuit_breaker=GatewayRateLimitCircuitBreaker(
+                failure_count=1, interval_seconds=60, trip_duration_seconds=60,
+                accept_retry_after=True,
+            ),
+        ))
+        runtime_config["apim_backend_pool"] = pool.model_dump(mode="json")
+    binding = binding.model_copy(update={"runtime_config": runtime_config})
+    secret_id = "https://unit-vault.vault.azure.net/secrets/runtime-key/" + "a" * 32
+    credentials = {
+        route_credential_source(source): secret_id
+        for source in pool_member_bindings(binding) or (binding,)
+    }
+    manifest = {"route_credentials": {"version": 1, "bindings": credentials}}
+    activated = _activated_runtime_credentials(
+        runtime_config, binding.model_dump(mode="json"), manifest,
+    )
+    assert activated["key_vault_secret_id"] == secret_id
+    assert binding.key_vault_secret_id is None
+    current = activated if published else dict(runtime_config)
+    assert (current.get("key_vault_secret_id") is not None) is published
+    changed_secret = secret_id[:-32] + "b" * 32
+    if fault == "runtime-version":
+        current["key_vault_secret_id"] = changed_secret
+    elif fault == "missing-mapping":
+        manifest = {"route_credentials": {"version": 1, "bindings": {}}}
+    elif fault == "mapped-version":
+        manifest = {"route_credentials": {"version": 1, "bindings": {
+            key: changed_secret for key in credentials
+        }}}
+    elif fault == "declared-conflict":
+        binding = binding.model_copy(update={"key_vault_secret_id": HttpUrl(secret_id)})
+        manifest = {"route_credentials": {"version": 1, "bindings": {
+            **credentials, route_credential_source(binding): changed_secret,
+        }}}
+    publication = publication.model_copy(update={
+        "gateway_profile_id": target, "resource_manifest": manifest,
+        "desired_spec": publication.desired_spec.model_copy(update={"bindings": [binding]}),
+    })
+    installation = FixedProgramInstallation(
+        program=program, target_identity_sha256="f" * 64,
+        storage_endpoint="https://unitstore.table.core.windows.net", storage_table="Routes",
+        gateway_endpoint="https://unit.azure-api.net/turnstile", publisher_subscription_id="unit",
+        parent_policy_sha256="a" * 64, operation_policies_sha256={"models": "b" * 64},
+        operation_contracts={"models": ("GET", "/models")}, supported_profiles=("openai-v1",),
+        pool_enabled=pool_enabled,
+    )
+    configuration = ApimTargetClientConfig(target, "f" * 64, True, Settings.model_construct(
+        azure_subscription_id=str(UUID(int=1)), apim_resource_group="unit-group",
+        apim_service_name="unit-apim", apim_api_id=program.scope.api_id,
+    ), route_target_identity_sha256=installation.target_identity_sha256)
+    repository, configurations, management = MagicMock(), MagicMock(), MagicMock()
+    configurations.resolve.return_value = configuration
+    repository.checkpoint_gateway_publication_preparation.return_value = True
+
+    def prepare(connection: ConnectionRevision, persist: Any,
+                *, recovery_only: bool = False) -> str:
+        assert recovery_only is False
+        persist({"unit": "connection-intent"})
+        return connection.dependency_sha256
+
+    management.prepare_route_connection.side_effect = prepare
+    management.verify_route_connection.side_effect = lambda value: value.dependency_sha256
+    factory = FixedRoutePublisherFactory(
+        repository, configurations, active_fence=MagicMock(),
+        availability_projector=MagicMock(), clock=lambda: 1100,
+    )
+    registry = {"runtimes": [{
+        "id": binding.runtime_id, "enabled": True,
+        "gateway_profile_id": target, "config": current,
+    }]}
+    prepare_connection = factory._connection_preparer(
+        publication, installation, configuration, management, "unit-worker", lambda: None,
+    )
+    if fault is not None:
+        with pytest.raises(PolicyCompilationError):
+            factory.approved_connections(publication, installation, management, baseline=snapshot,
+                registry=registry, prepare_connection=prepare_connection)
+        management.prepare_route_connection.assert_not_called()
+        management.prepare_route_pool.assert_not_called()
+        management.verify_route_connection.assert_not_called()
+    else:
+        approved = factory.approved_connections(publication, installation, management,
+            baseline=snapshot, registry=registry, prepare_connection=prepare_connection)
+        assert approved[binding.model.model_key].state == "approved"
+        if pool_enabled:
+            management.prepare_route_pool.assert_called_once()
+            assert management.prepare_route_pool.call_args.args[0] == (
+                approved[binding.model.model_key].connection
+            )
+            assert len(management.prepare_route_pool.call_args.args[1]) == 2
+        else:
+            management.prepare_route_connection.assert_called_once()
+            repository.checkpoint_gateway_publication_preparation.assert_called_once()
+        management.verify_route_connection.assert_called_once_with(
+            approved[binding.model.model_key].connection,
+        )
+
+
+def test_aliases_of_one_existing_connection_share_one_route_approval() -> None:
+    from itertools import count
+
+    from tests.backend.model_platform.test_storage_route_projection import snapshot_fixture
+    from turnstile_core.persistence.repository_support import _activated_runtime_credentials
+    from turnstile_core.services.route_publication import route_credential_source
+
+    publication, _ = budget_publication_contract_fixture()
+    snapshot, program, _ = snapshot_fixture()
+    target = UUID(program.scope.target_id)
+    binding = publication.desired_spec.bindings[0].model_copy(update={
+        "runtime_id": UUID(int=923), "api_format": ApiFormat.OPENAI_CHAT,
+        "auth_strategy": AuthStrategy.NAMED_VALUE_API_KEY,
+        "named_value_name": "unit-runtime-key", "key_vault_secret_id": None,
+    })
+    assert binding.backend_url is not None
+    runtime_config = {
+        **binding.runtime_config, "control_plane_managed": True,
+        "backend_url": str(binding.backend_url), "backend_path": binding.backend_path,
+        "api_format": binding.api_format.value, "auth_strategy": binding.auth_strategy.value,
+        "managed_identity_resource": binding.managed_identity_resource,
+    }
+    binding = binding.model_copy(update={"runtime_config": runtime_config})
+    sibling = binding.model_copy(update={
+        "model": binding.model.model_copy(update={"model_key": "unit-sibling-alias"}),
+    })
+    secret_id = "https://unit-vault.vault.azure.net/secrets/runtime-key/" + "a" * 32
+    manifest = {"route_credentials": {"version": 1, "bindings": {
+        route_credential_source(binding): secret_id,
+    }}}
+    activated = _activated_runtime_credentials(
+        runtime_config, binding.model_dump(mode="json"), manifest,
+    )
+    publication = publication.model_copy(update={
+        "gateway_profile_id": target, "resource_manifest": manifest,
+        "desired_spec": publication.desired_spec.model_copy(update={
+            "bindings": [binding, sibling],
+        }),
+    })
+    installation = FixedProgramInstallation(
+        program=program, target_identity_sha256="f" * 64,
+        storage_endpoint="https://unitstore.table.core.windows.net", storage_table="Routes",
+        gateway_endpoint="https://unit.azure-api.net/turnstile", publisher_subscription_id="unit",
+        parent_policy_sha256="a" * 64, operation_policies_sha256={"models": "b" * 64},
+        operation_contracts={"models": ("GET", "/models")}, supported_profiles=("openai-v1",),
+    )
+    configuration = ApimTargetClientConfig(target, "f" * 64, True, Settings.model_construct(
+        azure_subscription_id=str(UUID(int=1)), apim_resource_group="unit-group",
+        apim_service_name="unit-apim", apim_api_id=program.scope.api_id,
+    ), route_target_identity_sha256=installation.target_identity_sha256)
+    repository, configurations, management = MagicMock(), MagicMock(), MagicMock()
+    configurations.resolve.return_value = configuration
+    # The Backend already exists from earlier model additions, so preparation writes nothing.
+    management.prepare_route_connection.side_effect = (
+        lambda connection, persist, *, recovery_only=False: connection.dependency_sha256
+    )
+    management.verify_route_connection.side_effect = lambda value: value.dependency_sha256
+    ticks = count(1100)
+    factory = FixedRoutePublisherFactory(
+        repository, configurations, active_fence=MagicMock(),
+        availability_projector=MagicMock(), clock=lambda: next(ticks),
+    )
+    registry = {"runtimes": [{
+        "id": binding.runtime_id, "enabled": True,
+        "gateway_profile_id": target, "config": activated,
+    }]}
+    approved = factory.approved_connections(
+        publication, installation, management, baseline=snapshot, registry=registry,
+        prepare_connection=factory._connection_preparer(
+            publication, installation, configuration, management, "unit-worker", lambda: None,
+        ),
+    )
+    first, second = approved[binding.model.model_key], approved[sibling.model.model_key]
+    assert management.prepare_route_connection.call_count == 2
+    assert first.connection.revision_id == second.connection.revision_id
+    assert first == second
+    repository.checkpoint_gateway_publication_preparation.assert_not_called()
+
+
+@pytest.mark.parametrize("variant", ["base", "addition", "forged", "reconcile", "unrelated"])
+def test_fixed_route_rotation_renews_only_from_the_connection_base_credential(
+    variant: str,
+) -> None:
+    from tests.backend.model_platform.test_storage_route_projection import snapshot_fixture
+    from turnstile_core.services.route_publication import route_credential_source
+
+    publication, _ = budget_publication_contract_fixture()
+    snapshot, program, _ = snapshot_fixture()
+    target = UUID(program.scope.target_id)
+    prior = publication.desired_spec.bindings[0].model_copy(update={
+        "runtime_id": UUID(int=923), "api_format": ApiFormat.OPENAI_CHAT,
+        "auth_strategy": AuthStrategy.NAMED_VALUE_API_KEY, "named_value_name": "unit-runtime-key",
+        "key_vault_secret_id": None,
+    })
+    assert prior.backend_url is not None
+    config = {
+        **prior.runtime_config, "control_plane_managed": True,
+        "backend_url": str(prior.backend_url), "backend_path": prior.backend_path,
+        "api_format": prior.api_format.value, "auth_strategy": prior.auth_strategy.value,
+        "managed_identity_resource": prior.managed_identity_resource,
+        "named_value_name": prior.named_value_name,
+    }
+    prior = prior.model_copy(update={"runtime_config": config})
+    rotated_name = "finops-credential-" + "c" * 20
+    rotated = prior.model_copy(update={
+        "named_value_name": rotated_name,
+        "runtime_config": {**config, "named_value_name": rotated_name},
+    })
+    vault = "https://unit-vault.vault.azure.net/secrets/"
+    recorded, materialized = vault + "runtime-key/" + "a" * 32, vault + "rotated-key/" + "b" * 32
+    # Only the base release, or a model addition pinned to the record, may prove the record.
+    routed = variant not in {"addition", "unrelated"}
+    other = prior.model_copy(update={
+        "runtime_id": UUID(int=924),
+        "model": prior.model.model_copy(update={"model_key": "unit-other-model"}),
+    })
+    base = publication.model_copy(update={
+        "id": UUID(int=931), "gateway_profile_id": target,
+        "publication_kind": PublicationKind.ROUTE_RECONCILE,
+        "resource_manifest": {"route_credentials": {"version": 1, "bindings": {
+            route_credential_source(prior): recorded,
+        } if routed else {}}},
+        "desired_spec": publication.desired_spec.model_copy(update={
+            "gateway_profile_id": target, "bindings": [prior if routed else other],
+            "discovery_models": [item.model_copy(update={"id": "unit-other-model"})
+                                 if not routed else item
+                                 for item in publication.desired_spec.discovery_models],
+        }),
+    })
+    addition = publication.model_copy(update={
+        "id": UUID(int=932), "gateway_profile_id": target, "base_release_id": base.id,
+        "publication_kind": PublicationKind.MODEL_ADD, "resource_manifest": {},
+        "desired_spec": publication.desired_spec.model_copy(update={
+            "gateway_profile_id": target,
+            "bindings": [prior.model_copy(update={"key_vault_secret_id": HttpUrl(recorded)})],
+        }),
+    })
+    rotation = publication.model_copy(update={
+        "id": UUID(int=933), "gateway_profile_id": target, "base_release_id": base.id,
+        "publication_kind": PublicationKind.ROUTE_RECONCILE if variant == "reconcile"
+        else PublicationKind.CREDENTIAL_ROTATION,
+        "resource_manifest": {},
+        "desired_spec": publication.desired_spec.model_copy(update={
+            "gateway_profile_id": target, "bindings": [rotated],
+        }),
+    })
+    installation = FixedProgramInstallation(
+        program=program, target_identity_sha256="f" * 64,
+        storage_endpoint="https://unitstore.table.core.windows.net", storage_table="Routes",
+        gateway_endpoint="https://unit.azure-api.net/turnstile", publisher_subscription_id="unit",
+        parent_policy_sha256="a" * 64, operation_policies_sha256={"models": "b" * 64},
+        operation_contracts={"models": ("GET", "/models")}, supported_profiles=("openai-v1",),
+        credential_vault_origin="https://unit-vault.vault.azure.net",
+        trusted_vault_origins=("https://unit-vault.vault.azure.net",),
+    )
+    configuration = ApimTargetClientConfig(target, "f" * 64, True, Settings.model_construct(
+        azure_subscription_id=str(UUID(int=1)), apim_resource_group="unit-group",
+        apim_service_name="unit-apim", apim_api_id=program.scope.api_id,
+    ), route_target_identity_sha256=installation.target_identity_sha256)
+    cipher = CredentialCipher(Fernet.generate_key())
+    repository, configurations, management = MagicMock(), MagicMock(), MagicMock()
+    configurations.resolve.return_value = configuration
+    repository.get_gateway_publication.return_value = base.model_dump(mode="python")
+    repository.active_model_route_publications.return_value = (
+        [addition.model_dump(mode="python")] if variant == "addition" else []
+    )
+    repository.gateway_publication_credential.return_value = cipher.encrypt("unit-rotated-key")
+    repository.checkpoint_gateway_publication_credentials.return_value = True
+    repository.checkpoint_gateway_publication_preparation.return_value = True
+
+    def prepare(connection: ConnectionRevision, persist: Any,
+                *, recovery_only: bool = False) -> str:
+        persist({"unit": "connection-intent"})
+        return connection.dependency_sha256
+
+    management.prepare_route_connection.side_effect = prepare
+    management.verify_route_connection.side_effect = lambda value: value.dependency_sha256
+    factory = FixedRoutePublisherFactory(
+        repository, configurations, active_fence=MagicMock(),
+        availability_projector=MagicMock(), clock=lambda: 1100, cipher=cipher,
+    )
+    registry = {"runtimes": [{
+        "id": prior.runtime_id, "enabled": True, "gateway_profile_id": target,
+        "config": {**config, "key_vault_secret_id": (
+            recorded[:-32] + "f" * 32 if variant == "forged" else recorded
+        )},
+    }]}
+    accepted = variant in {"base", "addition"}
+    if accepted:
+        with (
+            patch("turnstile_core.services.storage_route_publisher.RouteCredentialVault") as vaults,
+            patch("turnstile_core.services.storage_route_publisher.ManagedIdentityTokenProvider"),
+        ):
+            vaults.return_value.materialize.return_value = materialized
+            rotation, keys = factory._prepare_credentials(
+                rotation, base, installation, management, "unit-worker", lambda: None,
+                registry=registry,
+            )
+        assert keys == {route_credential_source(rotated): materialized}
+    else:
+        rotation = rotation.model_copy(update={"resource_manifest": {"route_credentials": {
+            "version": 1, "bindings": {route_credential_source(rotated): materialized},
+        }}})
+    prepare_connection = factory._connection_preparer(
+        rotation, installation, configuration, management, "unit-worker", lambda: None,
+    )
+    if accepted:
+        approved = factory.approved_connections(rotation, installation, management,
+            baseline=snapshot, registry=registry, prepare_connection=prepare_connection)
+        assert approved[rotated.model.model_key].state == "approved"
+    else:
+        with pytest.raises(PolicyCompilationError, match="independent connection approval"):
+            factory.approved_connections(rotation, installation, management, baseline=snapshot,
+                registry=registry, prepare_connection=prepare_connection)
+        management.prepare_route_connection.assert_not_called()
+
+
 def test_storage_route_document_is_strict_and_canonical_with_no_duplicate_properties() -> None:
     scope = RouteScope(target_id=str(UUID(int=1)), api_id="unit-api", gateway_id="managed")
     document = canonical_document(scope)
@@ -2809,6 +3386,23 @@ def test_publication_uses_catalog_prices_not_submitted_amounts(
     assert saved["price_synced_at"] == publication.created_at
 
 
+def test_manually_priced_models_report_no_effective_discount() -> None:
+    # A connection discount is never applied to a hand-entered price, so reporting one
+    # for that model contradicts what is actually charged.
+    repository = InMemoryRepository()
+    manual, retail = repository.models[:2]
+    runtime = next(row for row in repository.runtimes if row["id"] == manual["runtime_id"])
+    runtime["price_discount_percent"] = 30
+    retail["runtime_id"] = manual["runtime_id"]
+    manual.update(price_source="manual", price_discount_percent=None)
+    retail.update(price_source="azure_retail", price_discount_percent=None)
+
+    saved = {row["id"]: row for row in repository.registry()["models"]}
+
+    assert saved[manual["id"]]["effective_discount_percent"] is None
+    assert saved[retail["id"]]["effective_discount_percent"] == 30
+
+
 @pytest.mark.parametrize("failure", ["missing", "partial", "no-output", "unavailable"])
 def test_publication_rejects_unusable_catalog_without_queueing(failure: str) -> None:
     repository = InMemoryRepository()
@@ -3337,6 +3931,8 @@ def test_compiler_emits_native_apim_pool_breakers_retry_and_probe_routes() -> No
         member for member in members if member.title.endswith("Secondary Foundry runtime")
     )
     assert dict(secondary.headers)["api-key"] == "{{secondary-foundry-key}}"
+    primary_member = next(member for member in members if member is not secondary)
+    assert "api-key" not in dict(primary_member.headers)
     assert {item.id for item in compiled.named_values} == {"secondary-foundry-key"}
     breaker = members[0].circuit_breaker
     assert breaker is not None
@@ -3366,6 +3962,97 @@ def test_compiler_emits_native_apim_pool_breakers_retry_and_probe_routes() -> No
     assert "BackendConnectionFailure" not in retry_block
     assert "Timeout" not in retry_block
     ElementTree.fromstring(policy)
+    _assert_pool_retries_every_request_and_hides_rate_limit_details(
+        ElementTree.fromstring(policy), "./backend/choose/when",
+    )
+
+
+def _assert_pool_retries_every_request_and_hides_rate_limit_details(
+    root: ElementTree.Element, pooled_branch: str,
+) -> None:
+    pooled = root.find(pooled_branch)
+    backend = root.find("./backend")
+    assert pooled is not None and backend is not None
+    # Requests with and without an execution receipt take the same retrying forward.
+    assert "executionReceiptHeader" not in ElementTree.tostring(backend, encoding="unicode")
+    forwards = pooled.findall(".//forward-request")
+    assert len(forwards) == 1
+    assert pooled.find("./retry/forward-request") is forwards[0]
+    retry = pooled.find("./retry")
+    assert retry is not None
+    # Headers that only some members set must not reach the member chosen for the retry.
+    assert [(child.tag, child.get("name"), child.get("exists-action")) for child in retry] == [
+        ("set-header", "x-turnstile-pool-deployment", "delete"),
+        ("set-header", "api-key", "delete"),
+        ("set-header", "x-api-key", "delete"),
+        ("forward-request", None, None),
+    ]
+    assert retry.get("condition") == (
+        "@(context.Response != null && context.Response.StatusCode == 429)"
+    )
+    assert (retry.get("count"), retry.get("first-fast-retry")) == ("1", "true")
+    limited = [
+        when for when in root.findall("./outbound/choose/when")
+        if "context.Response.StatusCode == 429" in when.get("condition", "")
+    ]
+    assert len(limited) == 1
+    assert [header.get("name") for header in limited[0].findall("set-header")] == [
+        "Content-Type",
+    ]
+    body = json.loads(limited[0].findtext("set-body") or "")
+    assert body["error"]["type"] == "rate_limit_error"
+    assert body["error"]["code"] == "rate_limit_exceeded"
+
+
+def test_fixed_pool_retries_budgeted_requests_and_hides_member_rate_limits() -> None:
+    from turnstile_core.integrations.apim_storage_routes import (
+        FIXED_OPERATIONS,
+        FixedRouteBinding,
+        fixed_operation,
+    )
+
+    binding = FixedRouteBinding(
+        scope=RouteScope(
+            target_id=str(APIM_ID), api_id="finops-foundry-llm", gateway_id="managed",
+        ),
+        api_revision="fixed-abi2-60e4f760",
+        table_endpoint="https://unitstore.table.core.windows.net",
+        table_name="Routes",
+        ledger_table_endpoint="https://unitstore.table.core.windows.net",
+        ledger_table_name="TurnstileLedger",
+        trust_binding_sha256="a" * 64,
+        supported_profiles=("openai-v1", "anthropic-messages", "microsoft-decision"),
+        pool_enabled=True,
+        decision_enabled=True,
+    )
+    for operation in (name for name in FIXED_OPERATIONS if name != "images-generations"):
+        _assert_pool_retries_every_request_and_hides_rate_limit_details(
+            ElementTree.fromstring(fixed_operation(operation, binding)),
+            "./backend/choose/when",
+        )
+    unpooled = fixed_operation(
+        "chat-completions", binding.model_copy(update={"pool_enabled": False}),
+    )
+    assert "<retry" not in unpooled
+    assert "StatusCode == 429" not in unpooled
+
+
+def test_native_stream_pool_retry_only_deletes_headers_before_forwarding() -> None:
+    def policy(step: str) -> str:
+        return (
+            '<policies><inbound><base /></inbound><backend><retry condition="@(true)" count="1"'
+            f' interval="1">{step}<forward-request buffer-response="false" /></retry></backend>'
+            "<outbound><base /></outbound><on-error><base /></on-error></policies>"
+        )
+
+    deleted = policy('<set-header name="api-key" exists-action="delete" />')
+    assert validate_native_stream_policy(deleted, "chat-completions") == deleted
+    for step in (
+        '<set-header name="api-key" exists-action="override"><value>k</value></set-header>',
+        '<set-variable name="unit" value="1" />',
+    ):
+        with pytest.raises(PolicyCompilationError, match="explicit and unbuffered"):
+            validate_native_stream_policy(policy(step), "chat-completions")
 
 def test_backend_pool_accepts_distinct_deployments_in_one_runtime() -> None:
     runtime_id = UUID("30000000-0000-4000-8000-000000000001")
@@ -3397,7 +4084,7 @@ def test_backend_pool_accepts_distinct_deployments_in_one_runtime() -> None:
 
 @pytest.mark.parametrize("invalid", [
     None, "disabled", "runtime", "provider", "image", "decision", "embeddings",
-    "family", "protocol", "unrelated-model", "version-lookalike",
+    "family", "protocol", "unrelated-model", "version-lookalike", "pool-capability",
 ])
 @pytest.mark.parametrize("independent", [False, True])
 @pytest.mark.parametrize("deployment_name", ["gpt-5-unit-chat", "unit-future-chat"])
@@ -3455,11 +4142,59 @@ def test_backend_pool_resolves_registered_deployments_in_one_runtime(
     write = GatewayBackendPoolMemberWrite(
         runtime_id=runtime["id"], model_id=replica["id"], priority=0, weight=1,
     )
+    if invalid == "pool-capability":
+        from turnstile_core.domain.storage_routes import (
+            FixedProgramInstallation,
+            ProgramIdentity,
+            RouteScope,
+        )
+
+        installed = FixedProgramInstallation(
+            program=ProgramIdentity(
+                scope=RouteScope(target_id=str(APIM_ID), api_id="unit-api", gateway_id="managed"),
+                api_revision="1", instance_id="managed", program_sha256="a" * 64,
+                trust_binding_sha256="b" * 64,
+            ),
+            target_identity_sha256="c" * 64,
+            storage_endpoint="https://unitstore.table.core.windows.net", storage_table="Routes",
+            gateway_endpoint="https://unit.azure-api.net/turnstile",
+            publisher_subscription_id="unit", parent_policy_sha256="d" * 64,
+            operation_policies_sha256={"models": "e" * 64},
+            operation_contracts={"models": ("GET", "/models")}, supported_profiles=("openai-v1",),
+        )
+        original_model = repository.models[0]
+        repository.models = [{**original_model, **model}, {**original_model, **replica}]
+        fixed_effective = publication.model_copy(update={
+            "resource_manifest": {"fixed_route_program": installed.model_dump(mode="json")},
+        })
+        monkeypatch.setattr(repository, "effective_gateway_publication", lambda _: (
+            fixed_effective.model_dump(mode="python")
+        ))
+        request = GatewayBackendPoolWrite(members=[
+            GatewayBackendPoolMemberWrite(runtime_id=runtime["id"], model_id=model["id"],
+                                         priority=0, weight=1), write,
+        ], rate_limit=GatewayRateLimitResilience(
+            max_attempts_per_request=2, retry_interval_seconds=1, first_fast_retry=True,
+            circuit_breaker=GatewayRateLimitCircuitBreaker(
+                failure_count=1, interval_seconds=60, trip_duration_seconds=60,
+                accept_retry_after=True,
+            ),
+        ))
+        with patch.object(service, "_queue_route_reconcile") as queue:
+            with pytest.raises(ControlPlaneConflictError, match="Pool capability is not installed"):
+                service.model_backend_pool_candidates(model["id"])
+            with pytest.raises(ControlPlaneConflictError, match="Pool capability is not installed"):
+                service.configure_model_backend_pool(model["id"], request, "owner@example.com")
+            queue.assert_not_called()
+        return
     if invalid is not None:
-        with pytest.raises(ControlPlaneConflictError):
+        with pytest.raises(ControlPlaneConflictError) as rejected:
             service._backend_pool_member(
                 binding, write, model, [runtime], [model, replica], APIM_ID,
             )
+        if invalid in {"image", "decision", "embeddings", "family"}:
+            # The 409 must name the member that differs, not just the rule.
+            assert f"{replica['model_key']} on {runtime['name']}" in str(rejected.value)
         source_row = repository.models[0]
         repository.models = [{**source_row, **model}, {**source_row, **replica}]
         monkeypatch.setattr(repository, "effective_gateway_publication", lambda _gateway:
@@ -4877,6 +5612,101 @@ def test_external_tenant_foundry_key_can_rotate_through_a_candidate_release() ->
     assert cipher.decrypt(encrypted) == "rotated-foundry-key"
     assert f"{{{{{rotated.named_value_name}}}}}" in policy
     assert "rotated-foundry-key" not in policy
+
+
+@pytest.mark.parametrize("pinned", [None, "target", "peer"])
+def test_fixed_route_key_rotation_replaces_every_route_of_its_connection(
+    pinned: str | None,
+) -> None:
+    from turnstile_core.services.route_publication import route_credential_source
+
+    repository = InMemoryRepository()
+    cipher = CredentialCipher(Fernet.generate_key())
+    service = GatewayControlPlaneService(repository, cipher)
+
+    def activate(publication_id: UUID) -> None:
+        current = "queued"
+        for status in ("validating", "provisioning", "building_revision", "verifying",
+                       "promoting"):
+            assert transition_publication(
+                repository, publication_id, current, status, {}, "worker",
+            )
+            current = status
+        activate_publication(repository, publication_id, "worker")
+
+    effective = service.publish(
+        external_tenant_foundry_publication(repository), "owner@example.com"
+    )
+    activate(effective.id)
+    original = effective.desired_spec.bindings[-1]
+    connection = service._binding_connection(original, APIM_ID, repository.registry())
+    runtime = next(item for item in repository.runtimes if item["id"] == connection["id"])
+    recorded = "https://unit-vault.vault.azure.net/secrets/runtime-key/" + "a" * 32
+    runtime["config"]["key_vault_secret_id"] = recorded
+    base = repository.get_gateway_publication(effective.id)
+    assert base is not None
+    base["resource_manifest"] = {"fixed_route_program": {}}
+    alias = "unit-rotation-addition"
+    spec = effective.desired_spec.model_copy(update={
+        "bindings": [original.model_copy(update={
+            "model": original.model.model_copy(update={"model_key": alias}),
+            "key_vault_secret_id": HttpUrl(
+                recorded if pinned is None else recorded[:-32] + "b" * 32,
+            ),
+        })],
+        "discovery_models": [effective.desired_spec.discovery_models[-1].model_copy(
+            update={"id": alias},
+        )],
+    })
+    payload, _ = service._release_payload(spec)
+    manifest = {"model_route_addition": {
+        "version": 1, "program_release_id": str(effective.id), "alias": alias,
+    }}
+    added = repository.create_gateway_publication(
+        APIM_ID, payload, document_digest({**manifest, "desired_spec": payload}),
+        "model_add", "unit-owner", expected_base_release_id=effective.id,
+        initial_manifest=manifest,
+    )
+    added["status"] = "active"
+    repository.gateway_publication_outbox[-1].update(status="completed")
+    write = GatewayCredentialRotation(
+        model_key=original.model.model_key if pinned == "peer" else alias,
+        api_key=SecretStr("rotated-route-key"),
+    )
+    if pinned is not None:
+        with pytest.raises(ControlPlaneConflictError, match=(
+            "credential ownership" if pinned == "peer" else "directly managed API key"
+        )):
+            service.rotate_credential(APIM_ID, write, "owner@example.com")
+        return
+
+    rotation = service.rotate_credential(APIM_ID, write, "owner@example.com")
+    rotated = rotation.desired_spec.bindings[-1]
+    routes = {item.model.model_key: item for item in rotation.desired_spec.bindings}
+    encrypted = repository.gateway_publication_credential(rotation.id)
+
+    assert rotation.publication_kind is PublicationKind.CREDENTIAL_ROTATION
+    assert rotation.base_release_id == effective.id
+    assert rotated.model.model_key == alias
+    assert rotated.named_value_name not in {None, original.named_value_name}
+    for key in (original.model.model_key, alias):
+        assert routes[key].named_value_name == rotated.named_value_name
+        assert routes[key].key_vault_secret_id is None
+    assert encrypted is not None and cipher.decrypt(encrypted) == "rotated-route-key"
+
+    materialized = recorded[:-32] + "c" * 32
+    row = repository.get_gateway_publication(rotation.id)
+    assert row is not None
+    row["resource_manifest"]["route_credentials"] = {"version": 1, "bindings": {
+        route_credential_source(rotated): materialized,
+    }}
+    activate(rotation.id)
+
+    assert runtime["config"]["key_vault_secret_id"] == materialized
+    assert runtime["config"]["named_value_name"] == rotated.named_value_name
+    assert added["status"] == "superseded"
+    assert repository.effective_gateway_releases[APIM_ID] == rotation.id
+
 
 def test_foundry_chat_policy_owns_backend_auth_path_and_deployment_mapping() -> None:
     repository = InMemoryRepository()

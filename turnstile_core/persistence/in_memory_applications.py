@@ -14,6 +14,7 @@ from ..domain.application_access import (
     application_organization,
 )
 from ..domain.ledger import BudgetReservationFinalization, validate_application_snapshot
+from .repository_support import zero_cost_budget_denial
 
 
 class InMemoryApplicationRepositoryMixin:
@@ -68,7 +69,20 @@ class InMemoryApplicationRepositoryMixin:
         discovered = {str(item["apim_subscription_id"]) for item in items}
         rows: list[dict[str, Any]] = []
         for value in items:
-            application_id = UUID(str(value["application_id"]))
+            subscription = next(
+                (
+                    item
+                    for item in self.gateway_application_subscriptions
+                    if item["gateway_profile_id"] == gateway_profile_id
+                    and item["apim_subscription_id"] == value["apim_subscription_id"]
+                ),
+                None,
+            )
+            application_id = (
+                subscription["application_id"]
+                if subscription is not None
+                else UUID(str(value["application_id"]))
+            )
             subscription_id = UUID(str(value["subscription_id"]))
             application = next(
                 (item for item in self.gateway_applications if item["id"] == application_id),
@@ -138,15 +152,6 @@ class InMemoryApplicationRepositoryMixin:
                         updated_at=now,
                     )
                 operation = "updated" if application_changed else "subscription_synced"
-            subscription = next(
-                (
-                    item
-                    for item in self.gateway_application_subscriptions
-                    if item["gateway_profile_id"] == gateway_profile_id
-                    and item["apim_subscription_id"] == value["apim_subscription_id"]
-                ),
-                None,
-            )
             subscription_before = deepcopy(subscription) if subscription else None
             if subscription is None:
                 subscription = {
@@ -569,6 +574,19 @@ class InMemoryApplicationRepositoryMixin:
             if item["application_id"] in wanted
         ]
 
+    def get_gateway_application_subscription(
+        self, gateway_profile_id: UUID, apim_subscription_id: str
+    ) -> dict[str, Any] | None:
+        return next(
+            (
+                item
+                for item in self.gateway_application_subscriptions
+                if item["gateway_profile_id"] == gateway_profile_id
+                and item["apim_subscription_id"] == apim_subscription_id
+            ),
+            None,
+        )
+
     def list_gateway_application_budgets(
         self, period_start: date, application_ids: Sequence[UUID]
     ) -> Sequence[dict[str, Any]]:
@@ -748,7 +766,10 @@ class InMemoryApplicationRepositoryMixin:
                     if any(row.usd_cost is not None for row in records)
                     else None
                 ),
-                "unpriced_usage_count": sum(row.usd_cost is None for row in records)
+                "unpriced_usage_count": sum(
+                    row.usd_cost is None and not zero_cost_budget_denial(row)
+                    for row in records
+                )
                 + len(recovered.get(application_id, [])),
                 "last_request_at": max(
                     [row.ts for row in records]

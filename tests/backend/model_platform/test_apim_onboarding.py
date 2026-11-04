@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
@@ -134,17 +135,381 @@ def test_self_hosted_capability_uses_shared_apim_tier_mapping(
     ("Developer", True),
     ("StandardV2", False),
 ])
+@pytest.mark.parametrize("logger_id", ["unit-business-events-a", "unit-business-events-b"])
+@pytest.mark.parametrize("legacy", [False, True])
 def test_onboarding_fixed_program_scope_matches_apim_tier(
-    tier: str, expected: bool,
+    tier: str, expected: bool, logger_id: str, legacy: bool,
 ) -> None:
     plan = onboarding_plan(service_tier=tier)
-    source = Path(__file__).resolve().parents[3] / "infra/policies/foundry-finops-policy.xml"
+    source = (Path(__file__).resolve().parents[3] / "infra/policies/foundry-finops-policy.xml")
     capability = self_hosted_gateway_capability_for_tier(plan.service_tier)
     program = render_onboarding_fixed_program(
         plan.request, onboarding_configuration(), source.read_text(),
         self_hosted_gateway=capability,
     )
     assert program.binding.native_gateway_scope is expected
+    assert program.binding.pool_enabled is True
+    from turnstile_core.integrations.apim_model_availability import (
+        _admission_locations,
+        admission_guard,
+        availability_kernel_digest,
+        compose_availability_parent,
+    )
+    from turnstile_core.integrations.apim_onboarding_policy import (
+        _render_onboarding_parent,
+        onboarding_canonical_parent,
+    )
+    from turnstile_core.integrations.apim_policy_components import (
+        policy_document_digest,
+        serialize_policy,
+    )
+    from turnstile_core.integrations.apim_storage_routes import (
+        _baseline_root,
+        compile_fixed_route_program,
+        upgrade_fixed_pool_program,
+        upgrade_fixed_program_parent,
+    )
+
+    canonical = compose_availability_parent(onboarding_canonical_parent(
+        source.read_text(), plan.request.api_id,
+    ))
+    baseline = _render_onboarding_parent(plan.request, onboarding_configuration(), canonical)
+    parent = parse_policy(baseline)
+    for event in parent.iter("log-to-eventhub"):
+        event.set("logger-id", logger_id)
+    if legacy:
+        assert availability_kernel_digest() == (
+            "83960caefc1b0f12e73e3877abb59e8ad40889e1f75c1980c761656b83d25ed9"
+        )
+        for branch, anchor in _admission_locations(parent):
+            guard = serialize_policy(admission_guard())
+            for parameter, value in (
+                ("__GATEWAY_PROFILE_ID__", program.binding.scope.target_id),
+                ("__LEDGER_TABLE_ENDPOINT__", program.binding.ledger_table_endpoint),
+                ("__LEDGER_TABLE_NAME__", program.binding.ledger_table_name),
+            ):
+                guard = guard.replace(parameter, value)
+            branch[list(branch).index(anchor) + 1] = parse_policy(guard)
+    baseline = serialize_policy(parent)
+    if legacy:
+        _baseline_root(baseline)
+        baseline = upgrade_fixed_program_parent(
+            baseline, program.binding, canonical, policy_document_digest(baseline),
+        )
+        assert len([event for event in parse_policy(baseline).iter("log-to-eventhub")
+                    if "model_availability_pre_dispatch_denial" in (event.text or "")]) == 2
+    program = compile_fixed_route_program(baseline, program.binding, canonical_parent=canonical)
+    events = [
+        event for artifact in (program.parent_policy, *dict(program.operation_policies).values())
+        for event in parse_policy(artifact).iter("log-to-eventhub")
+    ]
+    assert events
+    assert {event.attrib["logger-id"] for event in events} == {logger_id}
+    previous = compile_fixed_route_program(
+        baseline, program.binding.model_copy(update={"pool_enabled": False}),
+        canonical_parent=canonical,
+    )
+    assert previous.binding.pool_enabled is False
+    upgraded = upgrade_fixed_pool_program(previous.parent_policy, previous.binding)
+    assert upgraded.parent_policy == program.parent_policy
+    assert upgraded.operation_policies == program.operation_policies
+
+
+@pytest.mark.parametrize("tier", ["Developer", "StandardV2"])
+def test_program_refresh_adopts_the_current_model_assignment_denial(tier: str) -> None:
+    from turnstile_core.integrations.apim_model_availability import compose_availability_parent
+    from turnstile_core.integrations.apim_policy_components import component_digest
+    from turnstile_core.integrations.apim_storage_routes import (
+        refresh_fixed_budget_execution_policy,
+        upgrade_fixed_pool_program,
+    )
+
+    plan = onboarding_plan(service_tier=tier)
+    capability = self_hosted_gateway_capability_for_tier(plan.service_tier)
+    template = (REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml").read_text()
+    denial = (
+        '{"type":"error","error":{"type":"permission_error","code":"model_not_assigned",'
+        '"param":"model","message":"The requested model is not assigned to you"}}'
+    )
+    assert template.count(denial) == 1
+    installed = render_onboarding_fixed_program(
+        plan.request, onboarding_configuration(),
+        template.replace(denial, '{"error":"model_not_assigned"}'),
+        self_hosted_gateway=capability,
+    )
+    current = render_onboarding_fixed_program(
+        plan.request, onboarding_configuration(), template, self_hosted_gateway=capability,
+    )
+    canonical = compose_availability_parent(
+        onboarding_canonical_parent(template, plan.request.api_id),
+    )
+
+    refreshed = upgrade_fixed_pool_program(
+        refresh_fixed_budget_execution_policy(
+            installed.parent_policy, installed.binding, canonical,
+        ),
+        installed.binding,
+    )
+
+    assert component_digest(parse_policy(refreshed.parent_policy)) == component_digest(
+        parse_policy(current.parent_policy)
+    )
+
+
+@pytest.mark.parametrize("tier", ["Developer", "StandardV2"])
+def test_program_refresh_adopts_the_current_application_denial(tier: str) -> None:
+    # Programs installed before the application 403 used the standard envelope must still refresh.
+    from turnstile_core.integrations.apim_model_availability import compose_availability_parent
+    from turnstile_core.integrations.apim_policy_components import component_digest
+    from turnstile_core.integrations.apim_storage_routes import (
+        refresh_fixed_budget_execution_policy,
+        upgrade_fixed_pool_program,
+    )
+
+    plan = onboarding_plan(service_tier=tier)
+    capability = self_hosted_gateway_capability_for_tier(plan.service_tier)
+    template = (REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml").read_text()
+    reason = template.index(
+        "var reason = (string)context.Variables[&quot;applicationDenialReason&quot;];"
+    )
+    start = template.rindex('<set-header name="x-request-id"', 0, reason)
+    end = template.index("</set-body>", reason) + len("</set-body>")
+    legacy = template[:start] + (
+        "<set-body>@(new JObject(new JProperty(&quot;error&quot;, (string)context.Variables"
+        "[&quot;applicationDenialReason&quot;])).ToString(Newtonsoft.Json.Formatting.None))"
+        "</set-body>"
+    ) + template[end:]
+    installed = render_onboarding_fixed_program(
+        plan.request, onboarding_configuration(), legacy, self_hosted_gateway=capability,
+    )
+    current = render_onboarding_fixed_program(
+        plan.request, onboarding_configuration(), template, self_hosted_gateway=capability,
+    )
+    canonical = compose_availability_parent(
+        onboarding_canonical_parent(template, plan.request.api_id),
+    )
+
+    def refresh(program: FixedRouteProgram) -> FixedRouteProgram:
+        return upgrade_fixed_pool_program(
+            refresh_fixed_budget_execution_policy(
+                program.parent_policy, program.binding, canonical,
+            ),
+            program.binding,
+        )
+
+    refreshed = refresh(installed)
+    again = refresh(refreshed)
+
+    assert installed.parent_policy != current.parent_policy
+    assert component_digest(parse_policy(refreshed.parent_policy)) == component_digest(
+        parse_policy(current.parent_policy)
+    )
+    assert refreshed.operation_policies == current.operation_policies
+    assert again.parent_policy == refreshed.parent_policy
+    assert again.operation_policies == refreshed.operation_policies
+
+
+@pytest.mark.parametrize("tier", ["Developer", "StandardV2"])
+def test_program_refresh_adopts_the_current_responses_cache_write_usage(
+    tier: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from turnstile_core.integrations import apim_budget_execution as budget_execution
+    from turnstile_core.integrations.apim_model_availability import compose_availability_parent
+    from turnstile_core.integrations.apim_policy_components import component_digest
+    from turnstile_core.integrations.apim_storage_routes import (
+        refresh_fixed_budget_execution_policy,
+        upgrade_fixed_pool_program,
+    )
+
+    plan = onboarding_plan(service_tier=tier)
+    capability = self_hosted_gateway_capability_for_tier(plan.service_tier)
+    template = (REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml").read_text()
+    legacy_template = template.replace(
+        '          ?? (long?)usage?[&quot;input_tokens_details&quot;]?'
+        '[&quot;cache_write_tokens&quot;]\n',
+        "",
+    )
+    legacy_usage = budget_execution.COMPLETE_USAGE.replace(
+        'var write = anthropic ? usage["cache_creation_input_tokens"]\n'
+        '        : (usage["prompt_tokens_details"] ?? usage["input_tokens_details"])'
+        '?["cache_write_tokens"];',
+        'var write = anthropic ? usage["cache_creation_input_tokens"] : '
+        'usage["prompt_tokens_details"]?["cache_write_tokens"];',
+    )
+    with monkeypatch.context() as previous:
+        previous.setattr(budget_execution, "COMPLETE_USAGE", legacy_usage)
+        installed = render_onboarding_fixed_program(
+            plan.request, onboarding_configuration(), legacy_template,
+            self_hosted_gateway=capability,
+        )
+    current = render_onboarding_fixed_program(
+        plan.request, onboarding_configuration(), template, self_hosted_gateway=capability,
+    )
+    canonical = compose_availability_parent(
+        onboarding_canonical_parent(template, plan.request.api_id),
+    )
+
+    def refresh(program: FixedRouteProgram) -> FixedRouteProgram:
+        return upgrade_fixed_pool_program(
+            refresh_fixed_budget_execution_policy(
+                program.parent_policy, program.binding, canonical,
+            ),
+            program.binding,
+        )
+
+    refreshed = refresh(installed)
+    again = refresh(refreshed)
+    assert installed.parent_policy != current.parent_policy
+    assert component_digest(parse_policy(refreshed.parent_policy)) == component_digest(
+        parse_policy(current.parent_policy),
+    )
+    assert refreshed.operation_policies == current.operation_policies
+    assert again.parent_policy == refreshed.parent_policy
+    assert again.operation_policies == refreshed.operation_policies
+
+
+_APIM_EXPRESSION = re.compile(r"(>\s*|<!\[CDATA\[\s*|=[\"'])@[({]")
+_APIM_EXPRESSION_END = {
+    ">": re.compile(r"\s*<"), "<": re.compile(r"\s*\]\]>"),
+    '="': re.compile('"'), "='": re.compile("'"),
+}
+_SINGLE_QUOTED = re.compile(r"'(?:[^'\\\n]|\\.)*'")
+
+
+def apim_quote_errors(policy: str) -> list[str]:
+    # APIM delimits expressions in the policy text as sent, where &quot; is no string quote to it:
+    # a single quote outside literal "..." strings and // comments must close on its own line.
+    errors: list[str] = []
+    for match in _APIM_EXPRESSION.finditer(policy):
+        opener = match.group(1)
+        end = _APIM_EXPRESSION_END[opener[:2] if opener[0] == "=" else opener[0]]
+        index, depth = match.end() - 1, 0
+        while index < len(policy):
+            if policy.startswith("//", index):
+                newline = policy.find("\n", index)
+                index = len(policy) if newline < 0 else newline
+                continue
+            character = policy[index]
+            if character == '"':
+                index += 1
+                while index < len(policy) and policy[index] not in '"\n':
+                    index += 2 if policy[index] == "\\" else 1
+            elif character == "'":
+                quoted = _SINGLE_QUOTED.match(policy, index)
+                if quoted is None:
+                    break
+                index = quoted.end() - 1
+            elif character in "({":
+                depth += 1
+            elif character in ")}":
+                depth -= 1
+                if depth == 0:
+                    break
+            index += 1
+        if depth != 0 or not end.match(policy, index + 1):
+            line = max(policy.rfind("\n", 0, index) + 1, index - 80)
+            errors.append(policy[line:index + 40].strip())
+    return errors
+
+
+@pytest.mark.parametrize(("policy", "valid"), [
+    ("<value>@(path.Split('/')[0])</value>", True),
+    ("<value>@(now.ToString(&quot;yyyy-MM-dd'T'HH&quot;) + '\\'')</value>", True),
+    ('<set-body>@{\n  // the caller\'s body\n  return "it\'s";\n}</set-body>', True),
+    ('<set-variable name="filter" value="@(&quot;eq \'&quot; + key + &quot;\'&quot;)" />', True),
+    ("<value>@(&quot;The application's budget&quot;)</value>", False),
+    (
+        '<set-variable name="filter" value="@{\n  return &quot;eq \'&quot; + key\n'
+        '    + &quot;\'&quot;;\n}" />',
+        False,
+    ),
+    ("<value>@(&quot;it's&quot;) + x('y')</value>", False),
+])
+def test_apim_quote_check_rejects_unclosed_single_quotes(policy: str, valid: bool) -> None:
+    assert (apim_quote_errors(policy) == []) is valid
+
+
+@pytest.mark.parametrize("tier", ["Developer", "StandardV2"])
+def test_policies_sent_to_apim_close_every_single_quote(tier: str) -> None:
+    from turnstile_core.integrations.apim_model_availability import compose_availability_parent
+    from turnstile_core.integrations.apim_storage_routes import (
+        refresh_fixed_budget_execution_policy,
+        upgrade_fixed_pool_program,
+    )
+
+    plan = onboarding_plan(service_tier=tier)
+    template = (REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml").read_text()
+    program = render_onboarding_fixed_program(
+        plan.request, onboarding_configuration(), template,
+        self_hosted_gateway=self_hosted_gateway_capability_for_tier(plan.service_tier),
+    )
+    canonical = compose_availability_parent(
+        onboarding_canonical_parent(template, plan.request.api_id),
+    )
+    refreshed = upgrade_fixed_pool_program(
+        refresh_fixed_budget_execution_policy(program.parent_policy, program.binding, canonical),
+        program.binding,
+    )
+    policies = {
+        path.name: path.read_text()
+        for path in sorted((REPOSITORY_ROOT / "infra/policies").glob("*.xml"))
+    }
+    for label, compiled in (("compiled", program), ("refreshed", refreshed)):
+        policies[f"{label} parent"] = compiled.parent_policy
+        policies.update({f"{label} {name}": xml for name, xml in compiled.operation_policies})
+
+    assert all(_APIM_EXPRESSION.search(policies[name]) for name in (
+        "foundry-finops-policy.xml", "compiled parent", "refreshed parent",
+    ))
+    assert {
+        name: errors for name, policy in policies.items() if (errors := apim_quote_errors(policy))
+    } == {}
+
+
+def assert_decision_and_image_program(
+    binding: Any, parent_policy: str, policies: dict[str, str],
+    contracts: dict[str, tuple[str, str]],
+) -> None:
+    from turnstile_core.domain.image_profiles import DEFAULT_IMAGE_GENERATION_LIMITS
+    from turnstile_core.domain.storage_routes import canonical_document
+
+    assert binding.supported_profiles == (
+        "openai-v1", "anthropic-messages", "openai-images", "microsoft-decision",
+    )
+    assert binding.decision_enabled is True
+    assert binding.image_limits == DEFAULT_IMAGE_GENERATION_LIMITS
+    assert contracts["microsoft-decision"] == ("POST", "/providers/microsoft/v1/systemone")
+    assert set(policies) == set(contracts)
+    variables = {
+        node.get("name"): node.get("value")
+        for node in parse_policy(parent_policy).iter("set-variable")
+    }
+    assert variables["routeDecisionEnabled"] == "@(true)"
+    assert json.loads(variables["routeProfiles"] or "") == list(binding.supported_profiles)
+    assert variables["routeImageLimits"] == canonical_document(DEFAULT_IMAGE_GENERATION_LIMITS)
+    images = parse_policy(policies["images-generations"])
+    assert "route_image_capacity_unavailable" not in policies["images-generations"]
+    # Without a published image route the operation still answers 503 instead of forwarding.
+    assert any(
+        "IsNullOrEmpty" in when.get("condition", "")
+        and "routeContent" in when.get("condition", "")
+        and when.find("return-response/set-status[@code='503']") is not None
+        for when in images.iter("when")
+    )
+
+
+@pytest.mark.parametrize("tier", ["Developer", "StandardV2"])
+def test_onboarded_gateway_program_enables_decision_and_images(tier: str) -> None:
+    plan = onboarding_plan(service_tier=tier)
+    source = Path(__file__).resolve().parents[3] / "infra/policies/foundry-finops-policy.xml"
+    program = render_onboarding_fixed_program(
+        plan.request, onboarding_configuration(), source.read_text(),
+        self_hosted_gateway=self_hosted_gateway_capability_for_tier(plan.service_tier),
+    )
+    assert_decision_and_image_program(
+        program.binding, program.parent_policy, dict(program.operation_policies),
+        {name: (method, path) for name, method, path in program.operation_contracts},
+    )
 
 
 @pytest.mark.parametrize("display_name", [None, "Team inference gateway"])
@@ -757,6 +1122,10 @@ def test_fixed_program_initialization_creates_once_and_never_replays_unknown_wri
         client.ensure_fixed_program(program, record)
         writes = sum(request.method == "PUT" for request in state.requests)
         assert len(intents) == 2 * len(program.operation_contracts) + 1
+        uploaded = state.resources[
+            state.plan.request.resource_id + client.api_resource_path + "/policies/policy"
+        ]["properties"]["value"]
+        assert len(uploaded.encode()) <= 512 * 1024 - 32 * 1024
         client.ensure_fixed_program(program, record)
         assert sum(request.method == "PUT" for request in state.requests) == writes
         missing = client.api_resource_path + "/operations/models/policies/policy"

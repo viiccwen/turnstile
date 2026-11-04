@@ -51,6 +51,14 @@ class InfrastructureUpgradeRequiredError(PolicyCompilationError):
     pass
 
 
+class GatewayCapabilityUnavailableError(PolicyCompilationError):
+    def __init__(self, profile: str) -> None:
+        self.profile = profile
+        super().__init__("Gateway capability unavailable: " + json.dumps({
+            "code": "gateway_capability_unavailable", "profile": profile,
+        }, separators=(",", ":")))
+
+
 class CredentialSourceMissingError(PolicyCompilationError):
     def __init__(self, named_value_id: str) -> None:
         self.named_value_id = named_value_id
@@ -365,6 +373,8 @@ class ResolvedApimPublisherClient:
     enforce_identity_snapshot: bool
     client: ApimPublisherClient
     usage_observer: tuple[str | None, str | None] | None = None
+    route_target_identity_sha256: str | None = None
+    legacy_route_target_identity_sha256: str | None = None
 
 
 class ApimPublisherClientResolver(Protocol):

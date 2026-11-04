@@ -12,7 +12,7 @@ from psycopg.types.json import Jsonb
 
 from ..domain.model_availability import ModelAvailabilityConflict
 from ..domain.models import ModelIdentity
-from ..domain.runtime_models import apply_databricks_adoption
+from ..domain.runtime_models import apply_databricks_adoption, context_tier_schedule
 
 
 class PostgreSqlRegistryRepositoryMixin:
@@ -97,10 +97,14 @@ class PostgreSqlRegistryRepositoryMixin:
                                     price.pending_context_price_tiers,
                                     -- Resolved here rather than in the caller so every reader
                                     -- sees the same answer to "which discount actually applied".
-                                    COALESCE(
-                                        price.price_discount_percent,
-                                        runtime_price.price_discount_percent
-                                    ) AS effective_discount_percent
+                                    -- A hand-entered price is charged as entered.
+                                    CASE WHEN COALESCE(price.price_source, 'manual') = 'manual'
+                                        THEN NULL
+                                        ELSE COALESCE(
+                                            price.price_discount_percent,
+                                            runtime_price.price_discount_percent
+                                        )
+                                    END AS effective_discount_percent
                      FROM managed_model model
                      JOIN model_provider provider ON provider.id = model.provider_id
                      JOIN model_runtime runtime ON runtime.id = model.runtime_id
@@ -907,8 +911,9 @@ class PostgreSqlRegistryRepositoryMixin:
             merged[field] != current.get(field)
             for field in ("price_source", "price_reference")
         )
-        tiers_changed = merged["context_price_tiers"] != (
-            (current.get("context_price_tiers") or []) if current else []
+        # Charged rates alone follow the discount; only a new schedule answers a pending review.
+        tiers_changed = context_tier_schedule(merged["context_price_tiers"]) != (
+            context_tier_schedule(current.get("context_price_tiers")) if current else []
         )
         for field in (
             "list_input_cost_per_million", "list_output_cost_per_million",

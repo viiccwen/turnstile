@@ -29,7 +29,7 @@ from datetime import UTC, datetime, timedelta
 from importlib.metadata import distributions
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid5
 from xml.etree import ElementTree as ET
 
@@ -63,22 +63,30 @@ from turnstile_core.domain.gateway_targets import (
     native_gateway_scope_for_capability,
     self_hosted_gateway_capability_for_tier,
 )
+from turnstile_core.domain.image_profiles import DEFAULT_IMAGE_GENERATION_LIMITS
 from turnstile_core.domain.storage_routes import (
     FixedProgramCutover,
     FixedProgramInstallation,
+    FixedProgramUpgrade,
     RouteScope,
 )
 from turnstile_core.domain.storage_routes import document_digest as route_document_digest
 from turnstile_core.integrations.apim_budget_execution import bind_budget_delegation
 from turnstile_core.integrations.apim_model_availability import compose_availability_parent
 from turnstile_core.integrations.apim_onboarding_policy import onboarding_canonical_parent
-from turnstile_core.integrations.apim_policy_components import parse_policy, serialize_policy
+from turnstile_core.integrations.apim_policy_components import (
+    encode_policy_xml,
+    parse_policy,
+    serialize_policy,
+)
 from turnstile_core.integrations.apim_storage_routes import (
+    FULL_PROGRAM_PROFILES,
     FixedRouteBinding,
     compile_fixed_route_program,
     fixed_operation_contracts,
     fixed_policy_digest,
     fixed_program_digest,
+    prepare_capability_upgrade,
 )
 from turnstile_core.integrations.apim_policy_components import render_parent_client_ids
 from turnstile_core.persistence.repository_support import _registered_program_installation
@@ -108,6 +116,7 @@ EXPECTED_FUNCTIONS = {
     },
 }
 FIXED_ZIP_TIMESTAMP = (2020, 1, 1, 0, 0, 0)
+CAPABILITY_UPGRADE_VERSION = "capabilities-v1"
 POSTGRES_VERSION = "16"
 POSTGRES_AVAILABILITY_ZONE = "1"
 DEFAULT_POSTGRES_SKU_NAME = "Standard_B1ms"
@@ -2336,6 +2345,13 @@ def _what_if_counts(result: Mapping[str, Any]) -> Counter[str]:
         if isinstance(change, dict)
     )
     print("What-if: " + ", ".join(f"{name}={count}" for name, count in sorted(counts.items())))
+    # Reviewers need the actual creates, role assignments and network changes, not counts.
+    for change_type, resource_id in sorted(
+        (str(change.get("changeType", "Unknown")), str(change.get("resourceId", "")))
+        for change in changes
+        if isinstance(change, dict) and change.get("changeType") not in {"NoChange", "Ignore"}
+    ):
+        print(f"  {change_type} {resource_id}")
     if counts["Delete"]:
         raise DeploymentError("What-if contains Delete changes; deployment stopped")
     return counts
@@ -2490,13 +2506,17 @@ def linux_dependency_command(staged: Path) -> list[str]:
     ]
 
 
-def pip_linux_dependency_command(staged: Path, pip: str) -> list[str]:
+def pip_linux_dependency_command(staged: Path, python: str) -> list[str]:
     target = staged / ".python_packages" / "lib" / "site-packages"
     target.mkdir(parents=True, exist_ok=True)
     return [
-        pip,
+        python,
+        "-I",
+        "-m",
+        "pip",
         "install",
         "--disable-pip-version-check",
+        "--no-compile",
         "--only-binary=:all:",
         "--platform",
         "manylinux_2_28_x86_64",
@@ -2558,14 +2578,13 @@ def _install_linux_dependencies(runner: CommandRunner, staged: Path) -> None:
     try:
         runner.run(linux_dependency_command(staged), cwd=REPOSITORY_ROOT)
     except subprocess.CalledProcessError:
-        pip = shutil.which("pip3")
-        if pip is None:
-            raise DeploymentError(
-                "uv could not install Linux dependencies and pip3 is unavailable for fallback"
-            ) from None
         print("uv dependency installation failed; retrying with pip.")
         runner.run(
-            pip_linux_dependency_command(staged, pip),
+            [sys.executable, "-I", "-m", "ensurepip", "--upgrade"],
+            cwd=REPOSITORY_ROOT,
+        )
+        runner.run(
+            pip_linux_dependency_command(staged, sys.executable),
             cwd=REPOSITORY_ROOT,
         )
     validate_packaged_dependencies(staged)
@@ -2797,6 +2816,11 @@ def restart_runtime_apps(
 ) -> None:
     resource_group = _output_string(outputs, "resourceGroupName")
     api_name = _output_string(outputs, "apiName")
+    api_url = _output_string(outputs, "apiUrl")
+    try:
+        replaced = _api_instance(api_url, 15)
+    except (OSError, urllib.error.URLError):
+        replaced = None
     for action in ("stop", "start"):
         runner.run(
             [
@@ -2824,6 +2848,7 @@ def restart_runtime_apps(
             _output_string(outputs, "controlPlaneFunctionName"),
         ]
     )
+    wait_for_restarted_api(api_url, replaced)
 
 
 def _output_string(outputs: Mapping[str, Any], name: str) -> str:
@@ -3230,6 +3255,38 @@ def wait_for_observer_health(observer_url: str) -> str:
     return wait_for_health(observer_url, timeout_seconds=1800)
 
 
+def _api_instance(api_url: str, timeout: float) -> str | None:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(
+        urllib.request.Request(f"{api_url.rstrip('/')}/health"), timeout=timeout,
+    ) as response:
+        return cast(str | None, response.headers.get("X-Turnstile-Instance"))
+
+
+def wait_for_restarted_api(
+    api_url: str, replaced: str | None, timeout_seconds: int = 1800,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_error = "no response"
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            instance = _api_instance(api_url, min(15, remaining))
+        except (OSError, urllib.error.URLError) as error:
+            last_error = f"{type(error).__name__}: {error}"
+        else:
+            if instance and instance != replaced:
+                return
+            last_error = (
+                "the replaced API instance is still serving" if instance
+                else "health response has no instance identity"
+            )
+        time.sleep(min(3, max(0, deadline - time.monotonic())))
+    raise DeploymentError(
+        f"API restart did not complete within {timeout_seconds}s: "
+        f"expected a new API instance; actual {last_error}"
+    )
+
+
 def verify_owner_login(
     api_url: str, email: str, password: str, timeout_seconds: int = 180
 ) -> None:
@@ -3520,8 +3577,13 @@ def _approved_fixed_installation(
         initial = FixedProgramInstallation.model_validate_json(
             json.dumps(registration["initial_installation"]),
         )
-        if initial != installation_record(installed, initial.target_identity_sha256):
-            raise ValueError("Registered program origin differs from deployment outputs")
+        original = installation_record(installed, initial.target_identity_sha256)
+        if initial != original:
+            # A later publication records the upgraded program; its first upgrade starts here.
+            first = FixedProgramUpgrade.model_validate_json(json.dumps(
+                [*registration["registration_history"], registration["registration"]][0],
+            ))
+            first.require_previous(first.previous_publication_id, original)
         approved = _registered_program_installation(
             registration["previous_publication_id"], initial, {
                 "fixed_route_program_upgrade": registration["registration"],
@@ -4007,6 +4069,15 @@ def initialize_fixed_program(
                     raise DeploymentError("Previous fixed program deployment requires readback")
             elif previous.status_code != 404:
                 previous.raise_for_status()
+            # Parameters saved by earlier versions hold verbose XML that APIM rejects as oversized.
+            parameters = _arm_parameter_document({
+                **values,
+                "parentPolicy": encode_policy_xml(parse_policy(values["parentPolicy"])),
+                "fixedOperations": [
+                    {**item, "policy": encode_policy_xml(parse_policy(item["policy"]))}
+                    for item in operations
+                ],
+            })
             install(parameters)
             return pending_descriptor.model_dump(mode="json")
     if snapshot is None:
@@ -4030,7 +4101,12 @@ def initialize_fixed_program(
         trusted_vault_origins=(f"https://{vault}.vault.azure.net",),
         publisher_subscription_id=_output_string(outputs, "apimProbeSubscriptionId"),
         observer_key_named_value=_output_string(outputs, "observerAdapterKeyNamedValueName"),
+        supported_profiles=FULL_PROGRAM_PROFILES,
+        image_limits=DEFAULT_IMAGE_GENERATION_LIMITS,
+        decision_enabled=True,
         model_additions_enabled=True,
+        pool_enabled=True,
+        router_enabled=True,
         native_gateway_scope=native_gateway_scope_for_capability(
             self_hosted_gateway_capability_for_tier(service.json()["sku"]["name"]),
         ),
@@ -4090,7 +4166,7 @@ def initialize_fixed_program(
     policies = dict(program.operation_policies)
     operations = [
         {"name": name, "method": method, "path": path,
-         "policy": ET.tostring(parse_policy(policies[name]), encoding="unicode")}
+         "policy": encode_policy_xml(parse_policy(policies[name]))}
         for name, method, path in sorted(
             program.operation_contracts,
             key=lambda contract: (contract[0] not in binding.retired_operations, contract[0]),
@@ -4100,7 +4176,7 @@ def initialize_fixed_program(
         "apimResourceGroupName": core.apim_resource_group_name, "apimName": core.apim_name,
         "apiId": api_id, "sourceRevision": snapshot.revision, "revision": snapshot.revision,
         "stage": "prepare", "apiProperties": snapshot.api_properties,
-        "parentPolicy": ET.tostring(parse_policy(program.parent_policy), encoding="unicode"),
+        "parentPolicy": encode_policy_xml(parse_policy(program.parent_policy)),
         "fixedOperations": operations,
     })
     _write_outputs(inputs, {
@@ -4137,6 +4213,145 @@ def recover_fixed_program(
             raise DeploymentError("Fixed program recovery registration differs from its candidate")
 
 
+def enable_program_capabilities(
+    runner: CommandRunner, inputs: DeploymentInputs, outputs: Mapping[str, Any],
+    *, assume_yes: bool = False, owner_credentials: Path | None = None,
+) -> None:
+    if "pendingInstallation" in outputs or "pendingFixedBootstrap" in outputs:
+        raise DeploymentError("Complete the pending installation before enabling capabilities")
+    core = ExistingCore.from_outputs(outputs)
+    api_id = _output_string(outputs, "apimApiId")
+    resource_id = (
+        f"/subscriptions/{inputs.subscription}/resourceGroups/{core.apim_resource_group_name}"
+        f"/providers/Microsoft.ApiManagement/service/{core.apim_name}/apis/{api_id}"
+    )
+    application_root = (
+        f"/subscriptions/{inputs.subscription}/resourceGroups/{inputs.resource_group_name}"
+        "/providers/Microsoft.Web/sites/"
+    )
+    descriptor = current_app_settings(
+        runner, inputs, _output_string(outputs, "controlPlaneFunctionName"),
+    ).get("TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR")
+    if not descriptor:
+        raise DeploymentError("Enabling capabilities requires a fixed program installed by deploy")
+    installed = FixedInstallationDescriptor.model_validate_json(descriptor)
+    password = (
+        owner_credentials_password(owner_credentials, inputs.owner_email)
+        if owner_credentials is not None else getpass.getpass("Existing Owner password: ")
+    )
+    api_url = _output_string(outputs, "apiUrl")
+
+    def approved_program() -> tuple[FixedProgramInstallation, JsonObject]:
+        preview = verify_initial_fixed_program(
+            api_url, inputs.owner_email, password, installed.model_dump(mode="json"),
+        )
+        return _approved_fixed_installation(installed, preview), preview
+
+    approved, preview = approved_program()
+    if approved.decision_enabled and approved.image_limits is not None:
+        print("Decision and image generation are already enabled; no changes are required")
+        return
+    directory = inputs.state_path.with_suffix(".upgrades") / CAPABILITY_UPGRADE_VERSION
+    credentials = runner.run_json([
+        "az", "account", "get-access-token", "--subscription", inputs.subscription,
+        "--resource", "https://management.azure.com/", "--output", "json",
+    ])
+    with _upgrade_lock(directory), httpx.Client(
+        headers={"Authorization": f"Bearer {credentials.pop('accessToken')}",
+                 "Accept": "application/json"},
+        timeout=60, trust_env=False,
+    ) as client:
+        current = AzureUpgradeBackend(
+            client, resource_id,
+            (application_root + _output_string(outputs, "apiName"),
+             application_root + _output_string(outputs, "controlPlaneFunctionName")),
+            lambda *_args: None,
+        ).read()
+        if current is None:
+            raise DeploymentError("Saved API is absent; capabilities cannot be enabled")
+        plan_path = directory / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8")) if plan_path.exists() else None
+        upgrade = (FixedProgramUpgrade.model_validate_json(json.dumps(plan["upgrade"]))
+                   if plan is not None else None)
+        if upgrade is not None and upgrade.previous_installation_sha256 != route_document_digest(
+            approved,
+        ):
+            if fixed_policy_digest(current.parent_policy) != approved.parent_policy_sha256:
+                raise DeploymentError(
+                    "The saved capability plan no longer matches the live API; review it first",
+                )
+            plan_path.rename(directory / f"plan-superseded-{int(time.time())}.json")
+            plan = upgrade = None
+        if plan is None or upgrade is None:
+            _validate_installed_fixed_program(
+                current, installed, inputs, outputs,
+                deployment_budget_delegation(runner, inputs, outputs), preview,
+            )
+            upgrade, parent_policy, operation_policies = prepare_capability_upgrade(
+                approved, preview["previous_publication_id"], current.parent_policy,
+                {name: (operation["method"], operation["urlTemplate"],
+                        cast(str, current.operation_policies[name]))
+                 for name, operation in current.operations.items()},
+                installed.binding.ledger_table_endpoint, installed.binding.ledger_table_name,
+                installed.binding.observer_key_named_value,
+                enable_decision=True, enable_images=True,
+            )
+            plan = {"upgrade": upgrade.model_dump(mode="json"), "parent_policy": parent_policy,
+                    "operation_policies": operation_policies}
+            _write_private_json(plan_path, plan)
+        assert upgrade is not None
+        target = upgrade.installation
+        if fixed_policy_digest(current.parent_policy) not in {
+            approved.parent_policy_sha256, target.parent_policy_sha256,
+        }:
+            raise DeploymentError("The live API parent is neither the approved nor the planned one")
+        print(f"Gateway program: {target.program.scope.target_id} ({core.apim_name}/{api_id})")
+        print("Profiles: " + ", ".join(approved.supported_profiles)
+              + " -> " + ", ".join(target.supported_profiles))
+        print("Operations added or replaced: " + ", ".join(sorted(
+            name for name, digest in target.operation_policies_sha256.items()
+            if approved.operation_policies_sha256.get(name) != digest
+        )))
+        _confirm_deployment(assume_yes)
+        revision = resource_id + ";rev=" + quote(target.program.api_revision, safe="")
+        etags: dict[str, str | None] = {}
+        for name in target.operation_contracts:
+            response = client.head(
+                "https://management.azure.com" + revision + "/operations/"
+                + quote(name, safe="") + "/policies/policy",
+                params={"api-version": "2024-05-01"},
+            )
+            if response.status_code == 404 and name == "microsoft-decision":
+                etags[name] = None
+                continue
+            response.raise_for_status()
+            etags[name] = response.headers.get("ETag", "")
+        parent = client.head(
+            "https://management.azure.com" + revision + "/policies/policy",
+            params={"api-version": "2024-05-01"},
+        )
+        parent.raise_for_status()
+    write = FixedProgramCutover(
+        upgrade=upgrade, parent_policy=plan["parent_policy"],
+        expected_parent_etag=parent.headers.get("ETag", ""),
+        operation_policies=plan["operation_policies"], expected_operation_etags=etags,
+    )
+    try:
+        recover_fixed_program(runner, inputs, outputs, (write, preview["config_sha256"]))
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code != 409:
+            raise
+    final = approved_program()[1]
+    if upgrade.model_dump(mode="json") not in [
+        *final.get("registration_history", []), final.get("registration"),
+    ]:
+        raise DeploymentError(
+            "The capability cutover was not confirmed; review the Control-plane logs and rerun "
+            "the same command to read back and resume",
+        )
+    print("Decision and image generation are enabled on the gateway program")
+
+
 def verify_initial_fixed_program(
     api_url: str, owner_email: str, owner_password: str, descriptor: Mapping[str, Any],
 ) -> JsonObject:
@@ -4159,12 +4374,15 @@ def verify_initial_fixed_program(
         else:
             raise DeploymentError("Initial fixed program Owner login timed out")
         try:
+            unreachable: str | None = None
             while (remaining := deadline - time.monotonic()) > 0:
                 try:
                     response = http.get(path, timeout=min(15, remaining))
-                except httpx.TimeoutException:
+                except httpx.TransportError as error:
+                    unreachable = type(error).__name__
                     time.sleep(min(3, max(0, deadline - time.monotonic())))
                     continue
+                unreachable = None
                 if response.status_code == 200:
                     preview = response.json()
                     installation = preview["current_installation"]
@@ -4182,7 +4400,9 @@ def verify_initial_fixed_program(
                         _approved_fixed_installation(
                             initial, preview,
                         )
-                        installation = preview["initial_installation"]
+                        installation = installation_record(
+                            initial, preview["initial_installation"]["target_identity_sha256"],
+                        ).model_dump(mode="json")
                     if (
                         installation["program"]["program_sha256"]
                         != descriptor["binding"]["program_sha256"]
@@ -4194,7 +4414,10 @@ def verify_initial_fixed_program(
                 if response.status_code != 409:
                     response.raise_for_status()
                 time.sleep(min(3, max(0, deadline - time.monotonic())))
-            raise DeploymentError("Initial fixed program is not ready for model publication")
+            raise DeploymentError(
+                "Initial fixed program is not ready for model publication"
+                + (f"; the API was unreachable ({unreachable})" if unreachable else ""),
+            )
         finally:
             http.post("/api/v1/auth/logout")
 
@@ -4250,6 +4473,14 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
             raise DeploymentError("An incremental upgrade requires the original deployment outputs")
         gateway_upgrade(
             runner, inputs, saved_outputs, args.action, assume_yes=args.yes,
+            owner_credentials=args.owner_credentials,
+        )
+        return
+    if args.action == "enable-capabilities":
+        if saved_outputs is None:
+            raise DeploymentError("Enabling capabilities requires the original deployment outputs")
+        enable_program_capabilities(
+            runner, inputs, saved_outputs, assume_yes=args.yes,
             owner_credentials=args.owner_credentials,
         )
         return
@@ -4563,7 +4794,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Plan or deploy a complete self-hosted Turnstile environment."
     )
     parser.add_argument(
-        "action", choices=("plan", "deploy", "plan-upgrade", "upgrade", "rollback-upgrade")
+        "action", choices=(
+            "plan", "deploy", "plan-upgrade", "upgrade", "rollback-upgrade", "enable-capabilities",
+        ),
     )
     parser.add_argument("--subscription", required=True)
     parser.add_argument("--parameters", type=Path, required=True)
@@ -4608,6 +4841,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_SECRET_NAME = (
+    r"(?:(?:[a-z0-9]+_)*(?:sig|accountkey|sharedaccesskey|password|secret|token|key)"
+    # camelCase such as clientSecret or primaryKey; PascalCase PartitionKey is a diagnostic.
+    r"|(?-i:[a-z][a-z0-9]*(?:Secret|Token|Key|Password)))"
+)
+_SECRET_ASSIGNMENT = re.compile(rf"(?i)\b({_SECRET_NAME})=[^&\s;\"']+")
+_SECRET_JSON_VALUE = re.compile(rf"(?i)(\"{_SECRET_NAME}\"\s*:\s*\")[^\"]*\"")
+# Function URLs carry their key in the query string.
+_FUNCTION_KEY = re.compile(r"(?i)([?&]code=)[^&\s\"']+")
+_SECRET_HEADER = re.compile(r"(?i)\b((?:x-functions-key|ocp-apim-subscription-key)\s*:\s*)\S+")
+_BEARER_TOKEN = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+")
+
+
+def _redacted(text: str) -> str:
+    text = _SECRET_ASSIGNMENT.sub(r"\1=[redacted]", text)
+    text = _SECRET_JSON_VALUE.sub(r'\1[redacted]"', text)
+    text = _FUNCTION_KEY.sub(r"\1[redacted]", text)
+    text = _SECRET_HEADER.sub(r"\1[redacted]", text)
+    return _BEARER_TOKEN.sub("Bearer [redacted]", text)[-4000:]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         execute(build_parser().parse_args(argv), CommandRunner())
@@ -4615,6 +4869,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         DeploymentError, ApimUpgradeError, httpx.HTTPError, subprocess.CalledProcessError
     ) as error:
         print(f"Deployment failed: {error}", file=sys.stderr)
+        # Captured az output is otherwise lost, and it holds the actual cause.
+        if isinstance(error, subprocess.CalledProcessError) and error.stderr:
+            print(_redacted(str(error.stderr)), file=sys.stderr)
         return 1
     return 0
 

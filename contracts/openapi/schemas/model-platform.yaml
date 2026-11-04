@@ -2446,10 +2446,13 @@ schemas:
         - parent_policy_changed
         - credential_source_missing
         - apim_infrastructure_upgrade_required
+        - gateway_capability_unavailable
         - publication_failed
         - deployment_not_found
         - deployment_metadata_unavailable
         - upstream_request_failed
+        - credential_unreadable
+        - credential_vault_unavailable
       message:
         type: string
       stage:
@@ -2489,6 +2492,18 @@ schemas:
         items:
           type: string
         type: array
+      profile:
+        type:
+        - string
+        - 'null'
+        description: Route profile missing from the selected gateway program, present only
+          for gateway_capability_unavailable.
+        enum:
+        - openai-v1
+        - anthropic-messages
+        - openai-images
+        - microsoft-decision
+        - null
     additionalProperties: false
     type: object
     required:
@@ -4113,6 +4128,10 @@ schemas:
       pool_enabled:
         type: boolean
         title: Pool Enabled
+        default: false
+      router_enabled:
+        type: boolean
+        title: Router Enabled
         default: false
       decision_enabled:
         type: boolean

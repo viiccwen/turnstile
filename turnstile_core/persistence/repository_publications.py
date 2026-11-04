@@ -2523,7 +2523,9 @@ class PostgreSqlPublicationRepositoryMixin:
                     ).fetchone()
                 if runtime is None:
                     raise ValueError("The managed runtime no longer exists")
-                runtime_config = dict(runtime["config"] or {})
+                runtime_config = _activated_runtime_credentials(
+                    dict(runtime["config"] or {}), binding, publication["resource_manifest"],
+                )
                 if not runtime_config.get("control_plane_managed"):
                     raise ValueError("The runtime is not managed by the control plane")
                 runtime_config["named_value_name"] = binding["named_value_name"]
@@ -2601,12 +2603,17 @@ class PostgreSqlPublicationRepositoryMixin:
                     )
             else:
                 runtime_config = _activation_runtime_config(binding)
+                # Migration 019 made runtime names non-unique, so look up before inserting.
                 runtime = connection.execute(
+                    """SELECT * FROM model_runtime
+                       WHERE gateway_profile_id = %s AND name = %s
+                       ORDER BY created_at, id LIMIT 1 FOR UPDATE""",
+                    (publication["gateway_profile_id"], binding["runtime_name"]),
+                ).fetchone() or connection.execute(
                     """INSERT INTO model_runtime (
                            provider_id, gateway_profile_id, name, runtime_kind,
                            enabled, is_default, config
                        ) VALUES (%s, %s, %s, %s, TRUE, FALSE, %s)
-                       ON CONFLICT (name) DO UPDATE SET updated_at = model_runtime.updated_at
                        RETURNING *""",
                     (
                         provider_id,

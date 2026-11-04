@@ -56,7 +56,11 @@ from turnstile_core.services.application_provisioning_ledger import (
     prepare_application_ledger,
     project_application_rate_limit,
 )
-from turnstile_core.services.budget_settlement import BudgetScopeRepository, BudgetScopeService
+from turnstile_core.services.budget_settlement import (
+    BudgetScopeRepository,
+    BudgetScopeService,
+    initialize_model_prices,
+)
 from turnstile_core.services.gateway_publication_worker import GatewayPublicationWorker
 from turnstile_core.services.gateway_release_operation_worker import (
     GatewayReleaseOperationWorker,
@@ -81,6 +85,11 @@ def _close_repository(repository: object) -> None:
     close = getattr(repository, "close", None)
     if close is not None:
         close()
+
+
+def _worker_id() -> str:
+    # Flex Consumption sets no WEBSITE_INSTANCE_ID; the fallback appears in publication audit.
+    return os.environ.get("WEBSITE_INSTANCE_ID", "control-plane")[:128]
 
 
 @app.route(
@@ -226,7 +235,7 @@ def _run_model_availability(*, audit: bool, renew: bool = False) -> None:
             lambda: TableStorageLedger(endpoint, settings.ledger_table_name, timeout=2),
             coordinator.verify,
         )
-        worker.run_once(os.environ.get("WEBSITE_INSTANCE_ID", "control-plane-local")[:128])
+        worker.run_once(_worker_id())
     finally:
         try:
             if clients is not None:
@@ -484,6 +493,15 @@ def publish_gateway_changes(timer: func.TimerRequest) -> None:
                 initialization.configure_budget_delegation(
                     repository, target_config.settings, target_id,
                 )
+                if target_config.settings.ledger_table_endpoint:
+                    from turnstile_core.integrations.router_table_projection import (
+                        RouterTableProjector,
+                    )
+
+                    RouterTableProjector(
+                        target_config.settings.ledger_table_endpoint,
+                        target_config.settings.ledger_table_name,
+                    ).sync_all_published_routers(repository, gateway_profile_id=target_id)
         publisher = AzureApimPublisherClientResolver(configurations)
         cipher = CredentialCipher.from_settings(settings)
         client = resources.enter_context(httpx.Client(timeout=10.0, follow_redirects=False))
@@ -504,7 +522,7 @@ def publish_gateway_changes(timer: func.TimerRequest) -> None:
                 settings.ledger_table_endpoint, settings.ledger_table_name,
                 client=client, token_provider=routes._tokens, timeout=2,
             ))
-        worker_id = os.environ.get("WEBSITE_INSTANCE_ID", "control-plane-local")[:128]
+        worker_id = _worker_id()
         policy_path = Path(
             os.environ.get(
                 "CONTROL_PLANE_PARENT_POLICY_PATH",
@@ -558,6 +576,26 @@ def publish_gateway_changes(timer: func.TimerRequest) -> None:
                     result.id,
                     result.status.value,
                 )
+                if result.status.value == "failed":
+                    logger.warning(
+                        "Gateway publication %s failed: error_code=%s error_message=%r",
+                        result.id,
+                        result.error_code,
+                        result.error_message,
+                    )
+                if (
+                    ledger is not None and result.status.value == "active"
+                    and result.publication_kind.value == "model_add"
+                ):
+                    # Activation creates the model row; budget scopes may already be seeded.
+                    try:
+                        initialize_model_prices(repository, ledger, datetime.now(UTC))
+                    except Exception as error:
+                        logger.warning(
+                            "Model price projection pending after publication %s error_type=%s",
+                            result.id,
+                            type(error).__name__,
+                        )
                 route_configuration = result.resource_manifest.get("route_configuration")
                 model_removal = "model_route_removal" in result.resource_manifest
                 has_route_progress = (
@@ -617,7 +655,7 @@ def process_gateway_release_operations(timer: func.TimerRequest) -> None:
             ),
             cipher=cipher,
         )
-        worker_id = os.environ.get("WEBSITE_INSTANCE_ID", "control-plane-local")[:128]
+        worker_id = _worker_id()
 
         def project_application(gateway_id: UUID, application_id: UUID) -> None:
             assert settings.ledger_table_endpoint is not None

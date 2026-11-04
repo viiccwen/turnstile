@@ -1,3 +1,5 @@
+import type { ManagedModel, ModelRuntime } from "../data-sources/apim/types"
+
 export type ClientSampleLanguage = "bash" | "python" | "javascript"
 export type GatewayApiOperation = "models" | "chat_completions" | "responses" | "responses_compact" | "anthropic_messages" | "anthropic_count_tokens" | "image_generations" | "decision"
 export type ClientSampleOperation = GatewayApiOperation
@@ -25,6 +27,38 @@ export function gatewayApiOperations(): GatewayApiOperationOption[] {
     { id: "image_generations", label: "Image Generations", method: "POST", path: "/images/generations" },
     { id: "decision", label: "Decision", method: "POST", path: "/providers/microsoft/v1/systemone" },
   ]
+}
+
+export function operationSampleModels<Model extends { capabilities: readonly string[] }>(
+  models: readonly Model[],
+  operation: GatewayApiOperation,
+): Model[] {
+  return models.filter(model => operation === "models"
+    || model.capabilities.includes("decision") === (operation === "decision")
+    && model.capabilities.includes("image_generation") === (operation === "image_generations"))
+}
+
+export function modelSampleOperations(model: ManagedModel, runtime: ModelRuntime | undefined) {
+  const configuredFormat = String(runtime?.config.api_format ?? "")
+  const isAnthropic = (runtime?.brand_key === "microsoft_foundry" && model.family_key === "claude")
+    || configuredFormat === "anthropic_messages"
+    || (!configuredFormat && (
+      runtime?.brand_key === "amazon_bedrock"
+      || runtime?.brand_key === "anthropic"
+      || runtime?.brand_key === "azure_databricks"
+    ))
+  const allowedIds = new Set<ClientSampleOperation>(
+    isAnthropic
+      ? ["anthropic_messages", "anthropic_count_tokens", "models"]
+      : ["chat_completions", "responses", "responses_compact", "models"],
+  )
+  const defaultOperation: ClientSampleOperation = isAnthropic
+    ? "anthropic_messages"
+    : "chat_completions"
+  return {
+    defaultOperation,
+    operations: gatewayApiOperations().filter((operation) => allowedIds.has(operation.id)),
+  }
 }
 
 function shellQuote(value: string) {

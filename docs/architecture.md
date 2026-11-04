@@ -52,13 +52,15 @@ tests enforce these dependency and packaging boundaries.
 
 Connection and model changes are stored as immutable publication intent. The control-plane Function creates a candidate APIM revision, validates it, and promotes it only after probes pass. Gateway releases preserve integrity data and rollback metadata.
 
+Each gateway runs a fixed program whose `supported_profiles` declare the protocols it can route: OpenAI, Anthropic Messages, image generation (`openai-images`) and Decision (`microsoft-decision`). New installations and onboarded APIM gateways enable all four. A publication for a profile the program lacks is rejected before any APIM write. An earlier program gains image generation and Decision only through a recorded program upgrade that appends those profiles, adds the Decision operation and recompiles the image operation; the Control-plane verifies the native API against the approved program before and after the cutover.
+
 ## Governed image requests
 
 Image generation uses an explicitly published v4 profile on an existing Foundry Connection. The profile is content-addressed and release-owned. Text and image models can share the Connection credential while keeping distinct APIM operations and backend routes; image responses bypass the text usage observer. Connection credential rotation updates every owned binding and nested Pool reference in the candidate release before activation.
 
 The internal image API uses the same authenticated identity, model assignment and budget checks as text invocation. Before dispatch it records an immutable billable intent, request identity, model identity, admission month and reservation. A valid measured result creates an exact acknowledgement; uncertain results remain reserved. Publication probes use the same durable journal with explicit authorization and bounded attempts, including independent rollback phases. Worker leases are renewed during long probes and checked again when committing state or activation.
 
-The response carries one validated PNG, JPEG or WebP image. Preview URLs exist only in browser memory and are revoked on replacement or exit. Prompts and image bytes do not become usage records, logs or query-cache entries.
+The response carries one validated PNG, JPEG or WebP image, whichever format the provider returns; Microsoft Foundry rejects a request for `output_format: webp` with HTTP 400. Preview URLs exist only in browser memory and are revoked on replacement or exit. Prompts and image bytes do not become usage records, logs or query-cache entries.
 
 ## Ledger finalization
 

@@ -286,6 +286,8 @@
 	gap: 20px;
 	padding: 10px 12px 10px var(--model-workspace-gutter);
 }
+/* Match the toolbar's end padding and stay above the sticky table head, whose snapped edge covers the bottom border. */
+.model-toolbar ~ .smh-notice { position: relative; z-index: 3; margin-right: 12px; }
 .model-tabs { align-self: center; }
 .model-tabs button { display: inline-flex; align-items: center; gap: 6px; }
 .model-tabs button:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
@@ -780,6 +782,7 @@ button.model-availability-status { cursor: pointer; }
 .model-delete-body [data-slot="alert-dialog-title"] { grid-column: 1; display: block; font-size: 16px; line-height: 24px; font-weight: 600; }
 .model-delete-body [data-slot="alert-dialog-description"] { grid-column: 1; display: block; margin-top: 8px; font-size: 14px; line-height: 20px; }
 .model-delete-body > .registry-error { margin-top: 12px; }
+.model-delete-body > .application-governance-unavailable { margin-top: 12px; }
 [data-slot="alert-dialog-footer"].model-delete-footer { display: flex; justify-content: flex-end; gap: 8px; margin: 0; border-radius: 0 0 12px 12px; padding: 16px; background: color-mix(in oklch, var(--muted) 70%, var(--card)); }
 .model-delete-footer > [data-slot="alert-dialog-action"], .model-delete-footer > [data-slot="alert-dialog-cancel"] { appearance: none; min-width: 80px; height: 32px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid transparent; border-radius: 8px; padding: 0 12px; outline: none; font: inherit; font-size: 14px; line-height: 20px; font-weight: 500; white-space: nowrap; cursor: pointer; }
 .model-delete-footer > [data-slot="alert-dialog-action"] { background: var(--destructive); color: white; }
@@ -928,6 +931,11 @@ button.model-availability-status { cursor: pointer; }
 	.apim-native-route-hero .runtime-detail-facts > div:last-child { border-bottom: 0; }
 	.model-toolbar-filters { grid-template-columns: minmax(110px, 128px) minmax(0, 1fr) max-content; }
 	.model-search-control.expanded { max-width: none; }
+	.model-table.models { --model-table-compact-width: calc(max(160px, var(--resizable-column-1, 160px)) + max(80px, var(--resizable-column-5, 80px)) + max(63px, var(--resizable-column-6, 63px)) + 2 * var(--model-table-gap) + 24px); }
+	.model-table.models .model-table-head,
+	.model-table.models .model-list-row { grid-template-columns: minmax(160px, var(--resizable-column-1, 1fr)) minmax(80px, var(--resizable-column-5, 80px)) minmax(63px, var(--resizable-column-6, 63px)); }
+	.model-table.models .model-table-head > :nth-child(3),
+	.model-table.models .model-list-row > :nth-child(3) { display: none; }
 	[data-slot="alert-dialog-header"] { grid-template-columns: 1fr; justify-items: center; text-align: center; }
 	[data-slot="alert-dialog-media"] { grid-row: auto; }
 	[data-slot="alert-dialog-title"], [data-slot="alert-dialog-description"] { grid-column: 1; }
@@ -1155,6 +1163,7 @@ button.model-availability-status { cursor: pointer; }
 .router-validation-banner.invalid { background: color-mix(in srgb, var(--destructive) 5%, var(--background)); color: var(--destructive); }
 .router-validation-banner-head { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; gap: 8px; }
 .router-validation-banner-issues { display: grid; gap: 2px; padding-left: 24px; }
+.router-validation-banner-warning { padding-left: 24px; color: var(--warning); }
 .router-validation-banner button { height: 24px; border: 0; border-radius: 5px; padding: 0 7px; background: transparent; color: inherit; font-size: 11px; font-weight: 500; cursor: pointer; }
 .router-validation-banner button:hover:not(:disabled) { background: color-mix(in srgb, currentColor 8%, transparent); }
 .router-validation-banner button.router-validation-banner-issue { height: auto; min-height: 22px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 2px 6px; margin-left: -6px; color: var(--foreground); font-weight: 400; text-align: left; }
@@ -1498,6 +1507,7 @@ button.model-availability-status { cursor: pointer; }
 .router-resilience-state[data-status="active"] { color: var(--success); }
 .router-resilience-state[data-status="failed"], .router-resilience-state[data-status="rolled_back"] { color: var(--destructive); }
 .router-resilience-state[data-status="awaiting_authorization"] { color: var(--warning); }
+.router-resilience-task { min-width: 0; overflow-wrap: anywhere; color: var(--muted-foreground); }
 .router-deployment-resilience > footer { min-height: 30px; display: flex; align-items: center; justify-content: flex-start; flex-wrap: wrap; gap: 6px; padding-right: 56px; }
 .router-strategy-model-editor.compact .router-strategy-model-main { grid-template-columns: 28px 24px minmax(0, 1fr) auto; gap: 7px; }
 .router-strategy-model-editor.compact .router-strategy-model-row[data-mode="weighted"] .router-strategy-model-main { grid-template-columns: 24px minmax(0, 1fr) auto; }
@@ -1689,6 +1699,8 @@ button.router-new-button:disabled { cursor: not-allowed; opacity: .5; }
 	.router-resilience-policy dl { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 0; }
 	.router-resilience-policy dl > div:nth-child(odd) { border-left: 0; }
 	.router-resilience-policy dl > div:not(:last-child) { border-bottom: 1px solid var(--border); }
+	/* Right-aligned, the state sat under the floating Assistant button on phones. */
+	.router-resilience-affinity-state { flex-basis: 100%; margin-left: 0; }
 }
 
 @container (max-width: 650px) {
@@ -1854,6 +1866,7 @@ button.router-new-button:disabled { cursor: not-allowed; opacity: .5; }
 .model-price-rule-choice.usage-metric-segment > button.active { box-shadow: none; }
 .model-price-rule-choice > button:disabled { cursor: not-allowed; opacity: .6; }
 .model-price-rule-fields { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; }
+.model-price-rule-fields [data-slot="input"] { height: 32px; }
 @media (max-width: 480px) {
 	.model-price-rule-row { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 8px; }
 	.model-price-rule-fields .registry-field-label-row { flex-wrap: wrap; }
@@ -1861,7 +1874,7 @@ button.router-new-button:disabled { cursor: not-allowed; opacity: .5; }
 .model-price-loading { display: flex; align-items: center; gap: 6px; }
 .model-price-loading > svg { flex: 0 0 auto; }
 .model-price-catalog-fields { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 16px; }
-.model-price-catalog-fields .registry-select-trigger { height: 32px; }
+.model-price-catalog-fields .registry-select-trigger, .model-price-catalog-fields [data-slot="input"] { height: 32px; }
 @media (min-width: 641px) {
 	.model-price-catalog-fields { grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); }
 }

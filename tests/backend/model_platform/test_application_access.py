@@ -4,7 +4,7 @@ import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Literal, cast
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 from uuid import UUID, uuid4
 
 import httpx
@@ -542,7 +542,7 @@ def test_application_model_access_save_projects_only_own_application(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from backend.http.service_dependencies import application_access_service
-    from turnstile_core.integrations.ledger import application_partition_key
+    from turnstile_core.integrations.ledger import application_partition_key, model_access_periods
 
     repository = InMemoryRepository()
     access = ApplicationAccessService(repository, sync_available=False)
@@ -573,11 +573,14 @@ def test_application_model_access_save_projects_only_own_application(
             GatewayApplicationModelAccessUpdate(mode=mode, model_ids=[]),
             "owner@example.com",
         )
-        store.upsert.assert_called_once_with(
-            application_partition_key(application_id, datetime.now(UTC).strftime("%Y-%m")),
-            "M",
-            {"Configured": mode == "restricted", "Models": "||"},
-        )
+        assert store.upsert.call_args_list == [
+            call(
+                application_partition_key(application_id, period),
+                "M",
+                {"Configured": mode == "restricted", "Models": "||"},
+            )
+            for period in model_access_periods(datetime.now(UTC))
+        ]
     assert result.model_policy_configured == (mode == "restricted")
 
 
@@ -748,6 +751,61 @@ def test_application_usd_budget_uses_exact_priced_usage_and_fails_closed_unprice
     assert budget.used_usd is None
     assert budget.remaining_usd is None
     assert budget.usd_cost_available is False
+
+
+@pytest.mark.parametrize("usage", ["budget_denial", "unpriced"])
+def test_application_switch_to_usd_ignores_only_free_budget_denials(usage: str) -> None:
+    from turnstile_core.services.control_plane import ControlPlaneConflictError
+
+    repository = InMemoryRepository()
+    service = ApplicationAccessService(
+        repository,
+        sync_available=True,
+        read_execution_budget=lambda *_: {"ledger_status": "current", "budget_mode": "tokens"},
+    )
+    moment = datetime.now(UTC)
+    application = service.sync_discovery(
+        _discovery("usd-switch", discovered_at=moment), "worker",
+    )[0]
+    application_id = UUID(str(application["id"]))
+    service.update_application_budget(
+        application_id,
+        GatewayApplicationBudgetUpdate(
+            token_limit=1_000, tokens_per_minute=100_000, enforce=True,
+            warning_threshold_percent=80,
+        ),
+        "owner",
+    )
+    record = _usage_record("usd-switch", "Foundry", 0).model_copy(
+        update={"ts": moment, "usd_cost": None},
+    )
+    if usage == "budget_denial":
+        record = record.model_copy(update={
+            "status": "429", "status_code": 429, "estimated": True,
+            "ingest_source": "eventhub", "ingest_error": "budget_pre_dispatch_denial",
+            "budget_admission": "budget_exhausted",
+        })
+    repository.write_token_usage(record, UsageApplicationAttribution(
+        application_id=application_id,
+        application_subscription_id=repository.gateway_application_subscriptions[0]["id"],
+        application_name_snapshot=str(application["display_name"]),
+        apim_subscription_id="usd-switch",
+        actor_type="service",
+        actor_id="service:usd-switch",
+    ))
+    request = GatewayApplicationBudgetUpdate(
+        budget_mode="usd", usd_limit=Decimal("10.00"), tokens_per_minute=100_000,
+        enforce=True, warning_threshold_percent=80,
+    )
+    if usage == "unpriced":
+        with pytest.raises(ControlPlaneConflictError, match="unpriced usage"):
+            service.update_application_budget(application_id, request, "owner")
+        return
+    service.update_application_budget(application_id, request, "owner")
+    stored = repository.list_gateway_application_budgets(
+        moment.date().replace(day=1), [application_id],
+    )
+    assert stored[0]["budget_mode"] == "usd"
 
 
 @pytest.mark.parametrize("status", [None, "missing", "prepared", "unavailable"])

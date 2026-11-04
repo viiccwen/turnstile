@@ -783,6 +783,38 @@ def test_internal_invocation_enforces_user_model_policy() -> None:
     _assert_storable(denial)
 
 
+def test_disabled_model_invocation_is_denied_with_a_trace() -> None:
+    def handler(incoming: httpx.Request) -> httpx.Response:
+        raise AssertionError("the provider must not be reached for a disabled model")
+
+    repository = InMemoryRepository()
+    runtime, model = _foundry_route(repository)
+    model["enabled"] = False
+    service = ModelRuntimeService(
+        repository,
+        Settings(),
+        GatewayRouter(httpx.Client(transport=httpx.MockTransport(handler))),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        service.invoke(
+            request(model=model["model_key"], runtime=runtime["name"]).model_copy(
+                update={"model_id": model["id"]}
+            )
+        )
+
+    assert error.value.status_code == 403
+    detail: object = error.value.detail
+    assert detail == {"code": "model_disabled", "message": "The requested model is disabled"}
+    [denial] = repository.usage_records
+    assert error.value.headers == {"x-request-id": denial.request_id}
+    assert (denial.status_code, denial.model_admission) == (403, "model_disabled")
+    assert (denial.model_id, denial.model, denial.runtime) == (
+        str(model["id"]), model["display_name"], model["runtime_name"],
+    )
+    _assert_storable(denial)
+
+
 def test_dynamic_model_does_not_allow_legacy_health_identity_to_bypass_assignment() -> None:
     calls = 0
 
@@ -2178,6 +2210,130 @@ def test_complete_catalog_price_can_be_saved(
     assert saved.list_input_cost_per_million == published.input_per_million
     assert saved.price_sync_status == "ok"
     catalog.lookup.assert_called_once_with(write.price_reference)
+
+
+@pytest.mark.parametrize("catalog_now", ["unchanged", "unavailable", "up_10", "up_50"])
+@pytest.mark.parametrize("override", [None, 10.0])
+def test_connection_discount_reprices_inheriting_models_from_accepted_list_prices(
+    price_edit_service: tuple[ModelRuntimeService, Mock, ManagedModelWrite, UUID],
+    catalog_now: str,
+    override: float | None,
+) -> None:
+    from turnstile_core.domain.runtime_models import ModelConnectionUpdate
+
+    service, catalog, write, model_id = price_edit_service
+    accepted = catalog.lookup.return_value
+    saved = next(model for model in service.save_model(
+        write.model_copy(update={"price_discount_percent": override}), model_id,
+    ).models if model.id == model_id)
+    runtime = next(item for item in service.registry().runtimes if item.id == saved.runtime_id)
+    connection = ModelConnectionUpdate(
+        name=runtime.name, enabled=runtime.enabled, is_default=runtime.is_default,
+    )
+    if catalog_now == "unavailable":
+        catalog.lookup.side_effect = TimeoutError("price source unavailable")
+    elif catalog_now != "unchanged":
+        factor = 1.1 if catalog_now == "up_10" else 1.5
+        catalog.lookup.return_value = CatalogEntry(
+            reference=accepted.reference, label=accepted.label, source=accepted.source,
+            input_per_million=2.0 * factor, output_per_million=8.0 * factor,
+        )
+    catalog.lookup.reset_mock()
+
+    # Saving the same discount again is a no-op, not a retry that needs the catalog.
+    for discount in (20.0, 20.0, None):
+        model = next(model for model in service.update_connection(
+            runtime.id, connection.model_copy(update={"price_discount_percent": discount}),
+        ).models if model.id == model_id)
+        charged = accepted.discounted(override if override is not None else discount)
+        assert (model.input_cost_per_million, model.output_cost_per_million) == (
+            charged.input_per_million, charged.output_per_million,
+        )
+        assert (model.list_input_cost_per_million, model.list_output_cost_per_million) == (
+            2.0, 8.0,
+        )
+        assert model.price_sync_status == saved.price_sync_status
+    catalog.lookup.assert_not_called()
+
+
+def test_connection_edits_that_keep_the_discount_leave_model_prices_alone(
+    price_edit_service: tuple[ModelRuntimeService, Mock, ManagedModelWrite, UUID],
+) -> None:
+    from turnstile_core.domain.runtime_models import ModelConnectionUpdate
+
+    service, catalog, write, model_id = price_edit_service
+    saved = next(model for model in service.save_model(write, model_id).models
+                 if model.id == model_id)
+    # Rates that disagree with the connection discount are not rewritten by a rename or toggle.
+    service._repository.update_registry_item(
+        "runtime", saved.runtime_id, {"price_discount_percent": 20.0},
+    )
+    runtime = next(item for item in service.registry().runtimes if item.id == saved.runtime_id)
+    catalog.lookup.reset_mock()
+
+    for change in ({"name": "Renamed"}, {"enabled": not runtime.enabled}):
+        model = next(model for model in service.update_connection(runtime.id, ModelConnectionUpdate(
+            name=runtime.name, enabled=runtime.enabled, is_default=runtime.is_default,
+            price_discount_percent=20.0,
+        ).model_copy(update=change)).models if model.id == model_id)
+        assert (model.input_cost_per_million, model.output_cost_per_million) == (2.0, 8.0)
+    catalog.lookup.assert_not_called()
+
+
+def test_connection_discount_reprices_context_tiers_from_their_list_prices(
+    price_edit_service: tuple[ModelRuntimeService, Mock, ManagedModelWrite, UUID],
+) -> None:
+    from turnstile_core.domain.runtime_models import ModelConnectionUpdate
+
+    service, catalog, _write, model_id = price_edit_service
+    tiers: list[dict[str, Any]] = [
+        {"key": "short", "label": "Short", "reference": "azure_retail:A:Short:Global:*",
+         "min_input_tokens": 0, "max_input_tokens": 272000, "input_price_per_million": 4.0,
+         "output_price_per_million": 20.0, "cached_price_per_million": 4.0,
+         "cache_write_price_per_million": 4.0,
+         "list_prices": {"input": 4.0, "output": 20.0, "cached": None, "cache_write": None}},
+        {"key": "long", "label": "Long", "reference": "azure_retail:A:Long:Global:*",
+         "min_input_tokens": 272001, "max_input_tokens": None, "input_price_per_million": 8.0,
+         "output_price_per_million": 30.0, "cached_price_per_million": 1.0,
+         "cache_write_price_per_million": 1.0,
+         "list_prices": {"input": 8.0, "output": 30.0, "cached": 1.0, "cache_write": None}},
+    ]
+    service._repository.update_registry_item("model", model_id, {
+        "price_source": "azure_retail", "price_reference": "azure_retail:context:unit",
+        "context_price_tiers": tiers,
+    })
+    # A newer published schedule is waiting for review; a discount change must not answer it.
+    service._repository.update_registry_item("model", model_id, {
+        "pending_context_price_tiers": [
+            {**tier, "list_prices": {**tier["list_prices"], "input": 9.0}} for tier in tiers
+        ],
+        "price_sync_status": "review_needed", "price_sync_message": "unit review",
+        "price_synced_at": datetime(2026, 10, 1, tzinfo=UTC),
+    })
+    current = next(model for model in service.registry().models if model.id == model_id)
+    runtime = next(item for item in service.registry().runtimes if item.id == current.runtime_id)
+
+    model = next(model for model in service.update_connection(runtime.id, ModelConnectionUpdate(
+        name=runtime.name, enabled=runtime.enabled, is_default=runtime.is_default,
+        price_discount_percent=50.0,
+    )).models if model.id == model_id)
+
+    assert [(
+        tier.input_price_per_million, tier.output_price_per_million,
+        tier.cached_price_per_million, tier.cache_write_price_per_million,
+    ) for tier in model.context_price_tiers] == [(2.0, 10.0, 2.0, 2.0), (4.0, 15.0, 0.5, 0.5)]
+    assert [tier.list_prices for tier in model.context_price_tiers] == [
+        tier.list_prices for tier in current.context_price_tiers
+    ]
+    assert (
+        model.pending_context_price_tiers, model.price_sync_status,
+        model.price_sync_message, model.price_synced_at,
+    ) == (
+        current.pending_context_price_tiers, "review_needed",
+        "unit review", datetime(2026, 10, 1, tzinfo=UTC),
+    )
+    catalog.options.assert_not_called()
+    catalog.lookup.assert_not_called()
 
 
 def test_non_pricing_edit_does_not_require_an_available_catalog(

@@ -2,7 +2,7 @@
 
 ## Scope
 
-Turnstile infrastructure includes PostgreSQL, Event Hubs, an existing shared Storage account, Key Vault, Application Insights, the Web App, telemetry and control-plane Functions, and APIM configuration. FastAPI and the observer each have a dedicated App Service Plan. The telemetry and control-plane Functions each have a separate Flex Consumption plan, deployment container, and VNet subnet. The main deployment is resource-group scoped and does not create or reconfigure the shared account, Azure AI Foundry projects, or provider model deployments.
+Turnstile infrastructure includes PostgreSQL, Event Hubs, an existing shared Storage account, Key Vault, Application Insights, the Web App, telemetry and control-plane Functions, and APIM configuration. FastAPI and the observer each have a dedicated App Service Plan. The telemetry and control-plane Functions each have a separate Flex Consumption plan, deployment container, and VNet subnet. An Azure Monitor alert emails `bootstrapOwnerEmail` when every budget ledger sync in 30 minutes failed. The main deployment is resource-group scoped and does not create or reconfigure the shared account, Azure AI Foundry projects, or provider model deployments.
 
 The API, telemetry and control-plane Functions, and observer explicitly enable public network access and carry the resource-level `SecurityControl=Ignore` tag so an organization-level network Modify policy does not silently disable them. The exemption is not applied at resource-group scope. Shared Storage retains its administrator-managed network policy; verify runtime and deployment connectivity without weakening its firewall. Key Vault resources designed for private-link access remain isolated.
 
@@ -161,10 +161,28 @@ recovery checkpoint, but do not pass it as a template parameter. Initialization 
 the dedicated credential vault and managed usage hub are prepared before worker activation;
 grants on adopted dependencies remain lifecycle-managed at their exact resource scopes.
 
-## Prepare for v1.2
+## Prepare for v1.4
 
-Turnstile v1.2 is the current public release. Upgrading an existing v1.1 installation requires
+Turnstile v1.4 is the current public release. Upgrading an existing installation requires
 reviewing the migrations and protocol steps below in addition to uploading application packages.
+The table lists the changes introduced in v1.2; an installation already on v1.2 has them. v1.3 adds
+migration `029_model_intelligent_router`, and installations created by an earlier release must
+[enable Decision and image generation](#enable-decision-and-image-generation) before publishing
+those models. v1.4 adds no migration and no Bicep change. After its packages are deployed, the
+Control-plane refreshes the gateway program installed by the deployer to the v1.4 parent policy
+(`infra/policies/foundry-finops-policy.xml`) and operation policies, including the backend-pool
+retry, the 403 denial body, and Responses cache-write usage.
+
+> [!WARNING]
+> The complete previous-formal-release-to-v1.4 upgrade journey remains unverified. Fresh-install
+> and retained-target candidate update checks do not replace that evidence. Native Router SSE
+> buffering and long mobile budget-preview overlap remain known limitations; review the
+> [v1.4 release notes](https://github.com/xuleihive/turnstile/releases/tag/v1.4) before upgrading.
+
+After the Control-plane refresh, verify Responses JSON/SSE usage, the original admission-price
+snapshot, and exactly-once settlement rather than relying on HTTP 200 or telemetry display alone.
+The fix does not rewrite earlier overcharges, failed settlement tasks, or pending reservations;
+historical remediation requires separate authorization and retained evidence.
 
 | Change | Required preparation | Verify before use |
 | --- | --- | --- |
@@ -398,9 +416,11 @@ and scoped APIM Credential Manager permissions. Neither method creates upstream 
 The supported Databricks publication path is native Anthropic chat/streaming, not image
 generation or an assumption of every OpenAI-compatible operation.
 
-Foundry text, governed images and an OpenAI-compatible provider have separate model and
-credential prerequisites. Images are available without an enablement setting and require an
-existing Foundry image deployment, image-ready APIM infrastructure and consent for paid probes.
+Foundry text, governed images, Decision models and an OpenAI-compatible provider have separate
+model and credential prerequisites. New installations enable image generation and the Decision
+API in the gateway program; an installation created before this release enables them with
+[`enable-capabilities`](#enable-decision-and-image-generation). Publishing an image model still
+requires an existing Foundry image deployment and consent for paid probes.
 Publication probes also consume upstream
 requests; include them when choosing a validation budget. Never enable an upstream provider's
 local-key authentication or weaken networking merely to complete installation.
@@ -534,9 +554,10 @@ account, resource group or subscription. Configuration waits for the role deploy
 Azure RBAC propagation must still be checked with the API identity before admitting traffic.
 
 After restoring service, save a model grant, replace the allowed set, then revoke all models
-for an authorized test person. Verify the affected ledger `M` row contains the latest full UUID
-and alias set immediately after each save; deny-all must retain `Configured=true` and
-`Models="||"`. Other users and budgets must remain unchanged. Check a direct APIM client:
+for an authorized test person. Verify the affected ledger `M` rows for the current and next UTC
+month contain the latest full UUID and alias set immediately after each save; deny-all must
+retain `Configured=true` and `Models="||"`. Other users and budgets must remain unchanged. Check
+a direct APIM client:
 Invocation Test also reads PostgreSQL, so its success alone does not prove Desktop synchronization.
 
 PostgreSQL commits before immediate projection. A ledger write failure preserves the saved
@@ -548,10 +569,21 @@ requires diagnosis; local tests are not proof of Azure propagation or live concu
 ## Prerequisites
 
 - Azure CLI with an authenticated subscription context
-- `uv` and Python 3.11 or newer
+- `uv` 0.9.18 or newer (the version CI uses) and Python 3.11 or newer. When `uv` cannot resolve the
+  Linux x86-64 wheels (with `uv` 0.5.5 this happened for every package), packaging falls back to
+  pip. The fallback uses your configured package index and checks installed versions against
+  `uv.lock`, but not hashes.
 - Node.js and npm versions accepted by `frontend/package.json`
 - Permission to create the resource group and included resources
-- Permission to create role assignments; use Owner, or Contributor plus User Access Administrator, at the target scope
+- Permission to create role assignments; use Owner, or Contributor plus User Access Administrator, at the target scope. The template assigns roles at subscription scope (see below), so that scope is the subscription.
+
+The template gives the API and Control-plane managed identities `API Management Service Contributor`
+at subscription scope, in addition to the platform resource group. They need it to manage an
+existing APIM in another resource group and APIM instances added later in the console. It lets
+these identities manage every APIM service in the subscription. To narrow it, deploy into a
+dedicated subscription, or after installation remove the two subscription-scope assignments and
+assign the same role on each APIM service the installation manages before adding it. Any later
+deployment of `infra/main.bicep` recreates the subscription-scope assignments.
 
 Docker is not required. The observer image is built remotely by Azure Container Registry.
 
@@ -565,6 +597,8 @@ cp infra/main.parameters.example.json .turnstile/main.parameters.json
 ```
 
 Set the resource prefix, resource group, Azure and PostgreSQL regions, APIM publisher email, and `bootstrapOwnerEmail`. New deployments provision a capacity-one `StandardV2` APIM by default. `entraClientId` and `entraAllowedEmailDomains` are optional; password Owner login works without Entra.
+
+`apimSkuName` accepts `StandardV2` or `Developer`. The gateway must reach the private ledger Table and route Key Vault: StandardV2 uses outbound virtual network integration, while Developer, which has no SLA, is injected into the platform virtual network in External mode on subnet `10.42.4.0/27`. Injection adds considerably to the deployment time and gives the gateway a new public IP address, so allowlist that address only after deployment completes. Basic v2 is not supported because it cannot reach private endpoints.
 
 To run a clean end-to-end deployment without provisioning another APIM service, set all four `existingApimName`, `existingApimResourceGroupName`, `existingApimPrincipalId`, and `existingApimGatewayUrl` values. Other dependencies are managed unless explicitly adopted through their existing-resource parameters; shared Storage is always existing and the dedicated runtime credential vault remains managed. The deployment derives environment-unique API, path, product, subscription, logger, diagnostic-setting, and observer Named Value identifiers from `resourcePrefix`, so the shared APIM configuration does not overwrite another Turnstile environment. Review all shared named values, including platform governance, before reusing an APIM across installations; environment-specific child names alone do not establish full configuration isolation.
 
@@ -583,6 +617,8 @@ uv run python -m scripts.deploy plan \
 ```
 
 The first preview asks for the initial Owner password twice and stores only its scrypt hash. It also creates independent random platform secrets in `.turnstile/deployments/<resource-group>.json` with mode `0600`. Repeated previews and deployments reuse that state.
+
+The preview prints the count per change type and then one line per resource that would change, for example `  Create /subscriptions/.../roleAssignments/...`. Review the creates, role assignments and network resources there. `Unsupported` entries are role assignments for managed identities that the same deployment creates.
 
 Before creating deployment state, the command verifies that the selected region supports Flex Consumption, that `Microsoft.App` is registered, and that the selected PostgreSQL region supports PostgreSQL 16 with the configured SKU and availability zone. If either service is unavailable, choose another location and run the preview again.
 
@@ -609,11 +645,12 @@ The command runs these phases in order:
 
 Generated packages and deployment state remain under `.turnstile/deployments`. The script prints and stores only non-secret Azure outputs.
 
-Fresh installations include the fixed `POST /images/generations` operation with a default
-deny policy. Creating the operation does not publish an image model, enable image generation
-or authorize a provider call. Model publications inherit the operation into their candidate
-revisions and replace only its model-specific policy. The Control-plane publisher does not
-need `Microsoft.ApiManagement/service/apis/operations/write`.
+Fresh installations include the fixed `POST /images/generations` operation and the Decision
+operation `POST /providers/microsoft/v1/systemone`. Both answer 503 until a model of that type
+is published; creating them does not publish a model or authorize a provider call. Model
+publications inherit the operations into their candidate revisions and replace only
+model-specific policy. The Control-plane publisher does not need
+`Microsoft.ApiManagement/service/apis/operations/write` to publish models.
 
 ## Initial Owner
 
@@ -704,7 +741,8 @@ Apply pending migrations `004_apim_usage_identity_guard`, `005_billable_request_
 
 The API and Control-plane packages both require the pinned Pillow dependency for full image validation. The Control-plane artifact includes the public canonical parent policy at `policies/foundry-finops-policy.xml`; publication and image rollback read it through `CONTROL_PLANE_PARENT_POLICY_PATH`. The publisher verifies the live policy and its readback, and refuses incompatible image policies instead of transforming an unknown live template. Use the APIM infrastructure upgrade below before publishing image models on an older installation; do not rerun the bootstrap template against customer routing.
 
-Image generation has no separate enablement switch. Keep the evidence-v2 cutoff unset during the code and migration rollout; authorizing paid publication probes and scheduling the future evidence cutoff remain separate operational decisions. This upgrade does not provision a Foundry account or model, modify an upstream deployment, or grant new provider roles.
+Image generation needs no backend setting. The gateway program enables it at installation or
+through [`enable-capabilities`](#enable-decision-and-image-generation). Keep the evidence-v2 cutoff unset during the code and migration rollout; authorizing paid publication probes and scheduling the future evidence cutoff remain separate operational decisions. This upgrade does not provision a Foundry account or model, modify an upstream deployment, or grant new provider roles.
 
 ### Incremental APIM infrastructure upgrade
 
@@ -792,12 +830,51 @@ is refused; review that later state instead of discarding it. Restoring old infr
 does not roll back application packages or migrations and is incompatible with enabling
 new image functionality. Never clear or reschedule an already effective evidence-v2 cutoff.
 
+### Enable Decision and image generation
+
+Installations created with this release enable both capabilities in their gateway program.
+The program of an earlier installation lists only `openai-v1` and `anthropic-messages` in
+`supported_profiles`: the publication dialog then blocks image and Decision models, and a
+publication that reaches the publisher fails with `gateway_capability_unavailable` before any
+APIM write. Enable both on the installation's own APIM API with:
+
+```bash
+uv run python -m scripts.deploy enable-capabilities \
+  --subscription <subscription-id> \
+  --parameters .turnstile/main.parameters.json \
+  --state .turnstile/deployments/<resource-group>.json
+```
+
+Run it after the new API and Control-plane packages are running and no model publication is in
+progress. The command:
+
+1. Signs in as the Owner (`--owner-credentials` or a prompt) and reads the approved program.
+   When both capabilities are already present, it changes nothing.
+2. Reads the live API through Azure Resource Manager and requires it to equal the approved
+   program compiled by the current code. Otherwise it stops; wait for the Control-plane to
+   refresh the program after the package rollout and run it again.
+3. Saves a private plan under `<state-name>.upgrades/capabilities-v1/`, prints the profile and
+   operation changes and asks for confirmation (`--yes` skips it).
+4. Submits the upgrade to the Control-plane `cutover_gateway_program` function, which checks it
+   again, adds the Decision operation, recompiles `images-generations` to route published image
+   models, updates the parent policy with ETag preconditions and records the upgrade.
+5. Reports success only after the recorded upgrade is read back through the Owner API.
+
+The upgrade appends `openai-images` and `microsoft-decision` to `supported_profiles`, sets the
+default image capacity and leaves every other program field, operation, route, model,
+credential and subscription unchanged. It does not publish a model, call a provider or
+authorize paid probes. If it is interrupted, run the same command again: it reuses the saved
+plan, reads the current ETags and finishes the remaining writes. Model publications are not
+processed until it completes. Gateways onboarded in the web console with this release are
+already enabled. This command changes only the installation's own APIM API; it does not upgrade
+gateways onboarded in the web console by an earlier release.
+
 ## Verify
 
 1. Confirm the infrastructure deployment succeeded.
 2. Confirm `/health` returns HTTP 200.
 3. Confirm the served frontend asset belongs to the deployed package.
-4. Confirm the migration ledger contains each migration listed in [Testing](testing.md) once, with unchanged checksums for previously applied files.
+4. Confirm the migration ledger. The API container runs `python -m backend.migrate` before it starts and does not start if an applied migration's checksum changed, so `/health` returning HTTP 200 for the deployed package (steps 2 and 3) shows every packaged migration is recorded once with an unchanged checksum. Each migration applied by this deployment prints `applied <version>` in the API's log stream (`az webapp log tail --resource-group <resource-group> --name <api-app>`).
 5. Confirm the bootstrapped Owner can sign in with a password.
 6. Verify managed-identity role assignments at their intended resource scopes.
 7. Complete the real workflow in [E2E Validation](e2e-validation.md).

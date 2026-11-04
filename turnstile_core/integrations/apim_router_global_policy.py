@@ -7,6 +7,287 @@ from .apim_policy_components import parse_policy
 
 ROUTER_GLOBAL_POLICY_MARKER = "turnstileRouterEngineVersion"
 
+# The native path cannot run Fallback nodes; name the node so callers know why it is rejected.
+ROUTER_REJECTION_BODY = r'''@{
+    var message = "";
+    try {
+      var entity = JObject.Parse((string)context.Variables["routerCachedEntityJson"]);
+      var documents = new List<JObject> { JObject.Parse((string)entity["Document"]) };
+      var alternates = (string)entity["AlternateDocuments"];
+      if (!string.IsNullOrEmpty(alternates)) {
+        foreach (var value in JArray.Parse(alternates)) {
+          documents.Add(value is JObject ? (JObject)value : JObject.Parse((string)value));
+        }
+      }
+      foreach (var item in documents) {
+        if ((string)item["gateway_profile_id"] != "__GATEWAY_PROFILE_ID__") { continue; }
+        var nodes = item["definition"]?["nodes"] as JArray;
+        var node = nodes == null ? null : nodes.OfType<JObject>().FirstOrDefault(candidate =>
+          candidate["fallback_on"] is JArray && ((JArray)candidate["fallback_on"]).Count > 0);
+        if (node != null) {
+          var name = (string)node["label"];
+          if (string.IsNullOrWhiteSpace(name)) { name = (string)node["id"]; }
+          message = "Router Fallback node '" + name + "' is not supported by the gateway; "
+            + "remove the Fallback node and publish the Router again";
+          break;
+        }
+      }
+    } catch { }
+    var error = new JObject(new JProperty("code", "router_configuration_unavailable"));
+    if (message != "") { error["message"] = message; }
+    return new JObject(new JProperty("error", error)).ToString(Newtonsoft.Json.Formatting.None);
+  }'''
+
+
+_ROUTER_PERSON_IDENTITY_XML = r"""string rawUserId = context.Request.Headers.GetValueOrDefault(&quot;x-user-id&quot;, &quot;&quot;).Trim();
+                  string callerEmail = &quot;&quot;;
+                  bool hasPersonAuth = false;
+                  var delegHdr = context.Request.Headers.GetValueOrDefault(&quot;x-turnstile-delegation-token&quot;, &quot;&quot;).Trim();
+                  var authHdr = context.Request.Headers.GetValueOrDefault(&quot;Authorization&quot;, &quot;&quot;).Trim();
+                  if (!string.IsNullOrEmpty(delegHdr)) {
+                    hasPersonAuth = true;
+                    string rawTok = delegHdr.StartsWith(&quot;Bearer &quot;, StringComparison.OrdinalIgnoreCase) ? delegHdr.Substring(7).Trim() : delegHdr;
+                    if (rawTok.AsJwt() != null &amp;&amp; !string.IsNullOrEmpty(rawUserId) &amp;&amp; !string.Equals(rawUserId, &quot;unattributed&quot;, StringComparison.OrdinalIgnoreCase)) {
+                      callerEmail = rawUserId.ToLowerInvariant();
+                    }
+                  } else if (authHdr.StartsWith(&quot;Bearer &quot;, StringComparison.OrdinalIgnoreCase)) {
+                    var jwt = authHdr.Substring(7).Trim().AsJwt();
+                    if (jwt != null) {
+                      hasPersonAuth = true;
+                      callerEmail = (jwt.Claims.GetValueOrDefault(&quot;preferred_username&quot;,
+                        jwt.Claims.GetValueOrDefault(&quot;upn&quot;,
+                          jwt.Claims.GetValueOrDefault(&quot;email&quot;, &quot;&quot;))) ?? &quot;&quot;).Trim().ToLowerInvariant();
+                    }
+                  }"""
+
+_ROUTER_FALLBACK_PLAN_XML = r"""var fbEvents = st[&quot;fallback_events&quot;] as JArray ?? new JArray();
+                  bool canFallback = fbEvents.Values&lt;string&gt;().Any(ev =&gt; string.Equals(ev, trigger, StringComparison.OrdinalIgnoreCase) || string.Equals(ev, &quot;error&quot;, StringComparison.OrdinalIgnoreCase));
+                  var triedIds = new HashSet&lt;string&gt;(attempts.OfType&lt;JObject&gt;().Where(a =&gt; (string)a[&quot;attempt_role&quot;] == &quot;candidate&quot;).Select(a =&gt; (string)a[&quot;model_id&quot;] ?? &quot;&quot;), StringComparer.OrdinalIgnoreCase);
+                  var nextCand = canFallback
+                    ? ((JArray)st[&quot;eligible_candidates&quot;]).OfType&lt;JObject&gt;().FirstOrDefault(c =&gt; !triedIds.Contains((string)c[&quot;model_id&quot;] ?? &quot;&quot;))
+                    : null;
+                  if (nextCand != null &amp;&amp; !string.IsNullOrEmpty(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;routerOriginalRequestBody&quot;, &quot;&quot;))) {
+                    st[&quot;selected_candidate&quot;] = nextCand.DeepClone();
+                    st[&quot;decision_basis&quot;] = &quot;fallback_success&quot;;
+                    st[&quot;sticky_bound_by&quot;] = JValue.CreateNull();
+                    st[&quot;sticky_key&quot;] = JValue.CreateNull();
+                    st[&quot;needs_outbound_fallback&quot;] = true;
+                  } else {
+                    st[&quot;needs_outbound_fallback&quot;] = false;
+                  }"""
+
+
+def _router_engine_templates(*, gateway_profile_id: str | None = None) -> tuple[str, str]:
+    native = gateway_profile_id is not None
+    components = {
+        "__ROUTER_PERSON_IDENTITY__": (
+            'string rawUserId = &quot;&quot;; string callerEmail = &quot;&quot;; '
+            'bool hasPersonAuth = false;' if native else _ROUTER_PERSON_IDENTITY_XML
+        ),
+        "__ROUTER_CANDIDATE_TARGET__": (
+            ' if ((string)candDoc[&quot;gateway_profile_id&quot;] != &quot;'
+            + str(gateway_profile_id) + '&quot;) { continue; }' if native else ""
+        ),
+        "__ROUTER_FALLBACK_PLAN__": (
+            'st[&quot;needs_outbound_fallback&quot;] = false;'
+            if native else _ROUTER_FALLBACK_PLAN_XML
+        ),
+    }
+    inbound, outbound = _INBOUND_ROUTER_ENGINE_XML, _OUTBOUND_ROUTER_ENGINE_XML
+    for parameter, component in components.items():
+        inbound = inbound.replace(parameter, component)
+        outbound = outbound.replace(parameter, component)
+    return inbound, outbound
+
+
+def fixed_router_operation_stages(
+  ledger_table_endpoint: str, ledger_table_name: str, api_id: str, gateway_profile_id: str,
+  *, logger_id: str = "__LOGGER_ID__", usage_identity: str = "__ROUTER_USAGE_IDENTITY__",
+) -> tuple[ET.Element, ET.Element]:
+  from copy import deepcopy
+
+  from .apim_budget_execution import pre_dispatch_denial_event
+
+  replacements = {
+    "__LEDGER_TABLE_ENDPOINT__": ledger_table_endpoint.rstrip("/"),
+    "__LEDGER_TABLE_NAME__": ledger_table_name, "__API_ID__": api_id,
+    "__MISS__": "turnstile-router-miss",
+  }
+  inbound_xml, outbound_xml = _router_engine_templates(gateway_profile_id=gateway_profile_id)
+  for name, value in replacements.items():
+    inbound_xml = inbound_xml.replace(name, value)
+    outbound_xml = outbound_xml.replace(name, value)
+  inbound_root = ET.fromstring(inbound_xml)
+  branch = next(node for node in inbound_root.iter("when")
+          if node.find("set-variable[@name='routerRequestedModel']") is not None)
+  inbound = ET.Element("choose")
+  branch = deepcopy(branch)
+  branch.set("condition", '@(context.Operation.Id == "chat-completions" && '
+         'context.Request.Method == "POST" && '
+         '!context.Request.Headers.ContainsKey("x-turnstile-router-subrequest"))')
+  inbound.append(branch)
+  for owner in branch.iter():
+    for node in list(owner):
+      if node.tag in {"cache-lookup-value", "cache-store-value"}:
+        owner.remove(node)
+  matched = next(node for node in branch.iter("when") if node.get("condition") ==
+           '@((bool)context.Variables["routerMatched"])')
+  for node in list(matched):
+    if node.find(".//send-request[@response-variable-name='routerAnthropicHttp']") is not None:
+      matched.remove(node)
+  guard = ET.Element("choose")
+  denied = ET.SubElement(guard, "when", {"condition": '@(context.Subscription == null || '
+    'string.IsNullOrEmpty(context.Request.Headers.GetValueOrDefault('
+    '"Ocp-Apim-Subscription-Key", "")) || '
+    '!string.IsNullOrEmpty(context.Request.Headers.GetValueOrDefault("Authorization", "")) || '
+    '!string.IsNullOrEmpty(context.Request.Headers.GetValueOrDefault('
+    '"x-turnstile-delegation-token", "")))'})
+  response = ET.SubElement(denied, "return-response")
+  ET.SubElement(response, "set-status", {"code": "403", "reason": "Forbidden"})
+  ET.SubElement(response, "set-body").text = (
+    '{"error":{"code":"router_subscription_auth_required"}}'
+  )
+  matched.insert(0, guard)
+  valid = ET.Element("set-variable", {"name": "routerNativeDocumentReady", "value": r'''@{
+    try {
+      var entity = JObject.Parse((string)context.Variables["routerCachedEntityJson"]);
+      var document = (string)entity["Document"];
+      if ((int?)entity["SchemaVersion"] != 2 || (string)entity["Status"] != "published"
+        || (string)entity["PartitionKey"] != "model-router|v1"
+        || (string)entity["RowKey"] != (string)context.Variables["routerLookupRowKey"]
+        || string.IsNullOrEmpty(document) || Encoding.UTF8.GetByteCount(document) > 65536) { return false; }
+      using (var sha = System.Security.Cryptography.SHA256.Create()) {
+        var digest = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(document)))
+          .Replace("-", "").ToLowerInvariant();
+        if (digest != (string)entity["Sha256"]) { return false; }
+      }
+      var documents = new List<JObject> { JObject.Parse(document) };
+      var alternates = (string)entity["AlternateDocuments"];
+      if (!string.IsNullOrEmpty(alternates)) {
+        foreach (var value in JArray.Parse(alternates)) {
+          documents.Add(value is JObject ? (JObject)value : JObject.Parse((string)value));
+        }
+      }
+      var found = false;
+      foreach (var item in documents) {
+        if ((string)item["gateway_profile_id"] != "__GATEWAY_PROFILE_ID__") { continue; }
+        found = true;
+        if ((string)item["status"] != "published" || (int?)item["router_version"] < 1
+          || (string)item["gateway_profile_id"] != "__GATEWAY_PROFILE_ID__") { return false; }
+        var nodes = item["definition"]?["nodes"] as JArray;
+        if (nodes == null || nodes.OfType<JObject>().Any(node =>
+          node["fallback_on"] is JArray && ((JArray)node["fallback_on"]).Count > 0)) { return false; }
+        foreach (var candidate in ((JObject)item["candidates_by_id"]).Properties()) {
+          if ((string)candidate.Value["profile"] != "openai-v1") { return false; }
+        }
+        foreach (var model in ((JObject)item["routing_models_by_id"]).Properties()) {
+          if (!new[] { "chat_json", "system_one" }.Contains((string)model.Value["decision_protocol"])
+            || (string)model.Value["auth_mode"] != "gateway_route") { return false; }
+        }
+      }
+            return found;
+    } catch { return false; }
+  }'''.replace("__GATEWAY_PROFILE_ID__", gateway_profile_id)})
+  matched.insert(1, valid)
+  invalid = ET.Element("choose")
+  rejected = ET.SubElement(invalid, "when", {
+    "condition": '@(!(bool)context.Variables["routerNativeDocumentReady"])',
+  })
+  ET.SubElement(rejected, "set-variable", {
+    "name": "telemetryUsageId", "value": usage_identity,
+  })
+  rejected.append(pre_dispatch_denial_event("503", {
+    "ingest_error": '"router_pre_dispatch_denial"',
+    "model_admission": '"router_configuration_unavailable"',
+    "error_message": '"router_configuration_unavailable"',
+    "request_id": '(string)context.Variables["routerCallerRequestId"]',
+    "model": '(string)context.Variables["routerRequestedModel"]',
+    "native_gateway_instance_id": (
+      'known ? (string.IsNullOrWhiteSpace(context.Deployment.Gateway.InstanceId) '
+      '? context.Deployment.Gateway.Id : context.Deployment.Gateway.InstanceId) : null'
+    ),
+    "apim_subscription_id": '(context.Subscription?.Id ?? "").Split(\'/\').Last()',
+  }, logger_id=logger_id, gateway_profile_id=gateway_profile_id, request_source=(
+    'context.Variables.GetValueOrDefault<string>("telemetryRequestSource", '
+    'context.Request.Headers.GetValueOrDefault("x-request-source", "unattributed"))'
+  )))
+  response = ET.SubElement(rejected, "return-response")
+  ET.SubElement(response, "set-status", {"code": "503", "reason": "Service Unavailable"})
+  ET.SubElement(response, "set-body").text = ROUTER_REJECTION_BODY.replace(
+    "__GATEWAY_PROFILE_ID__", gateway_profile_id,
+  )
+  matched.insert(2, invalid)
+  decision = branch.find(".//send-request[@response-variable-name='routerDecisionHttp']")
+  assert decision is not None
+  destination = decision.find("set-url")
+  assert destination is not None
+  destination.text = '''@{
+    var st = JObject.Parse((string)context.Variables["routerPlanState"]);
+    var routingModel = ((JObject)st["routing_models_by_id"])[(string)st["routing_model_id"] ?? ""] as JObject;
+    return "https://" + context.Request.OriginalUrl.Host + "/" + context.Api.Path.Trim('/')
+      + ((string)routingModel?["decision_protocol"] == "system_one"
+        ? "/providers/microsoft/v1/systemone" : "/chat/completions");
+  }'''
+  payload = decision.find("set-body")
+  assert payload is not None and payload.text is not None
+  system_one_model = 'new JProperty("model", upstreamModel),'
+  if payload.text.count(system_one_model) != 1:
+    raise ValueError("Fixed Router System One payload changed")
+  payload.text = payload.text.replace(
+    system_one_model, 'new JProperty("model", (string)rmInfo?["apim_alias"] ?? upstreamModel),',
+  )
+  for node in list(decision):
+    if node.tag == "authentication-managed-identity":
+      decision.remove(node)
+  header = ET.Element("set-header", {
+    "name": "Ocp-Apim-Subscription-Key", "exists-action": "override",
+  })
+  ET.SubElement(header, "value").text = (
+    '@(context.Request.Headers.GetValueOrDefault("Ocp-Apim-Subscription-Key", ""))'
+  )
+  decision.insert(2, header)
+  outbound = ET.fromstring(outbound_xml)
+  failed = next(node for node in outbound.iter("when")
+          if node.get("condition") == "@(context.Response.StatusCode >= 400)")
+  attempt = failed.find("set-variable[@name='routerPlanState']")
+  assert attempt is not None
+  for node in list(failed):
+    if node is not attempt:
+      failed.remove(node)
+  trace = outbound.find(".//send-request[@response-variable-name='routerOutboundTraceWrite']/set-body")
+  assert trace is not None
+  trace.text = '''@{
+    var comp = JObject.Parse((string)context.Variables["routerOutboundCompleted"]);
+    var trace = (JObject)comp["trace"];
+    trace["native_usage_recorded"] = true;
+    return new JObject(
+      new JProperty("PartitionKey", "model-router-trace|v1"),
+      new JProperty("RowKey", (string)context.Variables["routerCallerRequestId"]),
+      new JProperty("SchemaVersion", 2),
+      new JProperty("Document", trace.ToString(Newtonsoft.Json.Formatting.None))
+    ).ToString(Newtonsoft.Json.Formatting.None);
+  }'''
+  requests = {node.get("response-variable-name") for node in inbound.iter("send-request")}
+  if requests != {"routerLookupRead", "routerStickyTableResp", "routerDecisionHttp"}:
+    raise ValueError("Fixed Router contains an unsupported request path")
+  parents = {child: owner for owner in inbound.iter() for child in owner}
+  for rejected in list(inbound.iter("return-response")):
+    correlation = ET.Element("set-header", {"name": "x-request-id", "exists-action": "override"})
+    ET.SubElement(correlation, "value").text = (
+      '@(context.Variables.GetValueOrDefault<string>("routerCallerRequestId", '
+      'context.RequestId.ToString()))'
+    )
+    rejected.insert(1, correlation)
+    diagnostic = ET.Element("trace", {"source": "turnstile-native-router", "severity": "error"})
+    ET.SubElement(diagnostic, "message").text = (
+      '@("Native Router rejected request_id=" + '
+      'context.Variables.GetValueOrDefault<string>("routerCallerRequestId", '
+      'context.RequestId.ToString()))'
+    )
+    owner = parents[rejected]
+    owner.insert(list(owner).index(rejected), diagnostic)
+  return inbound, outbound
+
 
 def build_router_global_service_policy(
     base_service_policy_xml: str,
@@ -23,8 +304,7 @@ def build_router_global_service_policy(
         "__LEDGER_TABLE_NAME__": ledger_table_name,
         "__API_ID__": api_id,
     }
-    inbound_xml = _INBOUND_ROUTER_ENGINE_XML
-    outbound_xml = _OUTBOUND_ROUTER_ENGINE_XML
+    inbound_xml, outbound_xml = _router_engine_templates()
     for key, val in replacements.items():
         inbound_xml = inbound_xml.replace(key, val)
         outbound_xml = outbound_xml.replace(key, val)
@@ -516,6 +796,7 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                   string prevAssistantPrompt = &quot;&quot;;
                   string pendingAssistantText = &quot;&quot;;
                   string lastNonSystemRole = &quot;&quot;;
+                  bool lastIsToolContinuation = false;
                   int userMsgCount = 0;
                   bool hasToolMsgs = false;
                   bool hasUserRequestTag = false;
@@ -603,6 +884,11 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                     if (!string.IsNullOrEmpty(role)) {
                       lastNonSystemRole = role;
                     }
+                    string itemType = ((string)mObj[&quot;type&quot;] ?? &quot;&quot;).Trim().ToLowerInvariant();
+                    var itemBlocks = mObj[&quot;content&quot;] as JArray;
+                    lastIsToolContinuation = itemType == &quot;function_call_output&quot; || itemType == &quot;function_call&quot;
+                      || (role == &quot;user&quot; &amp;&amp; itemBlocks != null &amp;&amp; itemBlocks.Count &gt; 0
+                        &amp;&amp; itemBlocks.All(block =&gt; block is JObject &amp;&amp; (string)block[&quot;type&quot;] == &quot;tool_result&quot;));
                     if (role == &quot;tool&quot; || role == &quot;assistant&quot;) {
                       hasToolMsgs = true;
                     }
@@ -721,26 +1007,7 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                     context.Request.Headers.GetValueOrDefault(&quot;x-conversation-id&quot;,
                       context.Request.Headers.GetValueOrDefault(&quot;x-copilot-interaction-id&quot;, (string)rCtx[&quot;interaction_id&quot;] ?? &quot;&quot;))).Trim();
                   string sessionId = context.Request.Headers.GetValueOrDefault(&quot;x-session-id&quot;, (string)rCtx[&quot;session_id&quot;] ?? &quot;&quot;).Trim();
-                  string rawUserId = context.Request.Headers.GetValueOrDefault(&quot;x-user-id&quot;, &quot;&quot;).Trim();
-                  string callerEmail = &quot;&quot;;
-                  bool hasPersonAuth = false;
-                  var delegHdr = context.Request.Headers.GetValueOrDefault(&quot;x-turnstile-delegation-token&quot;, &quot;&quot;).Trim();
-                  var authHdr = context.Request.Headers.GetValueOrDefault(&quot;Authorization&quot;, &quot;&quot;).Trim();
-                  if (!string.IsNullOrEmpty(delegHdr)) {
-                    hasPersonAuth = true;
-                    string rawTok = delegHdr.StartsWith(&quot;Bearer &quot;, StringComparison.OrdinalIgnoreCase) ? delegHdr.Substring(7).Trim() : delegHdr;
-                    if (rawTok.AsJwt() != null &amp;&amp; !string.IsNullOrEmpty(rawUserId) &amp;&amp; !string.Equals(rawUserId, &quot;unattributed&quot;, StringComparison.OrdinalIgnoreCase)) {
-                      callerEmail = rawUserId.ToLowerInvariant();
-                    }
-                  } else if (authHdr.StartsWith(&quot;Bearer &quot;, StringComparison.OrdinalIgnoreCase)) {
-                    var jwt = authHdr.Substring(7).Trim().AsJwt();
-                    if (jwt != null) {
-                      hasPersonAuth = true;
-                      callerEmail = (jwt.Claims.GetValueOrDefault(&quot;preferred_username&quot;,
-                        jwt.Claims.GetValueOrDefault(&quot;upn&quot;,
-                          jwt.Claims.GetValueOrDefault(&quot;email&quot;, &quot;&quot;))) ?? &quot;&quot;).Trim().ToLowerInvariant();
-                    }
-                  }
+                  __ROUTER_PERSON_IDENTITY__
                   string rawSubId = context.Subscription != null ? (context.Subscription.Id ?? &quot;&quot;) : &quot;&quot;;
                   int subSlash = rawSubId.LastIndexOf('/');
                   string subKeyId = (subSlash &gt;= 0 ? rawSubId.Substring(subSlash + 1) : rawSubId).Trim().ToLowerInvariant();
@@ -759,7 +1026,7 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                     } catch {}
                   }
                   JObject authorizedDoc = null;
-                  foreach (var candDoc in candidateRouterDocs) {
+                  foreach (var candDoc in candidateRouterDocs) {__ROUTER_CANDIDATE_TARGET__
                     if (hasPersonAuth) {
                       if (string.IsNullOrEmpty(callerEmail)) { continue; }
                       var assignedArr = candDoc[&quot;assigned_user_ids&quot;] as JArray;
@@ -1063,6 +1330,7 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                     new JProperty(&quot;lookup_keys&quot;, lookupKeys),
                     new JProperty(&quot;save_keys&quot;, saveKeys),
                     new JProperty(&quot;is_new_user_turn&quot;, initiator != &quot;agent&quot; &amp;&amp; lastNonSystemRole == &quot;user&quot; &amp;&amp; userMsgCount &gt; 1 &amp;&amp; !string.Equals(lastUserPrompt, prevUserPrompt, StringComparison.Ordinal)),
+                    new JProperty(&quot;is_user_turn&quot;, initiator != &quot;agent&quot; &amp;&amp; lastNonSystemRole == &quot;user&quot; &amp;&amp; !lastIsToolContinuation),
                     new JProperty(&quot;selected_candidate&quot;, defaultSelected != null ? (JToken)defaultSelected : JValue.CreateNull()),
                     new JProperty(&quot;decision_basis&quot;, defaultBasis),
                     new JProperty(&quot;sticky_hit&quot;, false),
@@ -1141,7 +1409,7 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                           var boundCand = (JObject)(boundElig ?? candsById[mid]).DeepClone();
                           double bCost = ((double?)boundCand[&quot;input_cost_per_million&quot;] ?? 0.0) + ((double?)boundCand[&quot;output_cost_per_million&quot;] ?? 0.0);
                           bool isNewTurn = (bool?)st[&quot;is_new_user_turn&quot;] ?? false;
-                          if (isNewTurn &amp;&amp; boundElig == null &amp;&amp; elig.Count &gt; 0) {
+                          if (((bool?)st[&quot;is_user_turn&quot;] ?? false) &amp;&amp; boundElig == null &amp;&amp; elig.Count &gt; 0) {
                             bool higherBranch = elig.OfType&lt;JObject&gt;().Any(x =&gt; (((double?)x[&quot;input_cost_per_million&quot;] ?? 0.0) + ((double?)x[&quot;output_cost_per_million&quot;] ?? 0.0)) &gt; bCost);
                             if (higherBranch) {
                               break;
@@ -1282,7 +1550,7 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                           sysPrompt = "You are Turnstile's model routing classifier. Select the single best model from the candidate catalog for the user's request based on each candidate's description and unit cost.\n\nCandidate catalog:\n" + catalogJson + "\n\n" + jsonShapeNote;
                         } else {
                           sysPrompt = instructions.Contains("{catalog}") ? instructions.Replace("{catalog}", catalogJson) : (instructions + "\n\nCandidate catalog:\n" + catalogJson);
-                          if (!sysPrompt.Contains("model_id")) {
+                          if (!sysPrompt.Contains("model_id") || instructions.IndexOf("json", StringComparison.OrdinalIgnoreCase) &lt; 0) {
                             sysPrompt = sysPrompt + "\n\n" + jsonShapeNote;
                           }
                         }
@@ -1975,7 +2243,10 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                           <value>@((string)JObject.Parse((string)context.Variables["routerPlanState"])["router_id"])</value>
                         </set-header>
                         <set-header name="x-router-name" exists-action="override">
-                          <value>@((string)JObject.Parse((string)context.Variables["routerPlanState"])["router_name"])</value>
+                          <value>@{
+                            var routerName = (string)JObject.Parse((string)context.Variables["routerPlanState"])["router_name"];
+                            return routerName.Any(character =&gt; character &gt; 127) ? Uri.EscapeDataString(routerName) : routerName;
+                          }</value>
                         </set-header>
                         <set-body>@((string)JObject.Parse((string)context.Variables["routerPlanState"])["anthropic_error_body"])</set-body>
                       </return-response>
@@ -2240,6 +2511,7 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                           new JProperty(&quot;sse_body&quot;, sseBody),
                           new JProperty(&quot;response&quot;, chatResp),
                           new JProperty(&quot;model_name&quot;, (string)sel[&quot;display_name&quot;]),
+                          new JProperty(&quot;model_alias&quot;, (string)sel[&quot;apim_alias&quot;]),
                           new JProperty(&quot;router_id&quot;, (string)st[&quot;router_id&quot;]),
                           new JProperty(&quot;router_name&quot;, (string)st[&quot;router_name&quot;]),
                           new JProperty(&quot;decision_basis&quot;, (string)st[&quot;decision_basis&quot;]),
@@ -2377,13 +2649,16 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                           <value>@((string)context.Variables["routerCallerRequestId"])</value>
                         </set-header>
                         <set-header name="x-routed-model" exists-action="override">
-                          <value>@((string)JObject.Parse((string)context.Variables["routerAnthropicCompleted"])["model_name"])</value>
+                          <value>@((string)JObject.Parse((string)context.Variables["routerAnthropicCompleted"])["model_alias"])</value>
                         </set-header>
                         <set-header name="x-router-id" exists-action="override">
                           <value>@((string)JObject.Parse((string)context.Variables["routerAnthropicCompleted"])["router_id"])</value>
                         </set-header>
                         <set-header name="x-router-name" exists-action="override">
-                          <value>@((string)JObject.Parse((string)context.Variables["routerAnthropicCompleted"])["router_name"])</value>
+                          <value>@{
+                            var routerName = (string)JObject.Parse((string)context.Variables["routerAnthropicCompleted"])["router_name"];
+                            return routerName.Any(character =&gt; character &gt; 127) ? Uri.EscapeDataString(routerName) : routerName;
+                          }</value>
                         </set-header>
                         <set-header name="x-router-reason" exists-action="override">
                           <value>@((string)JObject.Parse((string)context.Variables["routerAnthropicCompleted"])["decision_basis"])</value>
@@ -2487,21 +2762,7 @@ _OUTBOUND_ROUTER_ENGINE_XML = r"""<outbound>
                     new JProperty(&quot;attempt_role&quot;, &quot;candidate&quot;),
                     new JProperty(&quot;condition_evaluations&quot;, seq == 1 ? condEvals : new JArray())
                   ));
-                  var fbEvents = st[&quot;fallback_events&quot;] as JArray ?? new JArray();
-                  bool canFallback = fbEvents.Values&lt;string&gt;().Any(ev =&gt; string.Equals(ev, trigger, StringComparison.OrdinalIgnoreCase) || string.Equals(ev, &quot;error&quot;, StringComparison.OrdinalIgnoreCase));
-                  var triedIds = new HashSet&lt;string&gt;(attempts.OfType&lt;JObject&gt;().Where(a =&gt; (string)a[&quot;attempt_role&quot;] == &quot;candidate&quot;).Select(a =&gt; (string)a[&quot;model_id&quot;] ?? &quot;&quot;), StringComparer.OrdinalIgnoreCase);
-                  var nextCand = canFallback
-                    ? ((JArray)st[&quot;eligible_candidates&quot;]).OfType&lt;JObject&gt;().FirstOrDefault(c =&gt; !triedIds.Contains((string)c[&quot;model_id&quot;] ?? &quot;&quot;))
-                    : null;
-                  if (nextCand != null &amp;&amp; !string.IsNullOrEmpty(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;routerOriginalRequestBody&quot;, &quot;&quot;))) {
-                    st[&quot;selected_candidate&quot;] = nextCand.DeepClone();
-                    st[&quot;decision_basis&quot;] = &quot;fallback_success&quot;;
-                    st[&quot;sticky_bound_by&quot;] = JValue.CreateNull();
-                    st[&quot;sticky_key&quot;] = JValue.CreateNull();
-                    st[&quot;needs_outbound_fallback&quot;] = true;
-                  } else {
-                    st[&quot;needs_outbound_fallback&quot;] = false;
-                  }
+                  __ROUTER_FALLBACK_PLAN__
                   return st.ToString(Newtonsoft.Json.Formatting.None);
                 } catch {
                   return (string)context.Variables[&quot;routerPlanState&quot;];
@@ -3063,6 +3324,7 @@ _OUTBOUND_ROUTER_ENGINE_XML = r"""<outbound>
                 new JProperty(&quot;has_json_body&quot;, hasJsonBody),
                 new JProperty(&quot;body&quot;, hasJsonBody ? (JToken)rBody : JValue.CreateNull()),
                 new JProperty(&quot;model_name&quot;, (string)sel[&quot;display_name&quot;]),
+                new JProperty(&quot;model_alias&quot;, (string)sel[&quot;apim_alias&quot;]),
                 new JProperty(&quot;router_id&quot;, (string)st[&quot;router_id&quot;]),
                 new JProperty(&quot;router_name&quot;, (string)st[&quot;router_name&quot;]),
                 new JProperty(&quot;decision_basis&quot;, (string)st[&quot;decision_basis&quot;]),
@@ -3079,13 +3341,16 @@ _OUTBOUND_ROUTER_ENGINE_XML = r"""<outbound>
                 <value>@((string)context.Variables["routerCallerRequestId"])</value>
               </set-header>
               <set-header name="x-routed-model" exists-action="override">
-                <value>@((string)JObject.Parse((string)context.Variables["routerOutboundCompleted"])["model_name"])</value>
+                <value>@((string)JObject.Parse((string)context.Variables["routerOutboundCompleted"])["model_alias"])</value>
               </set-header>
               <set-header name="x-router-id" exists-action="override">
                 <value>@((string)JObject.Parse((string)context.Variables["routerOutboundCompleted"])["router_id"])</value>
               </set-header>
               <set-header name="x-router-name" exists-action="override">
-                <value>@((string)JObject.Parse((string)context.Variables["routerOutboundCompleted"])["router_name"])</value>
+                <value>@{
+                  var routerName = (string)JObject.Parse((string)context.Variables["routerOutboundCompleted"])["router_name"];
+                  return routerName.Any(character =&gt; character &gt; 127) ? Uri.EscapeDataString(routerName) : routerName;
+                }</value>
               </set-header>
               <set-header name="x-router-reason" exists-action="override">
                 <value>@((string)JObject.Parse((string)context.Variables["routerOutboundCompleted"])["decision_basis"])</value>
@@ -3231,9 +3496,9 @@ _OUTBOUND_ROUTER_ENGINE_XML = r"""<outbound>
           </choose>
         </when>
         <otherwise>
-          <!-- Direct Model Call (non-router) on /chat/completions: attach turnstile_routing and x-routed-model for uniform client contract -->
+          <!-- Direct Model Call (non-router) on /chat/completions: uniform client headers on every successful response, including streams; turnstile_routing only for JSON bodies -->
           <choose>
-            <when condition="@(context.Response.StatusCode &lt; 400 &amp;&amp; (context.Subscription == null || !context.Subscription.Id.EndsWith(&quot;-publisher-probe&quot;, StringComparison.OrdinalIgnoreCase)) &amp;&amp; context.Operation.Id == &quot;chat-completions&quot; &amp;&amp; context.Response.Headers.GetValueOrDefault(&quot;Content-Type&quot;, &quot;&quot;).StartsWith(&quot;application/json&quot;, StringComparison.OrdinalIgnoreCase))">
+            <when condition="@(context.Response.StatusCode &lt; 400 &amp;&amp; (context.Subscription == null || !context.Subscription.Id.EndsWith(&quot;-publisher-probe&quot;, StringComparison.OrdinalIgnoreCase)) &amp;&amp; context.Operation.Id == &quot;chat-completions&quot;)">
               <set-header name="x-request-id" exists-action="override">
                 <value>@(context.Variables.GetValueOrDefault&lt;string&gt;("routerCallerRequestId", context.RequestId.ToString()))</value>
               </set-header>
@@ -3246,6 +3511,10 @@ _OUTBOUND_ROUTER_ENGINE_XML = r"""<outbound>
               <set-header name="x-apim-subscription-id" exists-action="override">
                 <value>@(context.Subscription != null ? context.Subscription.Id : "")</value>
               </set-header>
+            </when>
+          </choose>
+          <choose>
+            <when condition="@(context.Response.StatusCode &lt; 400 &amp;&amp; (context.Subscription == null || !context.Subscription.Id.EndsWith(&quot;-publisher-probe&quot;, StringComparison.OrdinalIgnoreCase)) &amp;&amp; context.Operation.Id == &quot;chat-completions&quot; &amp;&amp; context.Response.Headers.GetValueOrDefault(&quot;Content-Type&quot;, &quot;&quot;).StartsWith(&quot;application/json&quot;, StringComparison.OrdinalIgnoreCase))">
               <set-body>@{
                 try {
                   var rBody = context.Response.Body.As&lt;JObject&gt;(preserveContent: true);

@@ -13,7 +13,7 @@
 <p align="center"><strong>Governed AI access, spend, and operations through one self-hosted control plane.</strong></p>
 
 <p align="center">
-   <a href="https://github.com/xuleihive/turnstile/releases/tag/v1.3"><img alt="Turnstile release v1.3" src="https://img.shields.io/badge/release-v1.3-2f6fdd.svg"></a>
+   <a href="https://github.com/xuleihive/turnstile/releases/tag/v1.4"><img alt="Turnstile release v1.4" src="https://img.shields.io/badge/release-v1.4-2f6fdd.svg"></a>
    <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2f6fdd.svg"></a>
    <a href="#prerequisites"><img alt="Python 3.11 or newer" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&amp;logoColor=white"></a>
    <a href="#prerequisites"><img alt="Node.js 20.19.x or 22.12 and newer" src="https://img.shields.io/badge/Node.js-20.19.x%20%7C%2022.12%2B-339933?logo=node.js&amp;logoColor=white"></a>
@@ -32,7 +32,7 @@
 Turnstile is a self-hosted control plane for governed AI model access. It combines an Azure API Management gateway, token and cost telemetry, budgets, application access, model onboarding, release controls, and an operational web console.
 
 > [!NOTE]
-> **Turnstile v1.3** is the current public release. This release adds intelligent model routing and expands backend-pool operations, request diagnostics, and installation recovery. Review migrations, infrastructure requirements, and provider compatibility before upgrading a production deployment.
+> **Turnstile v1.4** is the current public release. Version history and release details are maintained on the [website](https://turn-stile.com/docs) and in [GitHub Releases](https://github.com/xuleihive/turnstile/releases/tag/v1.4).
 
 > [!IMPORTANT]
 > The included infrastructure templates deploy only the Turnstile platform. They do not create an Azure AI Foundry project, deploy provider models, or preload customer connections and models. Operators connect their own Foundry or compatible provider resources after the platform is running.
@@ -61,22 +61,6 @@ Turnstile is a self-hosted control plane for governed AI model access. It combin
 
 > [!WARNING]
 > The GitHub data source and GitHub Copilot integration are still under active development and are not production-ready. Enable them with care, and independently verify usage, cost, and governance data before relying on it for operational or financial decisions. If you only need FinOps for GitHub Copilot, see [OctoFinance](https://github.com/satomic/OctoFinance).
-
-## What's New in v1.3
-
-- **Model Intelligent Router:** a visual canvas and configuration editor for conditional routing,
-   priority and weighted strategies, model-based decisions, and fallback. Versioned publication,
-   per-person router assignments, and decision/attempt Trace records keep routing and access explicit.
-- **Backend-pool operations:** independent pool creation, member compatibility checks, priority,
-   weighting, session affinity, and resilience settings. Background publication can continue after
-   leaving the form, with progress recovery and client integration samples in the detail view.
-- **Usage and request diagnostics:** native APIM client routing, concrete Runtime attribution,
-   per-attempt diagnostics, and expanded Chat, Responses, and Anthropic streaming-usage handling.
-   Missing or incomplete usage remains distinguishable from measured zero.
-- **Installation and recovery:** initial fixed-program installation and registration, scoped
-   Publisher dependency preparation, private outbound networking for newly provisioned StandardV2
-   APIM, and checkpointed installation recovery. Startup checks require both API health and the
-   expected frontend version within the existing startup deadline.
 
 Existing capabilities include catalog and manual model pricing, connection/model discounts,
 regional and context-tier prices, historical price snapshots, versioned model availability,
@@ -118,6 +102,7 @@ docs/             Maintainer and operator documentation
 - Node.js 20.19.x or 22.12+ and npm
 - PostgreSQL 16+
 - Azure CLI with Bicep for Azure deployment
+- For Azure deployment, outbound HTTPS from the deployment workstation to Azure, PyPI, and the npm registry (packaging downloads Linux Python wheels and frontend packages); set `HTTPS_PROXY` if a proxy is required
 - An Azure subscription where you can create the platform resources
 - Optional: a multi-tenant Microsoft Entra SPA registration
 - Optional after deployment: an existing Azure AI Foundry project or another supported provider
@@ -192,10 +177,10 @@ In-memory repositories are used only for isolated unit tests. Integration and en
 
 The Bicep templates create Turnstile platform resources such as PostgreSQL, Event Hubs, Storage, Key Vault, Application Insights, Web App, Functions, and APIM integration. The deployment does not create an Azure AI Foundry project or provider model deployment.
 
-For **Turnstile v1.3**, choose the matching deployment path:
+For **Turnstile v1.4**, choose the matching deployment path:
 
-- **Upgrading an existing installation:** review the [infrastructure and protocol upgrade requirements](docs/deployment.md#prepare-for-v12). Keep the original state, database, ledger, APIM, identities and history; apply pending migrations and the required infrastructure changes as well as the application packages.
-- **Installing from zero:** follow the [fresh-install guide](docs/deployment.md#deploy-v11-from-zero). Use a unique prefix and new state; a new StandardV2 APIM is the default. Provider models and credentials must already be available separately.
+- **Upgrading an existing installation:** review the [infrastructure and protocol upgrade requirements](docs/deployment.md#prepare-for-v14). Keep the original state, database, ledger, APIM, identities and history; apply pending migrations and the required infrastructure changes as well as the application packages.
+- **Installing from zero:** follow the step-by-step [website deployment guide](https://turn-stile.com/docs/deployment) (repository reference: [fresh-install guide](docs/deployment.md#deploy-v11-from-zero)). Use a unique prefix and new state; a new StandardV2 APIM is the default. Provider models and credentials must already be available separately.
 
 StandardV2 does not support self-hosted gateways. That optional feature requires a compatible
 Developer or classic Premium APIM instance and its matching network configuration. Developer is
@@ -211,6 +196,8 @@ mkdir -p .turnstile
 cp infra/main.parameters.example.json .turnstile/main.parameters.json
 ```
 
+Also add `"gatewayApplicationProvisioningEnabled": { "value": true }` to `parameters` if Turnstile will create Application subscriptions. The example omits it and the template default is `false`: **Add subscription** then returns “Application subscription provisioning is not enabled in this environment.” Set it before the first deployment: rerunning a completed installation does not apply a later change, and there is currently no verified way to change it afterwards. The deploy command sets `provisionControlPlane`, `controlPlaneEnabled`, `gatewayReleaseWorkerEnabled`, and `gatewayApplicationKeyManagementEnabled` itself; the `false` values in the example are not applied.
+
 2. Sign in to Azure, select a subscription, and run the repository deployment command:
 
 ```bash
@@ -221,7 +208,7 @@ uv run python -m scripts.deploy deploy \
    --parameters .turnstile/main.parameters.json
 ```
 
-The command prompts for the initial Owner password, runs a subscription-scope what-if, and requires the exact confirmation `deploy`. It stops on any Delete change. It then provisions the platform and observer, builds immutable Linux x86-64 packages, deploys the API and Functions, installs the initial fixed routing program, and enables workers after their dependencies exist. Completion checks include the expected frontend version, Function indexing, password Owner login, and the initial model-publication baseline. These startup checks do not replace provider, routing, or financial acceptance tests in your environment. Generated secrets are stored only in `.turnstile/deployments/<resource-group>.json` with mode `0600`; back up that ignored file in an approved secret store.
+The command prompts for the initial Owner password, runs a subscription-scope what-if, and requires the exact confirmation `deploy`. It stops on any Delete change. The what-if prints the count per change type (for example `What-if: Create=130, Unsupported=9` for a new installation) followed by one line per changed resource; `Unsupported` entries are role assignments for managed identities created by the same deployment. The template also assigns `API Management Service Contributor` to the API and Control-plane managed identities at subscription scope. It then provisions the platform and observer, builds immutable Linux x86-64 packages, deploys the API and Functions, installs the initial fixed routing program, and enables workers after their dependencies exist. Completion checks include the expected frontend version, Function indexing, password Owner login, and the initial model-publication baseline. These startup checks do not replace provider, routing, or financial acceptance tests in your environment. Generated secrets are stored only in `.turnstile/deployments/<resource-group>.json` with mode `0600`; back up that ignored file in an approved secret store.
 
 For automation, copy `infra/owner.credentials.example.json` to `.turnstile/owner.credentials.json`, set the same email as `bootstrapOwnerEmail`, choose the password, run `chmod 600` on the file, and add `--owner-credentials .turnstile/owner.credentials.json`. Plaintext never enters Bicep or deployment state; only its scrypt hash is deployed.
 
@@ -245,7 +232,7 @@ Turnstile never creates or modifies the customer Foundry project. The Azure user
 - No prompt or completion content is persisted in telemetry.
 - Credentials are encrypted before database storage.
 - Azure-hosted components use managed identity where supported.
-- APIM roles are scoped to the smallest practical resource and action set.
+- APIM roles are scoped to the smallest practical resource and action set, except `API Management Service Contributor`, which the API and Control-plane managed identities receive at subscription scope.
 - Secret-bearing responses use `Cache-Control: no-store` and are never query-cached.
 - Production cookies set the `HttpOnly` and `Secure` attributes and are role-bound.
 - Local and generated configuration is excluded by `.gitignore`.
@@ -261,7 +248,7 @@ Review [Security](docs/security.md) before deployment.
 
 ## Troubleshooting
 
-See [Troubleshooting](docs/troubleshooting.md) for startup, authentication, database, APIM, observer, and telemetry diagnostics. Deployment failures are resumable: correct the reported cause and rerun the same `scripts.deploy deploy` command with the original private state file.
+See [Troubleshooting](docs/troubleshooting.md) for startup, authentication, database, APIM, observer, and telemetry diagnostics. Deployment failures are resumable: correct the reported cause and rerun the same `scripts.deploy deploy` command with the original private state file. For Azure CLI steps whose output it captures, such as what-if and template deployments, the command does not print the Azure CLI error output: if a step fails with only `Command '[az, …]' returned non-zero exit status 1`, check Azure CLI and Bicep directly (for example `az bicep build --file infra/main.bicep`) and the workstation proxy settings before rerunning. If the final readiness check fails with `The read operation timed out`, rerun the same command; the rerun rebuilds and redeploys every package.
 
 ## Documentation
 

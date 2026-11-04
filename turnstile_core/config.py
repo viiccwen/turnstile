@@ -25,7 +25,7 @@ from .domain.budget_counting import (
     ProtocolRequestPolicy,
 )
 from .domain.budget_delegation import BudgetDelegationTarget, BudgetDelegationTrust
-from .domain.image_profiles import ImageGenerationLimits
+from .domain.image_profiles import DEFAULT_IMAGE_GENERATION_LIMITS, ImageGenerationLimits
 
 
 class ApimUsageObserverConfig(BaseModel):
@@ -89,12 +89,7 @@ class Settings(BaseSettings):
     management_api_key: SecretStr | None = None
     production: bool = False
     image_generation_defaults: ImageGenerationLimits = Field(
-        default_factory=lambda: ImageGenerationLimits(
-            max_request_bytes=24576,
-            max_response_bytes=16777216,
-            output_reservation_tokens=8192,
-            timeout_seconds=180,
-        )
+        default_factory=lambda: DEFAULT_IMAGE_GENERATION_LIMITS
     )
     bootstrap_owner_email: str = ""
     bootstrap_owner_password_hash: SecretStr | None = None
@@ -104,6 +99,8 @@ class Settings(BaseSettings):
     # and grants its managed identity narrowly scoped APIM rights. None of these settings
     # is read on the inference path.
     control_plane_enabled: bool = False
+    # v3 Router specs have no model facts writer and no runtime that executes them yet.
+    model_router_v3_enabled: bool = False
     apim_target_registry_enabled: bool = False
     apim_legacy_target_compatibility_enabled: bool = False
     apim_gateway_profile_id: UUID | None = None

@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from xml.etree import ElementTree
 
@@ -426,6 +427,26 @@ def test_apim_checks_model_access_before_spending_budget_headroom() -> None:
     )
 
 
+def test_model_assignment_denial_uses_the_standard_error_envelope() -> None:
+    root = parse_policy(POLICY_PATH.read_text())
+    denial = next(
+        node for node in root.iter("when")
+        if node.get("condition") == '@((string)context.Variables["modelAdmission"] == "denied")'
+    )
+    status = denial.find("return-response/set-status")
+    body = denial.find("return-response/set-body")
+    assert status is not None and status.get("code") == "403"
+    assert body is not None and json.loads(body.text or "") == {
+        "type": "error",
+        "error": {
+            "type": "permission_error",
+            "code": "model_not_assigned",
+            "param": "model",
+            "message": "The requested model is not assigned to you",
+        },
+    }
+
+
 def test_apim_employee_quota_moved_off_the_token_counter() -> None:
     policy = POLICY_PATH.read_text()
 
@@ -666,6 +687,60 @@ def test_apim_attributes_mapped_subscriptions_to_trusted_agents() -> None:
         '&quot;agent-&quot; + (string)((JObject)context.Variables['
         '&quot;applicationMapState&quot;])[&quot;applicationSlug&quot;]'
         in policy
+    )
+
+
+def test_apim_attributes_admitted_subscriptions_to_their_registered_organization() -> None:
+    policy = POLICY_PATH.read_text()
+    root = ElementTree.fromstring(policy)
+    state = next(
+        node.attrib["value"] for node in root.iter("set-variable")
+        if node.attrib.get("name") == "applicationMapState"
+    )
+    admitted = next(
+        node for node in root.iter("when")
+        if node.attrib.get("condition")
+        == '@((string)context.Variables["applicationAdmission"] == "ok")'
+        and any(child.attrib.get("name") == "applicationLedgerPartition" for child in node)
+    )
+    headers = {node.attrib["name"]: node.findtext("value") for node in admitted.iter("set-header")}
+
+    for header, field, column in (
+        ("x-org-id", "organizationId", "OrganizationId"),
+        ("x-org-name", "organizationName", "OrganizationName"),
+        ("x-department-id", "departmentId", "DepartmentId"),
+        ("x-department-name", "departmentName", "DepartmentName"),
+    ):
+        assert f'state["{field}"] = (string)row["{column}"] ?? "unattributed";' in state
+        assert headers[header] == (
+            '@((bool)context.Variables["hasEmployeeToken"] ? '
+            f'context.Request.Headers.GetValueOrDefault("{header}", "unattributed") : '
+            f'(string)((JObject)context.Variables["applicationMapState"])["{field}"])'
+        )
+    # Telemetry snapshots these headers later, so a client-supplied value never reaches it.
+    assert policy.index('name="applicationLedgerPartition"') < policy.index(
+        'name="telemetryOrganizationId"'
+    )
+
+
+def test_apim_person_attribution_is_set_from_the_validated_identity_first() -> None:
+    policy = POLICY_PATH.read_text()
+    root = ElementTree.fromstring(policy)
+    employee = next(
+        node for node in root.iter("when")
+        if node.attrib.get("condition") == '@((bool)context.Variables["hasEmployeeToken"])'
+        and node.find("validate-azure-ad-token") is not None
+    )
+    overridden = {
+        node.attrib["name"] for node in employee.findall("set-header")
+        if node.attrib.get("exists-action") == "override"
+    }
+
+    # Person traffic keeps these headers in the application branch, so a person request must
+    # never carry client-supplied attribution into it.
+    assert {"x-org-id", "x-org-name", "x-department-id", "x-department-name"} <= overridden
+    assert policy.index("<validate-azure-ad-token") < policy.index(
+        'name="applicationLedgerPartition"'
     )
 
 

@@ -13,7 +13,7 @@
 <p align="center"><strong>通过一个自托管控制平面统一治理 AI 访问、支出与运营。</strong></p>
 
 <p align="center">
-   <a href="https://github.com/xuleihive/turnstile/releases/tag/v1.3"><img alt="Turnstile v1.3 版本" src="https://img.shields.io/badge/release-v1.3-2f6fdd.svg"></a>
+   <a href="https://github.com/xuleihive/turnstile/releases/tag/v1.4"><img alt="Turnstile v1.4 版本" src="https://img.shields.io/badge/release-v1.4-2f6fdd.svg"></a>
    <a href="LICENSE"><img alt="MIT 许可证" src="https://img.shields.io/badge/license-MIT-2f6fdd.svg"></a>
    <a href="#前置条件"><img alt="Python 3.11 或更高版本" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&amp;logoColor=white"></a>
    <a href="#前置条件"><img alt="Node.js 20.19.x 或 22.12 及更高版本" src="https://img.shields.io/badge/Node.js-20.19.x%20%7C%2022.12%2B-339933?logo=node.js&amp;logoColor=white"></a>
@@ -32,7 +32,7 @@
 Turnstile 是一个用于治理 AI 模型访问的自托管控制平面。它整合了 Azure API Management 网关、Token 与成本遥测、预算、应用访问、模型接入、发布控制和运维 Web 控制台。
 
 > [!NOTE]
-> **Turnstile v1.3** 是当前公开版本。本版本新增模型智能路由，并扩展后端池操作、请求诊断与安装恢复能力。升级生产部署前，请核对迁移、基础设施要求和提供商兼容性。
+> **Turnstile v1.4** 是当前公开版本。版本历史和发行细节见[官网文档](https://turn-stile.com/docs)及 [GitHub Releases](https://github.com/xuleihive/turnstile/releases/tag/v1.4)。
 
 > [!IMPORTANT]
 > 本仓库包含的基础设施模板只部署 Turnstile 平台，不会创建 Azure AI Foundry 项目、部署提供商模型，也不会预置客户连接和模型。平台运行后，运维人员需要连接自己的 Foundry 或其他兼容提供商资源。
@@ -61,17 +61,6 @@ Turnstile 是一个用于治理 AI 模型访问的自托管控制平面。它整
 
 > [!WARNING]
 > GitHub 数据源和 GitHub Copilot 集成功能仍在积极开发中，尚未达到生产就绪状态。请谨慎启用，并在将相关用量、成本或治理数据用于运营或财务决策前进行独立核验。如果你只需要 GitHub Copilot FinOps 功能，请参考 [OctoFinance](https://github.com/satomic/OctoFinance)。
-
-## v1.3 新增特性
-
-- **模型智能路由（Model Intelligent Router）：** 可视化画布和配置编辑器，支持条件路由、优先级与权重策略、
-   模型决策和失败转移。通过版本化发布、人员级路由器授权以及决策和尝试级 Trace，明确路由行为与访问范围。
-- **后端池操作：** 独立创建后端池，检查成员兼容性，配置优先级、权重、会话亲和性和弹性策略。
-   离开表单后后台发布仍可继续，详情页提供进度恢复和客户端接入示例。
-- **用量与请求诊断：** 原生 APIM 客户端路由、准确的 Runtime 归因、尝试级诊断，以及扩展的 Chat、Responses
-   和 Anthropic 流式用量处理。缺失或不完整的用量仍与实测零消耗明确区分。
-- **安装与恢复：** 自动安装并登记初始固定程序，准备受限的 Publisher 依赖权限，为新建 StandardV2 APIM
-   接通私网出站链路，并通过检查点恢复中断的安装。启动检查在原有期限内同时要求 API 健康和前端版本匹配。
 
 现有能力还包括提供商目录与手工定价、连接及模型折扣、区域与上下文分档价格、历史价格快照、
 版本化模型启停、应用订阅管理，以及 USD/Token 预算预扣和结算。
@@ -110,6 +99,7 @@ docs/             维护人员与运维人员文档
 - Node.js 20.19.x 或 22.12+，以及 npm
 - PostgreSQL 16+
 - 已安装 Bicep 的 Azure CLI
+- Azure 部署时，部署工作站需能通过 HTTPS 访问 Azure、PyPI 和 npm 仓库（打包会下载 Linux Python wheel 与前端依赖）；需要代理时设置 `HTTPS_PROXY`
 - 一个可以创建平台资源的 Azure 订阅
 - 可选：多租户 Microsoft Entra SPA 应用注册
 - 可选：现有的 Azure AI Foundry 项目或其他受支持的提供商（部署后接入）
@@ -184,10 +174,10 @@ git diff --check
 
 Bicep 模板会创建 PostgreSQL、Event Hubs、Storage、Key Vault、Application Insights、Web App、Functions 和 APIM 集成等 Turnstile 平台资源，但不会创建 Azure AI Foundry 项目或提供商模型部署。
 
-对于 **Turnstile v1.3**，请先选择对应路径：
+对于 **Turnstile v1.4**，请先选择对应路径：
 
-- **升级已有安装：**核对[基础设施与协议升级要求](docs/deployment.md#prepare-for-v12)。保留原部署状态、数据库、账本、APIM、身份和历史；除应用包外，还需应用待执行迁移和必要的基础设施配置。
-- **完全从零安装：**按照[全新部署指南](docs/deployment.md#deploy-v11-from-zero)操作。使用独立前缀和新状态，默认新建 StandardV2 APIM；提供商模型与凭据需要另行准备。
+- **升级已有安装：**核对[基础设施与协议升级要求](docs/deployment.md#prepare-for-v14)。保留原部署状态、数据库、账本、APIM、身份和历史；除应用包外，还需应用待执行迁移和必要的基础设施配置。
+- **完全从零安装：**按照官网[部署指南](https://turn-stile.com/docs/deployment)逐步操作（仓库参考：[全新部署指南](docs/deployment.md#deploy-v11-from-zero)）。使用独立前缀和新状态，默认新建 StandardV2 APIM；提供商模型与凭据需要另行准备。
 
 StandardV2 不支持自托管网关。该可选功能需要兼容的 Developer 或经典 Premium APIM 实例，并完成相应网络配置。
 Developer 用于评估，没有生产 SLA，且自托管网关限单节点。平台不会创建或代管自托管网关容器的宿主机。
@@ -201,6 +191,8 @@ mkdir -p .turnstile
 cp infra/main.parameters.example.json .turnstile/main.parameters.json
 ```
 
+如需由 Turnstile 创建 Application 订阅，还要在 `parameters` 中加入 `"gatewayApplicationProvisioningEnabled": { "value": true }`。示例文件不含此项，模板默认值为 `false`：此时 **Add subscription** 会返回 “Application subscription provisioning is not enabled in this environment.”。请在首次部署前设置此项：对已完成的安装重跑部署不会应用之后的修改，目前也没有经过验证的方式可在部署完成后修改它。`provisionControlPlane`、`controlPlaneEnabled`、`gatewayReleaseWorkerEnabled` 和 `gatewayApplicationKeyManagementEnabled` 由部署命令自行设置，示例中的 `false` 不会生效。
+
 2. 登录Azure并运行仓库自带的部署命令：
 
 ```bash
@@ -211,7 +203,7 @@ uv run python -m scripts.deploy deploy \
    --parameters .turnstile/main.parameters.json
 ```
 
-脚本会交互读取首个 Owner 密码，先执行 subscription-scope what-if，并要求输入精确确认词 `deploy`；任何 Delete 变更都会终止。随后部署平台与 observer、构建 Linux x86-64 不可变包、部署 API 和两个 Functions、安装初始固定路由程序，并在依赖就绪后启用 worker。完成检查包括前端版本匹配、Function 索引、Owner 密码登录及首个模型发布所需的程序基线。这些启动检查不能代替当前环境中的提供商调用、路由和财务验收。生成的 secret 只保存在权限为 `0600` 的 `.turnstile/deployments/<resource-group>.json`，该文件被 Git 忽略，应备份到获批的 secret store。
+脚本会交互读取首个 Owner 密码，先执行 subscription-scope what-if，并要求输入精确确认词 `deploy`；任何 Delete 变更都会终止。what-if 只按变更类型输出数量（例如新安装显示 `What-if: Create=130, Unsupported=9`），`Unsupported` 是为本次部署新建的托管身份分配的角色。模板还会在订阅范围为 API 和控制面托管身份分配 `API Management Service Contributor`。随后部署平台与 observer、构建 Linux x86-64 不可变包、部署 API 和两个 Functions、安装初始固定路由程序，并在依赖就绪后启用 worker。完成检查包括前端版本匹配、Function 索引、Owner 密码登录及首个模型发布所需的程序基线。这些启动检查不能代替当前环境中的提供商调用、路由和财务验收。生成的 secret 只保存在权限为 `0600` 的 `.turnstile/deployments/<resource-group>.json`，该文件被 Git 忽略，应备份到获批的 secret store。
 
 自动化部署时，可将 `infra/owner.credentials.example.json` 复制为 `.turnstile/owner.credentials.json`，填写相同的
 `bootstrapOwnerEmail` 对应邮箱与密码，将权限设为 `0600`，并传入 `--owner-credentials .turnstile/owner.credentials.json`。
@@ -237,7 +229,7 @@ Turnstile不会创建或修改客户的Foundry项目；执行IAM授权的Azure�
 - 遥测数据中不会持久化任何提示词或补全内容。
 - 凭据在存入数据库前会进行加密。
 - Azure 托管组件会尽可能使用托管身份。
-- APIM 角色会限制在实际可行的最小资源与操作范围内。
+- APIM 角色会限制在实际可行的最小资源与操作范围内；例外是 API 和控制面托管身份在订阅范围获得的 `API Management Service Contributor`。
 - 包含密钥的响应使用 `Cache-Control: no-store`，且绝不进行查询缓存。
 - 生产环境 Cookie 启用 `HttpOnly` 和 `Secure` 属性，并绑定角色。
 - 本地配置与生成的配置均被 `.gitignore` 排除。
@@ -253,7 +245,7 @@ Turnstile不会创建或修改客户的Foundry项目；执行IAM授权的Azure�
 
 ## 故障排除
 
-启动、认证、数据库、APIM、observer 和 telemetry 诊断见[故障排除](docs/troubleshooting.md)。部署失败可以续跑：修复脚本报告的原因后，使用原 private state file 重新执行同一条 `scripts.deploy deploy` 命令。
+启动、认证、数据库、APIM、observer 和 telemetry 诊断见[故障排除](docs/troubleshooting.md)。部署失败可以续跑：修复脚本报告的原因后，使用原 private state file 重新执行同一条 `scripts.deploy deploy` 命令。对于需要读取输出的 Azure CLI 步骤（如 what-if 和模板部署），部署命令不会显示 Azure CLI 的错误信息：若某一步只报 `Command '[az, …]' returned non-zero exit status 1`，先直接检查 Azure CLI 与 Bicep（例如 `az bicep build --file infra/main.bicep`）及工作站代理设置，再重跑。若最后的就绪检查报 `The read operation timed out`，重跑同一条命令即可；重跑会重新构建并部署全部应用包。
 
 ## 文档
 

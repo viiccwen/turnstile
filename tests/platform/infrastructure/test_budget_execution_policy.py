@@ -1,20 +1,41 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from threading import Event
+from typing import Any, cast
 from uuid import UUID
 from xml.etree import ElementTree as ET
 
 import pytest
 
 from scripts.prepare_budget_execution import CutoverReadback, render_candidate
+from tests.backend.persistence.test_price_sync_concurrency import (
+    pricing_postgres as pricing_postgres,
+)
 from tests.backend.telemetry.test_atomic_ledger import EPOCH, NOW, completion, identity, summary
-from turnstile_core.domain.ledger import LedgerAdmissionReceipt, complete_ledger, reserve_ledger
+from tests.platform.api.test_model_router_api import router_repository as router_repository
+from tests.platform.infrastructure.test_envoy_cache_adapter import execution_row, load_shipper
+from turnstile_core.domain.gateway_targets import canonical_usage_id_v2
+from turnstile_core.domain.ledger import (
+    BudgetPriceProjection,
+    LedgerAdmissionReceipt,
+    LedgerAttempt,
+    LedgerCharge,
+    LedgerProtocolConflict,
+    LedgerScope,
+    LedgerSummary,
+    complete_ledger,
+    reserve_ledger,
+    settle_ledger,
+)
+from turnstile_core.domain.models import ModelPrice
 from turnstile_core.integrations import apim_budget_execution as compiler
 from turnstile_core.integrations import apim_model_availability as availability
 from turnstile_core.integrations import apim_storage_routes as storage_routes
@@ -98,10 +119,14 @@ sealed class Response : IResponse {
 }
 sealed class Request {
     public Body Body; public Headers Headers = new Headers(); public string Method = "POST";
+    public Uri OriginalUrl = new Uri("https://unit.azure-api.net/turnstile/chat/completions");
 }
 sealed class Operation { public string Id; }
 sealed class Subscription { public string Id; }
-sealed class Api { public string Id = "unit-turnstile"; public string Revision = "candidate"; }
+sealed class Api {
+  public string Id = "unit-turnstile"; public string Revision = "candidate";
+  public string Path = "turnstile";
+}
 sealed class Gateway {
     public string Id = "managed"; public bool IsManaged = true;
     public string InstanceId = "managed";
@@ -123,7 +148,8 @@ sealed class Context {
         Deployment.Gateway.Id = (string)source["gateway"] ?? "managed";
         Deployment.Gateway.InstanceId = (string)source["instance"] ?? "managed";
         Deployment.Gateway.IsManaged = Deployment.Gateway.Id == "managed";
-        Response = new Response(new JObject(new JProperty("status", 200),
+        Response = new Response(new JObject(
+            new JProperty("status", (int?)source["response_status"] ?? 200),
             new JProperty("headers", new JObject()),
             new JProperty("body", (string)source["response"] ?? "{}")));
     Operation = new Operation { Id = (string)source["operation"] ?? "responses" };
@@ -181,6 +207,40 @@ def expression_id(expression: str) -> str:
     return hashlib.sha256(expression.encode()).hexdigest()[:20]
 
 
+def text_usage_expression() -> str:
+    root = parse_policy((ROOT / "infra/policies/foundry-finops-policy.xml").read_text())
+    node = root.find(
+        "./outbound/choose/otherwise/choose/otherwise/set-variable[@name='usagePayload']",
+    )
+    assert node is not None
+    return node.attrib["value"]
+
+
+def responses_observer_event(
+    receipt: LedgerAdmissionReceipt, native: dict[str, Any], streamed: bool,
+) -> dict[str, Any]:
+    request = receipt.identity
+    event = load_shipper().normalize_access_row(execution_row(
+        request_id=request.correlation_id, correlation_id=request.correlation_id,
+        usage_id=canonical_usage_id_v2(
+            request.gateway_profile_id, "unit-service", request.native_gateway_id,
+            request.correlation_id,
+        ),
+        model_id=request.model_id, user_id=request.scope.scope_id, api_format="openai_responses",
+        budget_execution=base64.b64encode(json.dumps(
+            [receipt.model_dump(mode="json")],
+        ).encode()).decode(),
+        response_content_type="text/event-stream" if streamed else "application/json",
+        response_status="completed", last_event_type="response.completed",
+        prompt_tokens=native["input_tokens"], output_tokens=native["output_tokens"],
+        total_tokens=native["total_tokens"],
+        cache_read_tokens=native["input_tokens_details"]["cached_tokens"],
+        cache_write_tokens=native["input_tokens_details"]["cache_write_tokens"],
+    ))
+    assert event is not None
+    return cast(dict[str, Any], event)
+
+
 def application_tpm_expressions() -> dict[str, str]:
     source = (ROOT / "infra/policies/foundry-finops-policy.xml").read_text()
     composed = compiler.compose_budget_execution_parent(source, source, enabled=True)
@@ -191,6 +251,802 @@ def application_tpm_expressions() -> dict[str, str]:
     }
     return {node.attrib["name"]: node.attrib["value"]
             for node in root.iter("set-variable") if node.get("name") in names}
+
+
+def application_attribution_expressions() -> dict[str, str]:
+    root = parse_policy((ROOT / "infra/policies/foundry-finops-policy.xml").read_text())
+    return {
+        node.attrib["name"]: node.findtext("value", "")
+        for node in root.iter("set-header")
+        if "applicationMapState" in node.findtext("value", "")
+        and node.get("name") in {"x-org-id", "x-org-name", "x-department-id", "x-department-name"}
+    }
+
+
+def native_router_expressions() -> dict[str, str]:
+    from turnstile_core.integrations.apim_router_global_policy import (
+        build_router_global_service_policy,
+        fixed_router_operation_stages,
+    )
+
+    inbound, outbound = fixed_router_operation_stages(
+        "https://unitstore.table.core.windows.net", "Ledger", "unit-turnstile",
+        "90000000-0000-4000-8000-000000000002",
+    )
+    result = {}
+    for node in inbound.iter("set-variable"):
+        if node.get("name") in {"routerNativeDocumentReady", "routerPlanState"}:
+            name = node.attrib["name"]
+            result[name if name not in result else "routerDecisionResult"] = node.attrib["value"]
+    decision = inbound.find(
+        ".//send-request[@response-variable-name='routerDecisionHttp']/set-body",
+    )
+    assert decision is not None
+    result["routerDecisionBody"] = decision.text or ""
+    result["routerDecisionUrl"] = inbound.findtext(
+        ".//send-request[@response-variable-name='routerDecisionHttp']/set-url", "",
+    )
+    rewrite = next(node for node in inbound.iter("set-body")
+                   if 'context.Variables["routerOriginalRequestBody"]' in (node.text or ""))
+    result["routerCandidateBody"] = rewrite.text or ""
+    rejection = next(
+        (node.text or "" for node in inbound.iter("set-body")
+         if "router_configuration_unavailable" in (node.text or "")), "",
+    )
+    if rejection.startswith("@"):
+        result["routerRejectionBody"] = rejection
+    result["routerStickyState"] = next(
+        node.attrib["value"] for node in inbound.iter("set-variable")
+        if node.get("name") == "routerPlanState"
+        and "routerStickyTableResp" in node.attrib["value"]
+    )
+    for node in outbound.iter("set-variable"):
+        name = node.attrib["name"]
+        if name in {"routerPlanState", "routerOutboundCompleted"}:
+            key = "routerFailedAttempt" if name == "routerPlanState" else name
+            result[key] = node.attrib["value"]
+    result["routerNameHeader"] = next(
+        node.findtext("value", "") for node in outbound.iter("set-header")
+        if node.get("name") == "x-router-name"
+    )
+    legacy = parse_policy(build_router_global_service_policy(
+        "<policies><inbound></inbound><outbound></outbound></policies>",
+        ledger_table_endpoint="https://unitstore.table.core.windows.net",
+        ledger_table_name="Ledger", api_id="unit-turnstile",
+    ))
+    for state_variable in ("routerPlanState", "routerAnthropicCompleted"):
+        result[f"{state_variable}NameHeader"] = next(
+            node.findtext("value", "") for node in legacy.iter("set-header")
+            if node.get("name") == "x-router-name"
+            and state_variable in node.findtext("value", "")
+        )
+    trace = outbound.find(
+        ".//send-request[@response-variable-name='routerOutboundTraceWrite']/set-body",
+    )
+    assert trace is not None
+    result["routerTraceBody"] = trace.text or ""
+    return result
+
+
+def business_denial_expressions() -> dict[str, str]:
+    from turnstile_core.integrations.apim_router_global_policy import fixed_router_operation_stages
+
+    source = parse_policy((ROOT / "infra/policies/foundry-finops-policy.xml").read_text())
+    identity = source.find("./inbound/set-variable[@name='telemetryUsageId']")
+    assert identity is not None
+    model = availability.admission_guard(logger_id="__LOGGER_ID__")
+    router, _ = fixed_router_operation_stages(
+        "https://unitstore.table.core.windows.net", "Ledger", "unit-turnstile",
+        "90000000-0000-4000-8000-000000000002",
+        usage_identity=identity.attrib["value"],
+    )
+    result = {"usageIdentity": identity.attrib["value"]}
+    for name, guard in (("model_disabled", model), ("router_configuration_unavailable", router)):
+        event = guard.find(".//log-to-eventhub")
+        assert event is not None
+        result[name] = event.text or ""
+        if name == "model_disabled":
+            owner = next(node for node in guard.iter() if event in list(node))
+            result["availabilityEventAllowed"] = owner.attrib["condition"]
+    inference = source.find("./inbound/set-variable[@name='isInferenceOperation']")
+    assert inference is not None
+    result["isInferenceOperation"] = inference.attrib["value"]
+    denial = next(
+        node for node in source.iter("return-response")
+        if node.find("set-header[@name='x-application-budget-remaining-tokens']") is not None
+    )
+    body = denial.findtext("set-body", "")
+    if body.startswith("@"):
+        result["applicationDenialBody"] = body
+    return result
+
+
+def test_model_disabled_denial_emits_before_early_return() -> None:
+    guard = availability.admission_guard(logger_id="__LOGGER_ID__")
+    response = next(node for node in guard.iter("return-response")
+                    if node.find("set-status[@code='403']") is not None)
+    owners = {child: owner for owner in guard.iter() for child in owner}
+    denied = owners[response]
+    events = denied.findall(".//log-to-eventhub")
+    assert len(events) == 1
+    sender = next(node for node in denied if events[0] in node.iter())
+    assert list(denied).index(sender) < list(denied).index(response)
+    assert events[0].attrib["logger-id"] == "__LOGGER_ID__"
+    assert '"correlation_id"' in (events[0].text or "")
+    assert '"prompt_tokens"' not in (events[0].text or "")
+
+
+def test_native_router_configuration_denial_emits_before_early_return() -> None:
+    from turnstile_core.integrations.apim_router_global_policy import fixed_router_operation_stages
+
+    guard, _ = fixed_router_operation_stages(
+        "https://unitstore.table.core.windows.net", "Ledger", "unit-turnstile",
+        "90000000-0000-4000-8000-000000000002",
+    )
+    response = next(node for node in guard.iter("return-response")
+                    if '"router_configuration_unavailable"' in (node.findtext("set-body") or ""))
+    owners = {child: owner for owner in guard.iter() for child in owner}
+    denied = owners[response]
+    events = denied.findall(".//log-to-eventhub")
+    assert len(events) == 1
+    sender = next(node for node in denied if events[0] in node.iter())
+    assert list(denied).index(sender) < list(denied).index(response)
+    assert events[0].attrib["logger-id"] == "__LOGGER_ID__"
+    assert '"correlation_id"' in (events[0].text or "")
+    assert '"prompt_tokens"' not in (events[0].text or "")
+
+
+@pytest.mark.parametrize("surface,status_code", [
+    ("model_disabled", 403), ("router_configuration_unavailable", 503),
+])
+@pytest.mark.parametrize("known", [False, True])
+@pytest.mark.parametrize("gateway", ["managed", "unit-self-hosted"])
+@pytest.mark.parametrize("request_source", [None, "unit-client", "copilot-assistant-tool"])
+def test_business_denial_event_is_ingested_without_usage_or_sensitive_content(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, surface: str,
+    status_code: int, known: bool, gateway: str, request_source: str | None,
+) -> None:
+    from tests.backend.telemetry.test_processor import RecordingRepository
+    from turnstile_core.domain.gateway_targets import canonical_usage_id_v2
+    from turnstile_core.domain.models import UsageEvent
+    from turnstile_core.ingestion.processor import CoefficientResolver, UsageProcessor
+
+    target = UUID("90000000-0000-4000-8000-000000000002")
+    correlation = "11111111-2222-3333-4444-555555555555"
+    request_id = "22222222-3333-4444-5555-666666666666"
+    usage_id = canonical_usage_id_v2(target, "unit-service", gateway, correlation)
+    variables: dict[str, Any] = {
+        "callerRequestId": request_id, "routerCallerRequestId": request_id,
+        "availabilityModelId": "90000000-0000-4000-8000-000000000003",
+        "availabilityFixedModelAlias": "unit-model", "routerRequestedModel": "unit-router",
+    }
+    if known:
+        variables["telemetryUsageId"] = usage_id
+    expressions = business_denial_expressions()
+    has_identity = known or surface == "router_configuration_unavailable"
+    payload = json.loads(run_cases(compiled_expressions, tmp_path, [{
+        "expression": expression_id(expressions[surface]),
+        "body": json.dumps({"messages": [{"role": "user", "content": "unit-private-prompt"}]}),
+        "headers": {"Ocp-Apim-Subscription-Key": "unit-private-key",
+                    "x-user-id": "forged-person@example.test",
+                    **({"x-request-source": request_source} if request_source else {})},
+        "operation": "chat-completions", "subscription": True,
+        "gateway": gateway, "instance": gateway, "variables": variables,
+        "steps": [{"variable": "telemetryUsageId",
+               "expression": expression_id(expressions["usageIdentity"])}]
+        if surface == "router_configuration_unavailable" else [],
+    }])[0])
+    assert payload["request_id"] == request_id
+    assert payload["correlation_id"] == correlation
+    assert payload["status_code"] == status_code
+    assert payload["event_schema_version"] == (2 if has_identity else 1)
+    assert payload["model_admission"] == surface
+    assert payload["model"] == ("unit-model" if surface == "model_disabled" else "unit-router")
+    if has_identity:
+        assert payload["id"] == usage_id
+        assert payload["gateway_profile_id"] == str(target)
+        assert payload["native_gateway_id"] == gateway
+        assert payload["native_gateway_instance_id"] == gateway
+        assert payload["gateway_is_managed"] is (gateway == "managed")
+    else:
+        assert all(payload.get(name) is None for name in (
+            "gateway_profile_id", "native_gateway_id", "native_gateway_instance_id",
+            "gateway_is_managed", "apim_service_id", "apim_region", "api_revision",
+        ))
+    assert payload["apim_subscription_id"] == "unit-subscription"
+    assert payload["user_id"] == "unattributed"
+    assert payload["request_source"] == (request_source or "unattributed")
+    assert not {"input_tokens", "cached_tokens", "output_tokens", "tokens_consumed",
+                "budget_execution", "budget_terminal", "usd_cost"} & payload.keys()
+    assert "unit-private-prompt" not in json.dumps(payload)
+    assert "unit-private-key" not in json.dumps(payload)
+    assert "forged-person@example.test" not in json.dumps(payload)
+    parsed = UsageEvent.model_validate(payload)
+    assert parsed.budget_execution == []
+    assert parsed.usage_complete is False
+    repository = RecordingRepository()
+    processor = UsageProcessor(repository, CoefficientResolver({"default": 1.0}))
+    assert processor.process(payload) is True
+    assert len(repository.records) == 1
+    record = repository.records[0]
+    assert record.request_id == request_id
+    assert record.status_code == status_code
+    assert record.model_admission == surface
+    assert record.usage_domain == (
+        "github_copilot" if request_source == "copilot-assistant-tool" else "apim"
+    )
+    assert record.estimated is True
+    assert record.usd_cost is None
+    assert repository.execution_writes == []
+    if has_identity:
+        assert repository.gateway_attributions[0].apim_target_id == target
+    else:
+        assert repository.gateway_attributions == []
+
+
+@pytest.mark.parametrize("operation,allowed", [
+    ("chat-completions", True), ("responses", True), ("responses-compact", True),
+    ("anthropic-messages", True), ("images-generations", True),
+    ("anthropic-count-tokens", False), ("models", False), ("unknown", False),
+])
+def test_business_denial_event_preserves_non_inference_exclusions(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, operation: str, allowed: bool,
+) -> None:
+    expressions = business_denial_expressions()
+    result = run_cases(compiled_expressions, tmp_path, [{
+        "expression": expression_id(expressions["availabilityEventAllowed"]),
+        "body": "{}", "operation": operation,
+        "variables": {"isImagesOperation": operation == "images-generations",
+                      "isResponsesOperation": operation in {"responses", "responses-compact"}},
+        "steps": [{"variable": "isInferenceOperation",
+                   "expression": expression_id(expressions["isInferenceOperation"])}],
+    }])[0]
+    assert result is allowed
+    assert availability.availability_probe_guard().find(".//log-to-eventhub") is None
+
+
+@pytest.mark.parametrize("fault", [
+    None, "digest", "target", "unpublished", "direct-provider", "fallback",
+    "prepared", "multiple-gateways", "system-one", "unknown-protocol",
+])
+def test_native_router_definition_proof_executes_before_paid_routing(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, fault: str | None,
+) -> None:
+    from turnstile_core.integrations.router_table_projection import router_row_key
+
+    document = {
+        "status": "draft" if fault == "unpublished" else "published", "router_version": 1,
+        "gateway_profile_id": "foreign" if fault == "target"
+        else None if fault == "multiple-gateways"
+        else "90000000-0000-4000-8000-000000000002",
+        "candidates_by_id": {"candidate": {"profile": "openai-v1"}},
+        "definition": {"nodes": [{"fallback_on": ["timeout"] if fault == "fallback" else []}]},
+        "routing_models_by_id": {"decision": {
+            "decision_protocol": {"system-one": "system_one", "unknown-protocol": "unit"}.get(
+                fault or "", "chat_json",
+            ),
+            "auth_mode": "managed_identity" if fault == "direct-provider" else "gateway_route",
+        }},
+    }
+    serialized = json.dumps(document, separators=(",", ":"), sort_keys=True)
+    entity = {
+        "PartitionKey": "model-router-prepared|v1" if fault == "prepared" else "model-router|v1",
+        "RowKey": router_row_key("unit-router"),
+        "SchemaVersion": 2, "Status": "prepared" if fault == "prepared" else "published",
+        "Document": serialized,
+        "Sha256": ("0" * 64 if fault == "digest"
+               else hashlib.sha256(serialized.encode()).hexdigest()),
+    }
+    result = run_cases(compiled_expressions, tmp_path, [{
+        "expression": expression_id(native_router_expressions()["routerNativeDocumentReady"]),
+        "body": "{}", "subscription": True, "variables": {
+            "routerCachedEntityJson": json.dumps(entity),
+            "routerLookupRowKey": router_row_key("unit-router"),
+        },
+    }])[0]
+    assert result is (fault in {None, "system-one"})
+
+
+_CODE_MODEL, _GENERAL_MODEL = str(UUID(int=911)), str(UUID(int=912))
+
+
+def _native_router_choice(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, body: dict[str, Any],
+    *, sticky_cost: float,
+) -> dict[str, Any]:
+    """Plan a request on a Router whose code branch excludes the session's sticky model."""
+    def branch(name: str, model: str, y: int) -> list[dict[str, Any]]:
+        return [
+            {"id": f"pool-{name}", "type": "candidate_models", "label": name,
+             "position": {"x": 420, "y": y}, "candidates": [{"model_id": model}]},
+            {"id": f"strat-{name}", "type": "strategy", "label": name,
+             "position": {"x": 620, "y": y}, "strategy_type": "priority",
+             "model_configs": [{"model_id": model, "priority": 1, "weight": 100}]},
+        ]
+
+    document = {
+        "router_id": str(UUID(int=904)), "router_name": "unit-router", "router_version": 1,
+        "gateway_profile_id": "90000000-0000-4000-8000-000000000002",
+        "status": "published", "owner_email": "offline@example.test",
+        "assigned_user_ids": [], "allowed_subscription_ids": ["unit-subscription"],
+        "definition": {"schema_version": 2, "nodes": [
+            {"id": "start", "type": "start", "label": "Start", "position": {"x": 0, "y": 0}},
+            {"id": "task", "type": "condition", "label": "Task", "position": {"x": 200, "y": 0},
+             "condition": {"field": "task_type", "operator": "equals", "value": "code"}},
+            *branch("code", _CODE_MODEL, 80), *branch("general", _GENERAL_MODEL, 240),
+            {"id": "output", "type": "output", "label": "Output", "position": {"x": 840, "y": 0}},
+        ], "edges": [
+            {"id": "e1", "source": "start", "target": "task"},
+            {"id": "e2", "source": "task", "target": "pool-code", "label": "Match"},
+            {"id": "e3", "source": "task", "target": "pool-general", "label": "Else"},
+            {"id": "e4", "source": "pool-code", "target": "strat-code"},
+            {"id": "e5", "source": "pool-general", "target": "strat-general"},
+            {"id": "e6", "source": "strat-code", "target": "output"},
+            {"id": "e7", "source": "strat-general", "target": "output"},
+        ]},
+        "candidates_by_id": {model_id: {
+            "model_id": model_id, "apim_alias": alias, "display_name": alias,
+            "provider_name": "Unit", "runtime_name": "Unit", "profile": "openai-v1",
+            "capabilities": [], "context_window": 16384,
+            "input_cost_per_million": cost, "output_cost_per_million": cost,
+            "effective_cost_per_million": cost,
+        } for model_id, alias, cost in (
+            (_CODE_MODEL, "code-model", 1.0), (_GENERAL_MODEL, "general-model", sticky_cost),
+        )},
+        "routing_models_by_id": {},
+    }
+    text = json.dumps({**body, "model": "unit-router",
+                       "router_context": {"task_type": "code", "session_id": "s1"}})
+    plan_expression = expression_id(native_router_expressions()["routerPlanState"])
+    case: dict[str, Any] = {
+        "body": text, "subscription": True, "operation": "chat-completions",
+        "expression": plan_expression, "variables": {
+            "routerCachedEntityJson": json.dumps({"Document": json.dumps(document)}),
+            "routerOriginalRequestBody": text,
+            "routerCallerRequestId": str(UUID(int=906)),
+            "routerRequestedModel": "unit-router",
+            "routerDecisionRequestId": str(UUID(int=905)),
+        },
+    }
+    plan = json.loads(run_cases(compiled_expressions, tmp_path, [case])[0])
+    session = next(key for key in plan["lookup_keys"] if key["tier"] == "session")
+    binding = {"model_id": _GENERAL_MODEL, "updated_epoch": int(datetime.now(UTC).timestamp())}
+    sticky = {**case, "expression": expression_id(native_router_expressions()["routerStickyState"]),
+              "steps": [{"variable": "routerPlanState", "expression": plan_expression}],
+              "variables": {**case["variables"], "routerStickyTableResp": {
+                  "__response": True, "status": 200, "headers": {}, "body": json.dumps({
+                      "value": [{"RowKey": session["row_key"], "Document": json.dumps(binding)}],
+                  })}}}
+    return dict(json.loads(run_cases(compiled_expressions, tmp_path, [sticky])[0]))
+
+
+# The code branch is pricier than the sticky model. [False] one user message, which the
+# old rule never treated as a new turn; [True] a multi-turn conversation.
+@pytest.mark.parametrize("multi_turn", [False, True])
+def test_native_router_branch_takes_precedence_over_sticky_model_on_user_turns(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, multi_turn: bool,
+) -> None:
+    earlier = [{"role": "user", "content": "Summarize the news"},
+               {"role": "assistant", "content": "Here is the summary."}] if multi_turn else []
+    result = _native_router_choice(
+        compiled_expressions, tmp_path,
+        {"messages": [*earlier, {"role": "user", "content": "Refactor queue.ts"}]},
+        sticky_cost=0.5,
+    )
+    assert result["selected_candidate"]["model_id"] == _CODE_MODEL
+    assert result["decision_basis"] == "highest_priority_success"
+
+
+@pytest.mark.parametrize("multi_turn", [False, True])
+def test_native_router_user_turns_keep_the_sticky_model_when_the_branch_is_cheaper(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, multi_turn: bool,
+) -> None:
+    earlier = [{"role": "user", "content": "Summarize the news"},
+               {"role": "assistant", "content": "Here is the summary."}] if multi_turn else []
+    result = _native_router_choice(
+        compiled_expressions, tmp_path,
+        {"messages": [*earlier, {"role": "user", "content": "Refactor queue.ts"}]},
+        sticky_cost=35.0,
+    )
+    assert result["selected_candidate"]["model_id"] == _GENERAL_MODEL
+    assert result["decision_basis"] == "session_sticky"
+
+
+# [False] Anthropic Messages tool_result turn; [True] Responses function_call_output item.
+@pytest.mark.parametrize("responses", [False, True])
+def test_native_router_tool_continuations_keep_the_sticky_model(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, responses: bool,
+) -> None:
+    if responses:
+        field, text_type = "input", "input_text"
+        history: list[dict[str, Any]] = [
+            {"role": "user", "content": [{"type": "input_text", "text": "Refactor queue.ts"}]},
+            {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "export class Q {}"},
+        ]
+    else:
+        field, text_type = "messages", "text"
+        history = [
+            {"role": "user", "content": "Refactor queue.ts"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c1", "name": "read", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "c1", "content": "export class Q {}"}]},
+        ]
+    continued = _native_router_choice(
+        compiled_expressions, tmp_path, {field: history}, sticky_cost=0.5,
+    )
+    assert continued["selected_candidate"]["model_id"] == _GENERAL_MODEL
+    assert continued["decision_basis"] == "session_sticky"
+    fresh = _native_router_choice(compiled_expressions, tmp_path, {field: [
+        *history, {"role": "user", "content": [{"type": text_type, "text": "Now add tests"}]},
+    ]}, sticky_cost=0.5)
+    assert fresh["selected_candidate"]["model_id"] == _CODE_MODEL
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_native_router_rejection_names_the_unsupported_fallback_node(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, fallback: bool,
+) -> None:
+    document = {
+        "status": "published", "router_version": 1,
+        "gateway_profile_id": "90000000-0000-4000-8000-000000000002",
+        "definition": {"nodes": [
+            {"id": "start", "label": "Start", "fallback_on": []},
+            {"id": "backup", "label": "Backup \"tier\"",
+             "fallback_on": ["timeout"] if fallback else []},
+        ]},
+    }
+    result = run_cases(compiled_expressions, tmp_path, [{
+        "expression": expression_id(native_router_expressions()["routerRejectionBody"]),
+        "body": "{}", "subscription": True, "variables": {
+            "routerCachedEntityJson": json.dumps({"Document": json.dumps(document)}),
+        },
+    }])[0]
+    error = json.loads(result)["error"]
+    assert error["code"] == "router_configuration_unavailable"
+    assert error.get("message") == (
+        "Router Fallback node 'Backup \"tier\"' is not supported by the gateway; "
+        "remove the Fallback node and publish the Router again" if fallback else None
+    )
+
+
+@pytest.mark.parametrize("reason,kind,param", [
+    ("application_model_not_assigned", "permission_error", "model"),
+    ("application_monthly_token_budget_exhausted", "insufficient_quota", None),
+])
+def test_application_denial_uses_the_standard_error_envelope_and_request_id(
+    compiled_expressions: tuple[Path, str], tmp_path: Path,
+    reason: str, kind: str, param: str | None,
+) -> None:
+    source = parse_policy((ROOT / "infra/policies/foundry-finops-policy.xml").read_text())
+    denial = next(
+        node for node in source.iter("return-response")
+        if node.find("set-header[@name='x-application-budget-remaining-tokens']") is not None
+    )
+    assert denial.findtext("set-header[@name='x-request-id']/value") == (
+        '@((string)context.Variables["callerRequestId"])'
+    )
+    body = json.loads(run_cases(compiled_expressions, tmp_path, [{
+        "expression": expression_id(business_denial_expressions()["applicationDenialBody"]),
+        "body": "{}", "variables": {"applicationDenialReason": reason},
+    }])[0])
+    assert body["type"] == "error"
+    assert body["error"]["type"] == kind and body["error"]["code"] == reason
+    assert body["error"]["param"] == param and body["error"]["message"]
+
+
+@pytest.mark.parametrize("prompt", [
+    "Pick the cheaper model.\n{catalog}", "Answer with model_id only.",
+])
+def test_native_router_custom_decision_prompt_always_asks_for_json(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, prompt: str,
+) -> None:
+    from tests.platform.api.test_model_router_api import model_based_definition
+
+    first, second, decision = (UUID(int=value) for value in (901, 902, 903))
+    definition = model_based_definition(decision, first, second)
+    definition["nodes"] = [node for node in definition["nodes"] if node["type"] != "fallback"]
+    definition["edges"] = [edge for edge in definition["edges"]
+                           if edge["source"] != "fallback" and edge["target"] != "fallback"]
+    next(node for node in definition["nodes"]
+         if node["type"] == "strategy")["decision_prompt"] = prompt
+    document = {
+        "router_id": str(UUID(int=904)), "router_name": "unit-router", "router_version": 1,
+        "gateway_profile_id": "90000000-0000-4000-8000-000000000002",
+        "status": "published", "owner_email": "offline@example.test",
+        "assigned_user_ids": [], "allowed_subscription_ids": ["unit-subscription"],
+        "definition": definition,
+        "candidates_by_id": {str(model_id): {
+            "model_id": str(model_id), "apim_alias": alias, "display_name": alias,
+            "provider_name": "Unit", "runtime_name": "Unit", "profile": "openai-v1",
+            "capabilities": [], "context_window": 16384,
+            "input_cost_per_million": 1.0, "output_cost_per_million": 2.0,
+            "effective_cost_per_million": 2.0,
+        } for model_id, alias in ((first, "candidate-a"), (second, "candidate-b"))},
+        "routing_models_by_id": {str(decision): {
+            "model_id": str(decision), "apim_alias": "decision-alias",
+            "upstream_model": "decision-deployment", "display_name": "Decision",
+            "provider_name": "Unit", "runtime_name": "Unit",
+            "decision_protocol": "chat_json", "auth_mode": "gateway_route",
+            "capabilities": [], "max_tokens_field": "max_completion_tokens",
+            "input_cost_per_million": 1.0, "output_cost_per_million": 2.0,
+        }},
+    }
+    body = json.dumps({"model": "unit-router",
+                       "messages": [{"role": "user", "content": "Select a candidate"}]})
+    expressions = native_router_expressions()
+    request = run_cases(compiled_expressions, tmp_path, [{
+        "body": body, "subscription": True, "operation": "chat-completions",
+        "expression": expression_id(expressions["routerDecisionBody"]),
+        "variables": {
+            "routerCachedEntityJson": json.dumps({"Document": json.dumps(document)}),
+            "routerOriginalRequestBody": body,
+            "routerCallerRequestId": str(UUID(int=906)),
+            "routerRequestedModel": "unit-router",
+            "routerDecisionRequestId": str(UUID(int=905)),
+        },
+        "steps": [{"variable": "routerPlanState",
+                   "expression": expression_id(expressions["routerPlanState"])}],
+    }])[0]
+    decision_body = json.loads(request)
+    assert decision_body["response_format"] == {"type": "json_object"}
+    system = decision_body["messages"][0]["content"]
+    assert system.startswith(prompt.split("\n")[0])
+    assert "json" in system.casefold()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("status_code,outcome", [
+    (200, "succeeded"), (429, "rate_limited"), (504, "timeout"),
+])
+def test_native_router_model_decision_rewrites_only_to_an_eligible_gateway_alias(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, stream: bool,
+    status_code: int, outcome: str,
+) -> None:
+    from tests.platform.api.test_model_router_api import model_based_definition
+
+    first, second, decision = (UUID(int=value) for value in (901, 902, 903))
+    definition = model_based_definition(decision, first, second)
+    definition["nodes"] = [node for node in definition["nodes"] if node["type"] != "fallback"]
+    definition["edges"] = [edge for edge in definition["edges"]
+                           if edge["source"] != "fallback" and edge["target"] != "fallback"]
+    candidates = {str(model_id): {
+        "model_id": str(model_id), "apim_alias": alias, "display_name": alias,
+        "provider_name": "Unit", "runtime_name": "Unit", "profile": "openai-v1",
+        "capabilities": [], "context_window": 16384,
+        "input_cost_per_million": 1.0, "output_cost_per_million": 2.0,
+        "effective_cost_per_million": 2.0,
+    } for model_id, alias in ((first, "candidate-a"), (second, "candidate-b"))}
+    document = {
+        "router_id": str(UUID(int=904)), "router_name": "unit-router", "router_version": 1,
+        "gateway_profile_id": "90000000-0000-4000-8000-000000000002",
+        "status": "published", "owner_email": "offline@example.test",
+        "assigned_user_ids": [], "allowed_subscription_ids": ["unit-subscription"],
+        "definition": definition,
+        "candidates_by_id": candidates,
+        "routing_models_by_id": {str(decision): {
+            "model_id": str(decision), "apim_alias": "decision-alias",
+            "upstream_model": "provider-deployment-not-a-public-alias",
+            "display_name": "Decision", "provider_name": "Unit", "runtime_name": "Unit",
+            "decision_protocol": "chat_json", "auth_mode": "gateway_route",
+            "capabilities": [], "max_tokens_field": "max_completion_tokens",
+            "input_cost_per_million": 1.0, "output_cost_per_million": 2.0,
+        }},
+    }
+    body = json.dumps({
+        "model": "unit-router", "messages": [{"role": "user", "content": "Select candidate B"}],
+        "stream": stream, "router_context": {"task_type": "unit"},
+    })
+    expressions = native_router_expressions()
+    variables = {
+        "routerCachedEntityJson": json.dumps({"Document": json.dumps(document)}),
+        "routerOriginalRequestBody": body,
+        "routerCallerRequestId": str(UUID(int=906)),
+        "routerRequestedModel": "unit-router",
+        "routerDecisionRequestId": str(UUID(int=905)),
+        "routerDecisionHttp": {
+            "__response": True, "status": 200, "headers": {}, "body": json.dumps({
+                "choices": [{"message": {"content": json.dumps({
+                    "model_id": str(second), "rationale": "Eligible candidate B",
+                })}}], "usage": {"prompt_tokens": 11, "completion_tokens": 2, "total_tokens": 13},
+            }),
+        },
+    }
+    case: dict[str, Any] = {"body": body, "subscription": True, "operation": "chat-completions",
+            "variables": variables, "steps": [{
+                "variable": "routerPlanState",
+                "expression": expression_id(expressions["routerPlanState"]),
+            }]}
+    request, routed = run_cases(compiled_expressions, tmp_path, [
+        {**case, "expression": expression_id(expressions["routerDecisionBody"])},
+        {**case, "steps": [*case["steps"], {
+            "variable": "routerPlanState",
+            "expression": expression_id(expressions["routerDecisionResult"]),
+        }], "expression": expression_id(expressions["routerCandidateBody"])},
+    ])
+    decision_body = json.loads(request)
+    assert decision_body["model"] == "decision-alias" and decision_body["stream"] is False
+    result = json.loads(routed)
+    assert result["model"] == "candidate-b" and result["stream"] is stream
+    assert "router_context" not in result
+    assert result["messages"] == json.loads(body)["messages"]
+    completion_steps = [*case["steps"], {
+        "variable": "routerPlanState",
+        "expression": expression_id(expressions["routerDecisionResult"]),
+    }]
+    if status_code >= 400 and "routerFailedAttempt" in expressions:
+        completion_steps.append({
+            "variable": "routerPlanState",
+            "expression": expression_id(expressions["routerFailedAttempt"]),
+        })
+    completion_case = {**case, "response_status": status_code, "steps": [*completion_steps, {
+        "variable": "routerOutboundCompleted",
+        "expression": expression_id(expressions["routerOutboundCompleted"]),
+    }], "expression": expression_id(expressions["routerTraceBody"])}
+    entity = json.loads(run_cases(compiled_expressions, tmp_path, [completion_case])[0])
+    trace = json.loads(entity["Document"])
+    assert trace["native_usage_recorded"] is True
+    assert trace["selected_model_id"] == str(second)
+    assert len(trace["attempts"]) == 2
+    decision_attempt, candidate_attempt = trace["attempts"]
+    assert decision_attempt["attempt_role"] == "routing_decision"
+    assert decision_attempt["outcome"] == "succeeded"
+    assert candidate_attempt["attempt_role"] == "candidate"
+    assert candidate_attempt["model_id"] == str(second)
+    assert candidate_attempt["model_name"] == "candidate-b"
+    assert candidate_attempt["status_code"] == status_code
+    assert candidate_attempt["outcome"] == outcome
+    assert candidate_attempt["sequence"] == 2
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_native_router_system_one_decision_uses_the_gateway_decision_operation(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, stream: bool,
+) -> None:
+    from tests.platform.api.test_model_router_api import model_based_definition
+
+    first, second, decision = (UUID(int=value) for value in (901, 902, 903))
+    definition = model_based_definition(decision, first, second)
+    definition["nodes"] = [node for node in definition["nodes"] if node["type"] != "fallback"]
+    definition["edges"] = [edge for edge in definition["edges"]
+                           if edge["source"] != "fallback" and edge["target"] != "fallback"]
+    document: dict[str, Any] = {
+        "router_id": str(UUID(int=904)), "router_name": "unit-router", "router_version": 1,
+        "gateway_profile_id": "90000000-0000-4000-8000-000000000002",
+        "status": "published", "owner_email": "offline@example.test",
+        "assigned_user_ids": [], "allowed_subscription_ids": ["unit-subscription"],
+        "definition": definition,
+        "candidates_by_id": {str(model_id): {
+            "model_id": str(model_id), "apim_alias": alias, "display_name": alias,
+            "provider_name": "Unit", "runtime_name": "Unit", "profile": "openai-v1",
+            "capabilities": [], "context_window": 16384,
+            "input_cost_per_million": 1.0, "output_cost_per_million": 2.0,
+            "effective_cost_per_million": 2.0,
+        } for model_id, alias in ((first, "candidate-a"), (second, "candidate-b"))},
+        "routing_models_by_id": {str(decision): {
+            "model_id": str(decision), "apim_alias": "decision-1",
+            "upstream_model": "Decision-1-deployment", "display_name": "Decision-1",
+            "provider_name": "Microsoft Foundry", "runtime_name": "Unit",
+            "decision_protocol": "system_one", "auth_mode": "gateway_route",
+            "capabilities": ["decision"], "input_cost_per_million": 0.042,
+            "output_cost_per_million": 0.0,
+        }},
+    }
+    body = json.dumps({
+        "model": "unit-router", "messages": [{"role": "user", "content": "Prove a theorem"}],
+        "stream": stream,
+    })
+    expressions = native_router_expressions()
+    case: dict[str, Any] = {"body": body, "subscription": True, "operation": "chat-completions",
+            "variables": {
+                "routerCachedEntityJson": json.dumps({"Document": json.dumps(document)}),
+                "routerOriginalRequestBody": body,
+                "routerCallerRequestId": str(UUID(int=906)),
+                "routerRequestedModel": "unit-router",
+                "routerDecisionRequestId": str(UUID(int=905)),
+                "routerDecisionHttp": {
+                    "__response": True, "status": 200, "headers": {}, "body": json.dumps({
+                        "answers": {"route": {
+                            "choice": str(second), "confidence": 0.86, "type": "choice",
+                            "probabilities": {str(first): 0.14, str(second): 0.86},
+                        }},
+                        "usage": {"input_tokens": 92, "output_tokens": 3},
+                    }),
+                },
+            }, "steps": [{
+                "variable": "routerPlanState",
+                "expression": expression_id(expressions["routerPlanState"]),
+            }]}
+    decided = [*case["steps"], {
+        "variable": "routerPlanState",
+        "expression": expression_id(expressions["routerDecisionResult"]),
+    }]
+    url, request, routed, stored = run_cases(compiled_expressions, tmp_path, [
+        {**case, "expression": expression_id(expressions["routerDecisionUrl"])},
+        {**case, "expression": expression_id(expressions["routerDecisionBody"])},
+        {**case, "steps": decided, "expression": expression_id(expressions["routerCandidateBody"])},
+        {**case, "steps": [*decided, {
+            "variable": "routerOutboundCompleted",
+            "expression": expression_id(expressions["routerOutboundCompleted"]),
+        }], "expression": expression_id(expressions["routerTraceBody"])},
+    ])
+    assert url == "https://unit.azure-api.net/turnstile/providers/microsoft/v1/systemone"
+    decision_body = json.loads(request)
+    assert set(decision_body) == {"model", "state", "questions"}
+    assert decision_body["model"] == "decision-1"
+    route = decision_body["questions"]["route"]
+    assert route["type"] == "choice" and set(route["criteria"]) == {str(first), str(second)}
+    assert analyze(compiled_expressions, tmp_path, "microsoft-decision", decision_body)[
+        "error"] == ""
+    assert json.loads(routed)["model"] == "candidate-b"
+    trace = json.loads(json.loads(stored)["Document"])
+    assert trace["native_usage_recorded"] is True
+    assert trace["selected_model_id"] == str(second)
+    decision_attempt = trace["attempts"][0]
+    assert decision_attempt["attempt_role"] == "routing_decision"
+    assert decision_attempt["decision_protocol"] == "system_one"
+    assert decision_attempt["outcome"] == "succeeded"
+    assert decision_attempt["request_id"] == str(UUID(int=905))
+    assert decision_attempt["decision_probabilities"] == {str(first): 0.14, str(second): 0.86}
+    chat = {**document["routing_models_by_id"][str(decision)], "decision_protocol": "chat_json"}
+    chat_document = {**document, "routing_models_by_id": {str(decision): chat}}
+    chat_url = run_cases(compiled_expressions, tmp_path, [{
+        **case, "variables": {**case["variables"], "routerCachedEntityJson": json.dumps({
+            "Document": json.dumps(chat_document),
+        })}, "expression": expression_id(expressions["routerDecisionUrl"]),
+    }])[0]
+    assert chat_url == "https://unit.azure-api.net/turnstile/chat/completions"
+
+
+@pytest.mark.parametrize("state_variable,expression_name", [
+    ("routerOutboundCompleted", "routerNameHeader"),
+    ("routerPlanState", "routerPlanStateNameHeader"),
+    ("routerAnthropicCompleted", "routerAnthropicCompletedNameHeader"),
+])
+def test_native_router_name_header_is_ascii_for_any_router_name(
+    compiled_expressions: tuple[Path, str], tmp_path: Path,
+    state_variable: str, expression_name: str,
+) -> None:
+    expression = native_router_expressions()[expression_name]
+    names = ["Unified Router 1", "统一条件路由", "50% router"]
+
+    values = run_cases(compiled_expressions, tmp_path, [{
+        "body": "{}", "expression": expression_id(expression),
+        "variables": {state_variable: json.dumps({"router_name": name})},
+    } for name in names])
+
+    assert values == [
+        "Unified Router 1", "%E7%BB%9F%E4%B8%80%E6%9D%A1%E4%BB%B6%E8%B7%AF%E7%94%B1",
+        "50% router",
+    ]
+
+
+def test_native_router_keeps_other_owner_name_access_after_stale_backfill(
+    compiled_expressions: tuple[Path, str], tmp_path: Path,
+    router_repository: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.platform.api.test_model_router_api import same_name_router_backfill_scenario
+
+    before, after, second_id = same_name_router_backfill_scenario(router_repository, monkeypatch)
+    expressions = native_router_expressions()
+    body = json.dumps({
+        "model": "Shared owner backfill", "messages": [{"role": "user", "content": "Hello"}],
+    })
+    cases = [{
+        "expression": expression_id(expressions["routerPlanState"]),
+        "body": body, "subscription": True, "operation": "chat-completions", "variables": {
+            "routerCachedEntityJson": json.dumps(entity),
+            "routerOriginalRequestBody": body,
+            "routerRequestedModel": "Shared owner backfill",
+            "routerCallerRequestId": str(UUID(int=907)),
+        },
+    } for entity in (before, after)]
+    for result in run_cases(compiled_expressions, tmp_path, cases):
+        planned = json.loads(result)
+        assert not planned.get("access_denied", False)
+        assert planned["router_id"] == str(second_id)
+        assert planned["selected_candidate"]["model_id"]
 
 
 @pytest.mark.parametrize("mode,version,subscription,person,allowed", [
@@ -237,6 +1093,10 @@ def compiled_expressions(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path
         if name.isupper() and isinstance(value, str) and value.startswith("@")
     }
     expressions.update(application_tpm_expressions().values())
+    expressions.update(application_attribution_expressions().values())
+    expressions.update(native_router_expressions().values())
+    expressions.update(business_denial_expressions().values())
+    expressions.add(text_usage_expression())
     expressions.update(value for name, value in vars(availability).items()
                        if name.isupper() and isinstance(value, str) and value.startswith("@"))
     expressions.add(storage_routes.READ_FIXED_CONTENT)
@@ -570,6 +1430,28 @@ def test_execution_tpm_rejects_unproven_or_invalid_rate_without_a_default(
         },
     }])[0]
     assert result == 0
+
+
+@pytest.mark.parametrize("person", [True, False])
+def test_application_traffic_keeps_validated_person_organization(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, person: bool,
+) -> None:
+    expressions = application_attribution_expressions()
+    person_headers = {
+        "x-org-id": "org-person", "x-org-name": "Person Org",
+        "x-department-id": "department-person", "x-department-name": "Person Department",
+    }
+    registered = {
+        "organizationId": "org-application", "organizationName": "Application Org",
+        "departmentId": "department-application", "departmentName": "Application Department",
+    }
+    values = run_cases(compiled_expressions, tmp_path, [{
+        "body": "{}", "expression": expression_id(expression), "headers": person_headers,
+        "variables": {"hasEmployeeToken": person, "applicationMapState": registered},
+    } for expression in expressions.values()])
+    assert dict(zip(expressions, values, strict=True)) == (
+        person_headers if person else dict(zip(person_headers, registered.values(), strict=True))
+    )
 
 
 def analyze(
@@ -1272,6 +2154,410 @@ def test_execution_composition_preserves_public_identity_limits_and_routing() ->
             template,
             enabled=True,
         )
+
+
+def test_execution_composition_settles_image_responses() -> None:
+    from turnstile_core.integrations.apim_policy_components import (
+        _image_usage,
+        serialize_policy,
+        validate_parent_policy,
+    )
+
+    template = (ROOT / "infra/policies/foundry-finops-policy.xml").read_text()
+    composed = compiler.compose_budget_execution_parent(template, template, enabled=True)
+    root = parse_policy(composed)
+    image, text = (root.find(
+        f"./outbound/choose/otherwise/choose/{branch}/set-variable[@name='usagePayload']",
+    ) for branch in ("when", "otherwise"))
+    assert image is not None and image.get("value") == compiler.COMPLETE_IMAGE_USAGE
+    assert text is not None and text.get("value") == compiler.COMPLETE_USAGE
+    image.set("value", _image_usage().attrib["value"])
+    validate_parent_policy(serialize_policy(root), composed)
+
+
+def image_response(change: dict[str, int]) -> str:
+    cached = change.get("cached")
+    usage = {
+        "input_tokens": 20, "output_tokens": 229, "total_tokens": 249 + change.get("total", 0),
+        "input_tokens_details": {
+            "text_tokens": 20 - change.get("input_image", 0),
+            "image_tokens": change.get("input_image", 0),
+            **({"cached_tokens": cached} if cached is not None else {}),
+        },
+        "output_tokens_details": {
+            "text_tokens": change.get("output_text", 0),
+            "image_tokens": 229 - change.get("output_text", 0),
+        },
+    }
+    return json.dumps({"created": 1, "data": [{"b64_json": "A" * 2_000_000}], "usage": usage})
+
+
+@pytest.mark.parametrize("change,complete", [
+    ({}, True), ({"cached": 5}, True), ({"input_image": 3}, False),
+    ({"output_text": 4}, False), ({"total": 1}, False),
+])
+def test_image_completion_usage_settles_only_exact_text_to_image_usage(
+    compiled_expressions: tuple[Path, str], tmp_path: Path,
+    change: dict[str, int], complete: bool,
+) -> None:
+    result = run_cases(compiled_expressions, tmp_path, [{
+        "expression": expression_id(compiler.COMPLETE_IMAGE_USAGE), "body": "{}",
+        "operation": "images-generations", "response": image_response(change), "variables": {},
+    }])[0]
+    assert result["usage_complete"] is complete
+    if complete:
+        cached = change.get("cached", 0)
+        assert (result["input_tokens"], result["cached_tokens"], result["cache_write_tokens"],
+                result["output_tokens"], result["tokens_consumed"]) == (
+            20 - cached, cached, 0, 229, 249,
+        )
+    else:
+        assert result["ingest_error"] == "usage_parse_failed"
+
+
+@pytest.mark.parametrize("operation", ["responses", "responses-compact", "chat-completions"])
+@pytest.mark.parametrize("reader", ["template", "fixed_program"])
+@pytest.mark.parametrize("details,expected", [
+    ({"cache_write_tokens": 2115, "cached_tokens": 0}, (3, 2115, 2115, 5, 2123)),
+    ({"cache_write_tokens": 0, "cached_tokens": 2115}, (3, 2115, 0, 5, 2123)),
+    ({"cache_write_tokens": 1115, "cached_tokens": 1000}, (3, 2115, 1115, 5, 2123)),
+    ({}, (2118, 0, 0, 5, 2123)),
+])
+def test_responses_completion_preserves_cache_buckets(
+    compiled_expressions: tuple[Path, str], tmp_path: Path,
+    operation: str, reader: str, details: dict[str, int], expected: tuple[int, int, int, int, int],
+) -> None:
+    chat = operation == "chat-completions"
+    response = json.dumps({"status": "completed", "usage": {
+        "prompt_tokens" if chat else "input_tokens": 2118,
+        "prompt_tokens_details" if chat else "input_tokens_details": details,
+        "completion_tokens" if chat else "output_tokens": 5, "total_tokens": 2123,
+    }})
+    model_id = UUID(int=4)
+    projection = BudgetPriceProjection.create(model_id, ModelPrice(
+        input_price_per_million=10, cached_price_per_million=1,
+        cache_write_price_per_million=20, output_price_per_million=30,
+    ), NOW)
+    receipt = LedgerAdmissionReceipt(
+        identity=identity(model_id=str(model_id)), epoch=EPOCH, reserved_tokens=3000,
+        budget_mode="usd", reserved_usd=Decimal("1"), price_snapshot=projection,
+    )
+    expression = compiler.COMPLETE_USAGE if reader == "fixed_program" else text_usage_expression()
+    result = run_cases(compiled_expressions, tmp_path, [{
+        "expression": expression_id(expression), "body": "{}",
+        "operation": operation, "response": response,
+        "variables": {
+            "isResponsesOperation": not chat,
+            "executionDispatch": {"receipts": [receipt.model_dump(mode="json")]},
+            "executionPlan": {"model_id": str(model_id)},
+        },
+    }])[0]
+    assert result["estimated"] is False
+    assert tuple(result[field] for field in (
+        "input_tokens", "cached_tokens", "cache_write_tokens", "output_tokens",
+    )) == expected[:4]
+    assert result["input_tokens"] + result["cached_tokens"] + result["output_tokens"] == 2123
+    if reader == "fixed_program":
+        assert result["usage_complete"] is True and result["tokens_consumed"] == expected[4]
+        expected_usd = (Decimal(expected[0]) * Decimal("10")
+                        + Decimal(expected[1] - expected[2]) * Decimal("1")
+                        + Decimal(expected[2]) * Decimal("20")
+                        + Decimal(expected[3]) * Decimal("30")) / Decimal(1_000_000)
+        assert Decimal(result["usd_cost"]) == expected_usd
+        assert result["budget_price_projection"] == projection.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("details", [
+    {"cached_tokens": 2115, "cache_write_tokens": 2115},
+    {"cached_tokens": 0, "cache_write_tokens": 2119},
+    {"cached_tokens": 0, "cache_write_tokens": -1},
+    {"cached_tokens": 0, "cache_write_tokens": "2115"},
+    {"cached_tokens": 0, "cache_write_tokens": None},
+])
+def test_responses_completion_rejects_inconsistent_cache_buckets(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, details: dict[str, Any],
+) -> None:
+    result = run_cases(compiled_expressions, tmp_path, [{
+        "expression": expression_id(compiler.COMPLETE_USAGE), "body": "{}",
+        "operation": "responses", "response": json.dumps({"status": "completed", "usage": {
+            "input_tokens": 2118, "input_tokens_details": details,
+            "output_tokens": 5, "total_tokens": 2123,
+        }}), "variables": {},
+    }])[0]
+    assert result["usage_complete"] is False and result["estimated"] is True
+    assert result["input_tokens"] is None and result["cached_tokens"] is None
+
+
+@pytest.mark.parametrize("scope_type", ["person", "application"])
+def test_responses_cache_usage_settles_original_price_once(
+    compiled_expressions: tuple[Path, str], tmp_path: Path, scope_type: str,
+) -> None:
+    scope = LedgerScope.model_validate({
+        "scope_type": scope_type,
+        "scope_id": "unit-cache-budget" if scope_type == "person" else str(UUID(int=8)),
+        "period_start": identity().scope.period_start,
+    })
+    current = summary(
+        limit=0, scope=scope, budget_mode="usd", usd_limit=Decimal("5"),
+        confirmed_usd=Decimal("0.004196000"),
+    )
+    model_id = UUID(int=4)
+    projection = BudgetPriceProjection.create(model_id, ModelPrice(
+        input_price_per_million=1.25, cached_price_per_million=0.125,
+        cache_write_price_per_million=0.125, output_price_per_million=10,
+    ), NOW)
+    expected = (Decimal(3) * Decimal("1.25") + Decimal(2115) * Decimal("0.125")
+                + Decimal(5) * Decimal("10")) / Decimal(1_000_000)
+    assert expected == Decimal("0.000318125")
+
+    for streamed in (False, True):
+        request = identity(f"cache-{scope_type}-{streamed}", scope=scope, model_id=str(model_id))
+        current, attempt = reserve_ledger(
+            current, request, 3000, current.updated_at,
+            reserved_usd=Decimal("0.01"), price_snapshot=projection,
+        )
+        receipt = LedgerAdmissionReceipt(
+            identity=request, epoch=EPOCH, reserved_tokens=3000, budget_mode="usd",
+            reserved_usd=Decimal("0.01"), price_snapshot=projection,
+        )
+        native = {"input_tokens": 2118, "output_tokens": 5, "total_tokens": 2123,
+                  "input_tokens_details": {
+                      "cached_tokens": 2115 if streamed else 0,
+                      "cache_write_tokens": 0 if streamed else 2115,
+                  }}
+        response = json.dumps({"status": "completed", "usage": native})
+        if streamed:
+            response = "event: response.completed\ndata: " + json.dumps({
+                "type": "response.completed", "response": {"status": "completed", "usage": native},
+            }) + "\n\n"
+        variables = {
+            "executionDispatch": {"receipts": [receipt.model_dump(mode="json")]},
+            "executionPlan": {"model_id": str(model_id)},
+        }
+        usage = run_cases(compiled_expressions, tmp_path, [{
+            "expression": expression_id(compiler.COMPLETE_USAGE), "body": "{}",
+            "operation": "responses", "response": response, "variables": variables,
+        }])[0]
+        if streamed:
+            assert usage["usage_complete"] is False
+        else:
+            assert usage["usage_complete"] is True
+            assert Decimal(usage["usd_cost"]) == expected
+            completed = run_cases(compiled_expressions, tmp_path, [{
+                "expression": expression_id(compiler.COMPLETION), "body": "{}",
+                "operation": "responses", "variables": {
+                    "usagePayload": usage, "executionReceipt": receipt.model_dump(mode="json"),
+                    "executionSummaryRead": stored_response(current.model_dump(mode="json")),
+                    "executionAttemptRead": stored_response(attempt.model_dump(mode="json")),
+                },
+            }])[0]
+            assert completed["error"] == "" and completed["already_settled"] is False
+            current = LedgerSummary.model_validate(completed["summary"])
+            attempt = LedgerAttempt.model_validate(completed["attempt"])
+            assert attempt.actual_usd == expected
+            assert attempt.completion_evidence is not None
+
+        observed = responses_observer_event(receipt, native, streamed)
+        assert observed["usage_complete"] is True
+        assert (observed["input_tokens"], observed["cached_tokens"], observed["output_tokens"]) == (
+            3, 2115, 5,
+        )
+        assert observed["cache_write_tokens"] == (0 if streamed else 2115)
+        formal = LedgerCharge(
+            identity=request, epoch=EPOCH, revision=1, evidence_rank=3,
+            evidence_key="observer:" + observed["id"], total_tokens=2123,
+            budget_mode="usd", actual_usd=expected, price_snapshot=projection,
+        )
+        previous = current
+        current, attempt = settle_ledger(current, attempt, formal, current.updated_at)
+        if not streamed:
+            assert current is previous
+        duplicate, duplicate_attempt = settle_ledger(current, attempt, formal, current.updated_at)
+        assert duplicate is current and duplicate_attempt is attempt
+        assert attempt.actual_usd == expected and attempt.actual_tokens == 2123
+        assert current.active_reserved_usd == 0
+        with pytest.raises(LedgerProtocolConflict, match="conflicting amount"):
+            settle_ledger(current, attempt, formal.model_copy(update={
+                "actual_usd": expected + Decimal("0.00000000000001"),
+            }), current.updated_at)
+        with pytest.raises(LedgerProtocolConflict, match="admitted price snapshot"):
+            settle_ledger(current, attempt, formal.model_copy(update={
+                "price_snapshot": projection.model_copy(update={"price_sha256": "f" * 64}),
+            }), current.updated_at)
+
+    assert current.confirmed_usd == Decimal("0.004832250")
+    assert current.confirmed_usd - Decimal("0.004196000") == Decimal("0.000636250")
+
+
+@pytest.mark.parametrize("case_name,cache_read,cache_write", [
+    ("json_write", 0, 2115), ("json_read", 2115, 0), ("json_uncached", 0, 0),
+    ("sse_write", 0, 2115), ("sse_read", 2115, 0), ("sse_uncached", 0, 0),
+    ("old_json", 0, 2115),
+])
+def test_responses_formal_tasks_apply_once_without_hiding_conflicts(
+    compiled_expressions: tuple[Path, str], tmp_path: Path,
+    pricing_postgres: tuple[str, Event], case_name: str, cache_read: int, cache_write: int,
+) -> None:
+    from unittest.mock import Mock
+    from uuid import uuid4
+
+    from turnstile_core.domain.gateway_targets import gateway_deployment_id_for
+    from turnstile_core.ingestion.processor import CoefficientResolver, UsageProcessor
+    from turnstile_core.persistence.repository import PostgreSqlOpsDbProxy
+    from turnstile_core.services.budget_settlement import BudgetSettlementService
+
+    scope = identity().scope.model_copy(update={"scope_id": "cache-" + uuid4().hex})
+    request = identity("formal-" + uuid4().hex, scope=scope, model_id=str(UUID(int=4)))
+    projection = BudgetPriceProjection.create(UUID(int=4), ModelPrice(
+        input_price_per_million=1.25, cached_price_per_million=0.125,
+        cache_write_price_per_million=0.125, output_price_per_million=10,
+    ), NOW)
+    current, attempt = reserve_ledger(
+        summary(limit=0, scope=scope, budget_mode="usd", usd_limit=Decimal("5")),
+        request, 3000, NOW, reserved_usd=Decimal("0.01"), price_snapshot=projection,
+    )
+    receipt = LedgerAdmissionReceipt(
+        identity=request, epoch=EPOCH, reserved_tokens=3000, budget_mode="usd",
+        reserved_usd=Decimal("0.01"), price_snapshot=projection,
+    )
+    streamed = case_name.startswith("sse")
+    native = {"input_tokens": 2118, "output_tokens": 5, "total_tokens": 2123,
+              "input_tokens_details": {
+                  "cached_tokens": cache_read, "cache_write_tokens": cache_write,
+              }}
+    if not streamed:
+        usage = run_cases(compiled_expressions, tmp_path, [{
+            "expression": expression_id(compiler.COMPLETE_USAGE), "body": "{}",
+            "operation": "responses",
+            "response": json.dumps({"status": "completed", "usage": native}),
+            "variables": {},
+        }])[0]
+        if case_name == "old_json":
+            usage.update(input_tokens=2118, cached_tokens=0, cache_write_tokens=0)
+        current, attempt = complete_ledger(current, attempt, receipt, completion(
+            2123, input_tokens=usage["input_tokens"], cached_tokens=usage["cached_tokens"],
+            cache_write_tokens=usage["cache_write_tokens"], output_tokens=usage["output_tokens"],
+        ), NOW)
+    before = current
+    observed = responses_observer_event(receipt, native, streamed)
+    expected = (Decimal(2118 - cache_read - cache_write) * Decimal("1.25")
+                + Decimal(cache_read + cache_write) * Decimal("0.125")
+                + Decimal(5) * Decimal("10")) / Decimal(1_000_000)
+    info, _waiting = pricing_postgres
+    repository = PostgreSqlOpsDbProxy(info)
+    try:
+        with repository._connection() as connection:
+            connection.execute(
+                "INSERT INTO gateway_profile(id,name,implementation) VALUES(%s,%s,'apim') "
+                "ON CONFLICT DO NOTHING", (request.gateway_profile_id, "Unit cache accounting"),
+            )
+            connection.execute(
+                """INSERT INTO apim_target_metadata (
+                   gateway_profile_id, arm_resource_id, tenant_id, subscription_id, resource_group,
+                   service_name, api_id, api_path, service_tier, tier_family, service_location,
+                   ownership_mode
+                   ) VALUES (%s,%s,%s,%s,'unit','unit-service','unit','unit','Developer',
+                             'classic','unit','turnstile_managed') ON CONFLICT DO NOTHING""",
+                (
+                    request.gateway_profile_id,
+                    "/subscriptions/" + str(EPOCH) + "/resourceGroups/unit/"
+                    "providers/Microsoft.ApiManagement/service/unit-service", EPOCH, EPOCH,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO gateway_deployment (
+                   id,apim_target_id,native_gateway_id,kind,display_name,hosting_mode,lifecycle_ownership
+                   ) VALUES (%s,%s,'managed','managed','Unit','azure_managed','turnstile_iac')
+                   ON CONFLICT DO NOTHING""",
+                (
+                    gateway_deployment_id_for(request.gateway_profile_id, "managed"),
+                    request.gateway_profile_id,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO budget_execution_scope (
+                   scope_type,scope_id,period_start,epoch,state,admitted_after,legacy_fence_verified_at
+                   ) VALUES ('person',%s,%s,%s,'active',%s,%s)""",
+                (scope.scope_id, scope.period_start, EPOCH, NOW, NOW),
+            )
+        processor = UsageProcessor(repository, CoefficientResolver({}), execution_enabled=True)
+        assert processor.process(observed) is True
+        with repository._connection() as connection:
+            queued = connection.execute(
+                "SELECT * FROM budget_settlement_task WHERE scope_id=%s", (scope.scope_id,),
+            ).fetchone()
+        assert queued is not None
+        assert queued["actual_usd"] == expected
+        assert queued["price_snapshot"] == projection.model_dump(mode="json")
+        assert (
+            queued["evidence_rank"], queued["revision"], queued["applied_revision"],
+        ) == (3, 1, 0)
+
+        def apply(charge: LedgerCharge) -> tuple[LedgerSummary, LedgerAttempt]:
+            nonlocal current, attempt
+            current, attempt = settle_ledger(current, attempt, charge, datetime.now(UTC))
+            return current, attempt
+
+        ledger = Mock()
+        ledger.settle.side_effect = apply
+        service = BudgetSettlementService(repository, ledger)
+        assert service.drain(observed["id"], limit=1) == int(case_name != "old_json")
+        with repository._connection() as connection:
+            applied = connection.execute(
+                "SELECT * FROM budget_settlement_task WHERE id=%s", (queued["id"],),
+            ).fetchone()
+        assert applied is not None and applied["attempts"] == 1
+        if case_name == "old_json":
+            assert current is before and current.confirmed_usd == Decimal("0.002697500")
+            assert applied["applied_revision"] == 0 and applied["applied_at"] is None
+            assert applied["last_error"] == "LedgerProtocolConflict"
+        else:
+            assert applied["applied_revision"] == 1 and applied["applied_at"] is not None
+            assert applied["last_error"] is None
+            assert current.confirmed_usd == expected and current.active_reserved_usd == 0
+            assert processor.process(observed) is True
+            assert service.drain(observed["id"], limit=1) == 0
+            with repository._connection() as connection:
+                repeated = connection.execute(
+                    "SELECT revision,applied_revision,attempts FROM budget_settlement_task "
+                    "WHERE id=%s",
+                    (queued["id"],),
+                ).fetchone()
+            assert repeated is not None
+            assert (
+                repeated["revision"], repeated["applied_revision"], repeated["attempts"],
+            ) == (1, 1, 1)
+            duplicate, duplicate_attempt = settle_ledger(
+                current, attempt, ledger.settle.call_args.args[0], datetime.now(UTC),
+            )
+            assert duplicate is current and duplicate_attempt is attempt
+            assert current.confirmed_usd == expected
+    finally:
+        repository.close()
+
+
+def test_image_response_settles_its_ledger_reservation(
+    compiled_expressions: tuple[Path, str], tmp_path: Path,
+) -> None:
+    initial = summary()
+    reserved, attempt = reserve_ledger(initial, identity(), 500, NOW)
+    receipt = LedgerAdmissionReceipt(identity=identity(), epoch=EPOCH, reserved_tokens=500)
+    expected, expected_attempt = complete_ledger(reserved, attempt, receipt, completion(249), NOW)
+    result = run_cases(compiled_expressions, tmp_path, [{
+        "expression": expression_id(compiler.COMPLETION), "body": "{}",
+        "operation": "images-generations", "response": image_response({}),
+        "variables": {
+            "executionSummaryRead": stored_response(reserved.model_dump(mode="json")),
+            "executionAttemptRead": stored_response(attempt.model_dump(mode="json")),
+            "executionReceipt": receipt.model_dump(mode="json"),
+        },
+        "steps": [{"variable": "usagePayload",
+                   "expression": expression_id(compiler.COMPLETE_IMAGE_USAGE)}],
+    }])[0]
+    assert result["error"] == "" and result["already_settled"] is False
+    assert result["attempt"]["actual_tokens"] == expected_attempt.actual_tokens == 249
+    for field in ("confirmed_tokens", "active_reserved_tokens", "upper_bound_tokens"):
+        assert result["summary"][field] == getattr(expected, field)
 
 
 @pytest.mark.parametrize(

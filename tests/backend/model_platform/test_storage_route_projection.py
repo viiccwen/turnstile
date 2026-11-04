@@ -1213,6 +1213,127 @@ def test_managed_approval_renewal_compares_raw_publication_not_decorated_view(
         assert len(renewals) == len(scope_snapshots)
 
 
+def test_approval_renewal_budget_starts_after_slow_program_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import turnstile_core.services.route_publication as route_module
+    from turnstile_core.services.storage_route_publisher import FixedRoutePublisherFactory
+
+    snapshot, program, proof = snapshot_fixture()
+    route = snapshot.routes[0]
+    target = UUID(program.scope.target_id)
+    identity, runtime_id = UUID(int=979), UUID(int=978)
+    raw = {"id": identity, "gateway_profile_id": target, "status": "active",
+           "resource_manifest": {"legacy": "unchanged"}}
+    current: Any = SimpleNamespace(
+        id=identity, gateway_profile_id=target, resource_manifest={},
+        desired_spec=SimpleNamespace(bindings=[SimpleNamespace(
+            model=SimpleNamespace(model_key=route.alias), runtime_id=runtime_id,
+        )]), model_dump=lambda **kwargs: {**raw, "resource_manifest": {"managed_program": True}},
+    )
+    repository = Mock()
+    repository.effective_gateway_publication.side_effect = [raw, deepcopy(raw)]
+    repository.active_model_route_publications.return_value = []
+    repository.registry.return_value = {"runtimes": [{
+        "id": runtime_id, "gateway_profile_id": target, "enabled": True, "config": {},
+    }]}
+    repository.model_availability_proof_guard.return_value = nullcontext()
+    started = max(1100, snapshot.members[0].connection_approval.expires_epoch - 3600)
+    now = [started]
+
+    def verify() -> ProgramCapabilityProof:
+        now[0] += 70
+        return proof.model_copy(update={"issued_epoch": now[0], "expires_epoch": started + 150})
+
+    factory = FixedRoutePublisherFactory(repository, Mock(), active_fence=lambda _: {
+        "protocol_version": 2, "mode": "active", "gateway_profile_id": str(target),
+        "epoch": snapshot.approval.budget_epoch,
+    }, availability_projector=Mock(), clock=lambda: now[0])
+    head = ActiveRouteHead(approval=snapshot.approval, activated_epoch=1100)
+    monkeypatch.setattr(route_module, "recorded_route_snapshot", lambda _: (snapshot, head))
+    monkeypatch.setattr(factory, "_runtime_destination_matches", Mock(return_value=True))
+    monkeypatch.setattr(factory, "_credential_references", Mock(return_value={}))
+    monkeypatch.setattr(factory, "_verify_credential_references", Mock())
+    port, management = Mock(), Mock()
+    port._verifier.verify.side_effect = verify
+    port.projection.read_active.return_value = (head, '"original"')
+    port.projection.read_approval_renewal_history.return_value = None
+    management.verify_route_connection.side_effect = lambda revision: revision.dependency_sha256
+    monkeypatch.setattr(factory, "_open", lambda *args: nullcontext((port, management)))
+    installation: Any = SimpleNamespace(program=program, native_gateway_scope=False)
+    factory._renew_independent_approvals(current, installation, Mock())
+    assert port.projection.publish_approval_renewal.call_count == 1
+    assert port.projection.publish_approval_renewal.call_args.args[3].issued_epoch == started + 70
+
+
+def test_availability_window_starts_after_slow_program_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import nullcontext
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    import turnstile_core.services.route_publication as route_module
+    import turnstile_core.services.storage_route_publisher as publisher_module
+
+    _, program, proof = snapshot_fixture()
+    target = UUID(program.scope.target_id)
+    endpoint = "https://unit.azure-api.net/llm"
+    source = {"id": UUID(int=980), "resource_manifest": {"fixed_route_program": {}}}
+    repository = Mock()
+    repository.effective_gateway_publication.return_value = source
+    repository.get_model_availability_inventory.return_value = {target: "a" * 64}
+    repository.list_gateway_deployments.return_value = [
+        {"retired_at": None, "native_gateway_id": "managed", "endpoint_url": endpoint},
+    ]
+    repository.get_model_availability_states.return_value = {}
+    repository.model_availability_proof_guard.return_value = nullcontext()
+    started = 1100
+    now = [started]
+
+    def verify() -> ProgramCapabilityProof:
+        now[0] += 70
+        return proof.model_copy(update={"issued_epoch": now[0], "expires_epoch": started + 150})
+
+    port = Mock()
+    port._verifier.verify.side_effect = verify
+    head = object()
+    port.projection.read_active.return_value = (head, '"head"')
+    port.projection.read_program_proof.return_value = None
+    port.read_catalog.return_value = []
+    installation = SimpleNamespace(
+        program=program, native_gateway_scope=False, model_additions_enabled=False,
+        gateway_endpoint=endpoint, operation_contracts={"models": ("GET", "/models")},
+    )
+    config = SimpleNamespace(settings=SimpleNamespace(
+        ledger_table_endpoint="https://unitstore.table.core.windows.net",
+        ledger_table_name="Ledger",
+    ))
+    factory = publisher_module.FixedRoutePublisherFactory(
+        repository, Mock(), active_fence=Mock(), availability_projector=Mock(),
+        clock=lambda: now[0],
+    )
+    monkeypatch.setattr(publisher_module, "GatewayPublication", SimpleNamespace(
+        model_validate=lambda _: SimpleNamespace(
+            id=source["id"], desired_spec=SimpleNamespace(bindings=[]),
+        ),
+    ))
+    monkeypatch.setattr(publisher_module, "TableStorageLedger",
+                        lambda *args, **kwargs: nullcontext(Mock()))
+    monkeypatch.setattr(route_module, "recorded_route_snapshot", lambda _: (
+        SimpleNamespace(routes=(), configuration_sha256="c" * 64), head,
+    ))
+    monkeypatch.setattr(factory, "installed", Mock(return_value=(installation, config)))
+    monkeypatch.setattr(factory, "_open", Mock(return_value=nullcontext((port, Mock()))))
+    coverage = factory.verify_availability(target, "a" * 64)
+    assert coverage.verified_at == datetime.fromtimestamp(started + 70, UTC)
+    assert coverage.expires_at == datetime.fromtimestamp(started + 150, UTC)
+    port.projection.publish_program_proof.assert_called_once()
+
+
 class Journal:
     def __init__(self) -> None:
         self.intent: RouteActivationIntent | None = None
@@ -3452,6 +3573,135 @@ def test_foundry_deployment_validation_reads_metadata_without_inference(
         tokens.token.assert_not_called()
 
 
+@pytest.mark.parametrize("source", ["inherited", "named_value", "missing"])
+def test_model_addition_validation_reads_the_credential_its_connection_already_has(
+    source: str,
+) -> None:
+    from pydantic import SecretStr
+
+    from turnstile_core.domain.control_plane import AuthStrategy, PublicationKind
+    from turnstile_core.integrations.apim_control_plane_contract import (
+        CredentialSourceMissingError,
+    )
+    from turnstile_core.services.storage_route_publisher import FixedRoutePublisherFactory
+
+    repository = Mock()
+    repository.gateway_publication_credential.return_value = None
+    factory = FixedRoutePublisherFactory(
+        repository, Mock(), active_fence=Mock(), availability_projector=Mock(),
+    )
+    tokens = Mock()
+    tokens.token.return_value = "unit-only-vault-token"
+    factory._tokens = tokens
+    factory._cipher = Mock()
+    secret_id = "https://unit-vault.vault.azure.net/secrets/unit-key/" + "a" * 32
+    installation = Mock(
+        credential_vault_origin="https://unit-vault.vault.azure.net",
+        trusted_vault_origins=("https://unit-vault.vault.azure.net",),
+    )
+
+    def keyed_binding() -> Mock:
+        return Mock(
+            runtime_config={
+                "project_endpoint": "https://unit.services.ai.azure.com/api/projects/unit",
+            },
+            backend_url="https://unit.openai.azure.com",
+            model=Mock(upstream_model_id="unit-deployment"),
+            auth_strategy=AuthStrategy.NAMED_VALUE_API_KEY,
+            named_value_name="unit-key", key_vault_secret_id=None, backend_pool=None,
+        )
+
+    # A connection whose credential is already provisioned: no key is submitted and the
+    # model addition has no route credential of its own until credentials are prepared.
+    publication = Mock(
+        desired_spec=Mock(bindings=[keyed_binding()]),
+        publication_kind=PublicationKind.MODEL_ADD, resource_manifest={},
+    )
+    previous = Mock(
+        desired_spec=Mock(bindings=[] if source == "missing" else [keyed_binding()]),
+        resource_manifest={
+            "route_credentials": {"version": 1, "bindings": {"b" * 64: secret_id}},
+        } if source == "inherited" else {},
+    )
+    management = Mock()
+    management.route_credential_value.return_value = SecretStr("unit-only-key")
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "unit-vault.vault.azure.net":
+            return httpx.Response(200, json={
+                "id": secret_id, "value": "unit-only-key", "attributes": {"enabled": True},
+            })
+        assert request.url.path == "/api/projects/unit/deployments"
+        assert request.headers["api-key"] == "unit-only-key"
+        return httpx.Response(200, json={"value": [{"name": "unit-deployment"}]})
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            "turnstile_core.services.route_publication.route_credential_source",
+            lambda _binding: "b" * 64,
+        )
+        with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+            if source == "missing":
+                with pytest.raises(CredentialSourceMissingError):
+                    factory._validate_deployment(
+                        publication, management, client, installation, previous=previous,
+                    )
+            else:
+                assert factory._validate_deployment(
+                    publication, management, client, installation, previous=previous,
+                ) == {"name": "unit-deployment"}
+
+    assert [request.url.host for request in requests] == {
+        "inherited": ["unit-vault.vault.azure.net", "unit.services.ai.azure.com"],
+        "named_value": ["unit.services.ai.azure.com"],
+        "missing": [],
+    }[source]
+    if source == "named_value":
+        management.route_credential_value.assert_called_once_with("unit-key")
+    else:
+        management.route_credential_value.assert_not_called()
+
+
+@pytest.mark.parametrize(("body", "upstream"), [
+    ({"error": {"code": "PermissionDenied", "message": "private upstream detail"}},
+     "PermissionDenied"),
+    ({"error": {"code": "private code with spaces"}}, None),
+    ({"error": "private-upstream-error"}, None),
+    ([{"error": {"code": "PermissionDenied"}}], None),
+])
+@pytest.mark.parametrize("managed_identity", [False, True])
+def test_deployment_directory_failure_keeps_only_a_safe_upstream_code(
+    body: object, upstream: str | None, managed_identity: bool,
+) -> None:
+    from turnstile_core.integrations.apim_control_plane_contract import PolicyCompilationError
+    from turnstile_core.integrations.gateway_connection_probe import foundry_deployment_catalog
+
+    headers = (
+        {"Authorization": "Bearer unit-only"} if managed_identity else {"api-key": "unit-only"}
+    )
+    with (
+        httpx.Client(transport=httpx.MockTransport(
+            lambda _request: httpx.Response(400, json=body),
+        )) as client,
+        pytest.raises(PolicyCompilationError) as failed,
+    ):
+        foundry_deployment_catalog(
+            client, "https://unit.services.ai.azure.com/api/projects/unit",
+            "https://unit.openai.azure.com", "unit-deployment", lambda: headers,
+        )
+
+    message = str(failed.value)
+    assert "private" not in message
+    assert json.loads(message.removeprefix("Deployment validation failed: ")) == {
+        "code": "deployment_metadata_unavailable", "deployment": "unit-deployment",
+        "http_status": 400,
+        **({"upstream_code": upstream} if upstream else {}),
+        **({"auth": "managed_identity"} if managed_identity else {}),
+    }
+
+
 @pytest.mark.parametrize("complete", [False, True])
 @pytest.mark.parametrize("pool", [False, True])
 def test_fixed_route_probe_recovery_only_reads_original_protocol_evidence(
@@ -4300,6 +4550,7 @@ def test_program_upgrade_cutover_holds_proof_guard_until_registration(
                 assert fixed_policy_digest(ET.tostring(uploaded, encoding="unicode")) == (
                     fixed_policy_digest(parent)
                 )
+                assert "&quot;" not in kwargs["json_body"]["properties"]["value"]
             return Mock(status_code=200)
         if method == "GET":
             assert decision and "/operations/" not in args[0]
@@ -4315,6 +4566,9 @@ def test_program_upgrade_cutover_holds_proof_guard_until_registration(
 
     management._request.side_effect = request
     management._policy_response_value.return_value = parent
+    management.route_program_operations.return_value = {
+        "models": ("GET", "/models", "<policies />"),
+    }
     native_parent = parent if fault in {"written", "written-expired"} else (
         ET.tostring(ET.fromstring(parent), encoding="unicode") if fault == "xml-normalized"
         else "<policies><inbound><base /><return-response /></inbound></policies>"
@@ -4388,7 +4642,9 @@ def test_program_upgrade_cutover_holds_proof_guard_until_registration(
         side_effect=[next_verifier, prior_verifier],
     ))
     monkeypatch.setattr(module, "TableRouteProjection", Mock(return_value=projection))
-    monkeypatch.setattr(module, "_validate_program_cutover", lambda *args: None, raising=False)
+    monkeypatch.setattr(
+        module, "_validate_program_cutover", lambda *args, **options: None, raising=False,
+    )
 
     def cutover() -> None:
         module.register_verified_program_upgrade(
@@ -4608,6 +4864,129 @@ def test_subsequent_program_upgrade_preserves_registration_history_and_original_
             document_digest(updated),
         ) is None
     assert canonical_document(config) == original
+
+
+@pytest.mark.parametrize("initial_legacy", [None, "9" * 64])
+@pytest.mark.parametrize("upgrades", [0, 1, 2])
+def test_empty_installation_accepts_model_additions_after_every_registered_upgrade(
+    upgrades: int, initial_legacy: str | None,
+) -> None:
+    from tests.backend.model_platform.control_plane_support import (
+        APIM_ID,
+        GatewayControlPlaneService,
+        bedrock_publication,
+        foundry_publication,
+    )
+    from turnstile_core.domain.control_plane import (
+        GatewayPublication,
+        GatewayReleaseSpec,
+        PublicationKind,
+        PublicationStatus,
+    )
+    from turnstile_core.domain.runtime_models import ProviderTarget
+    from turnstile_core.domain.storage_routes import FixedProgramInstallation, FixedProgramUpgrade
+    from turnstile_core.persistence.in_memory import InMemoryRepository
+    from turnstile_core.persistence.repository_support import (
+        _fixed_program_upgrade_config,
+        _managed_program_publication,
+    )
+
+    _, program, _ = snapshot_fixture()
+    program = program.model_copy(update={
+        "scope": program.scope.model_copy(update={"target_id": str(APIM_ID)}),
+    })
+    legacy_fields: dict[str, Any] = (
+        {"model_additions_enabled": True, "legacy_program_sha256": initial_legacy}
+        if initial_legacy else {}
+    )
+    installation = FixedProgramInstallation(
+        program=program, target_identity_sha256="b" * 64,
+        storage_endpoint="https://unitstore.table.core.windows.net", storage_table="Routes",
+        gateway_endpoint="https://unit.azure-api.net/llm", publisher_subscription_id="unit",
+        parent_policy_sha256="a" * 64, operation_policies_sha256={"models": "c" * 64},
+        operation_contracts={"models": ("GET", "/models")}, supported_profiles=("openai-v1",),
+        **legacy_fields,
+    )
+    version = str(UUID(int=76))
+    _, manifest, dependencies = configuration_manifests(program.scope, version, (), {}, 1100)
+    approval = ConfigurationApproval(
+        approval_id=str(UUID(int=77)), scope=program.scope, route_version=version,
+        generation=1, manifest_sha256=manifest, dependency_manifest_sha256=dependencies,
+        catalog_sha256=catalog_digest(()), entry_count=0,
+        required_program_sha256=program.program_sha256, required_profiles=(),
+        budget_epoch=str(UUID(int=2)), issued_epoch=1100, activate_before_epoch=1700,
+    )
+    template = GatewayControlPlaneService(InMemoryRepository()).publish(
+        bedrock_publication(), "unit",
+    )
+    empty = template.model_copy(update={
+        "id": UUID(int=75), "gateway_profile_id": APIM_ID, "status": PublicationStatus.ACTIVE,
+        "publication_kind": PublicationKind.ROUTE_RECONCILE, "generation": 1,
+        "base_release_id": None, "apim_revision": program.api_revision,
+        "policy_sha256": program.program_sha256,
+        "desired_spec": GatewayReleaseSpec(gateway_profile_id=APIM_ID, bindings=[],
+                                           discovery_models=[]),
+        "resource_manifest": {
+            "fixed_route_program": installation.model_dump(mode="json"),
+            "fixed_route_snapshot": RouteSnapshot.prepare(approval, (), {}, 1100).model_dump(
+                mode="json",
+            ),
+            "fixed_route_head": ActiveRouteHead(
+                approval=approval, activated_epoch=1100,
+            ).model_dump(mode="json"),
+        },
+    }).model_dump(mode="python")
+    config: dict[str, Any] = {}
+    previous = installation
+    for index in range(upgrades):
+        # The production upgrade chain: legacy is carried, earlier programs become predecessors.
+        legacy = previous.legacy_program_sha256 or previous.program.program_sha256
+        upgraded = previous.model_copy(update={
+            "program": program.model_copy(update={"program_sha256": str(index + 1) * 64}),
+            "parent_policy_sha256": str(index + 4) * 64, "model_additions_enabled": True,
+            "legacy_program_sha256": legacy,
+            "predecessor_program_sha256": tuple(value for value in (
+                *previous.predecessor_program_sha256, previous.program.program_sha256,
+            ) if value != legacy),
+        })
+        updated = _fixed_program_upgrade_config(empty, config, FixedProgramUpgrade(
+            previous_publication_id=str(UUID(int=75)),
+            previous_installation_sha256=document_digest(previous), installation=upgraded,
+        ).model_dump(mode="json"), document_digest(config))
+        assert updated is not None
+        config, previous = updated, upgraded
+    derived = _managed_program_publication(empty, config)
+    assert derived is not None
+    assert GatewayPublication.model_validate(derived).desired_spec.bindings == []
+    overlaid = derived["resource_manifest"]["fixed_route_program"]
+    assert (overlaid != empty["resource_manifest"]["fixed_route_program"]) is (upgrades == 2)
+    if upgrades == 2:
+        forged = deepcopy(derived)
+        assert program.program_sha256 not in {"e" * 64, "8" * 64}
+        forged["resource_manifest"]["fixed_route_program"].update(
+            legacy_program_sha256="e" * 64, predecessor_program_sha256=["8" * 64],
+        )
+        with pytest.raises(ValueError, match="configuration binding changed"):
+            GatewayPublication.model_validate(forged)
+    if not upgrades:
+        return
+    repository = InMemoryRepository()
+    repository.gateway_publications.append(empty)
+    repository.effective_gateway_releases[APIM_ID] = empty["id"]
+    next(row for row in repository.gateways if row["id"] == APIM_ID)["config"] = config
+    request = foundry_publication("unit-upgraded-empty-installation")
+    request.provider = ProviderTarget(existing_id=next(
+        row["id"] for row in repository.providers if row["brand_key"] == "microsoft_foundry"
+    ))
+
+    addition = GatewayControlPlaneService(
+        repository, apim_principal_id=str(UUID(int=705)),
+    ).publish(request, "unit-owner")
+
+    assert addition.publication_kind is PublicationKind.MODEL_ADD
+    assert addition.base_release_id == empty["id"]
+    assert set(addition.resource_manifest) == {"model_route_addition"}
+    assert repository.effective_gateway_releases[APIM_ID] == empty["id"]
 
 
 @pytest.mark.parametrize("fault", [

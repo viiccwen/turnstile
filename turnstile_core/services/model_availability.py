@@ -42,6 +42,7 @@ from ..domain.storage_routes import (
 )
 from ..integrations.apim_control_plane_contract import (
     ApimPublisherClientResolver,
+    PolicyCompilationError,
     missing_management_actions,
 )
 from ..integrations.apim_publisher_client import AzureApimPublisherClient
@@ -476,6 +477,18 @@ def build_controlled_gateway_enroller(
     return enroll
 
 
+def loggable_reason(error: Exception) -> str | None:
+    reason = str(error) if isinstance(
+        error, (ModelAvailabilityUnavailable, PolicyCompilationError),
+    ) else None
+    if reason is not None and (
+        len(reason) > 180
+        or any(not (character.isalnum() or character in " _.-") for character in reason)
+    ):
+        return None
+    return reason
+
+
 def _log_verification_failure(target_id: UUID, error: Exception) -> None:
     frames = traceback.extract_tb(error.__traceback__)
     locations = ",".join(
@@ -492,12 +505,7 @@ def _log_verification_failure(target_id: UUID, error: Exception) -> None:
         and transport.request.url.host == "management.azure.com"
         else None
     )
-    reason = str(error) if isinstance(error, ModelAvailabilityUnavailable) else None
-    if reason is not None and (
-        len(reason) > 180
-        or any(not (character.isalnum() or character in " _.-") for character in reason)
-    ):
-        reason = None
+    reason = loggable_reason(error)
     logger.warning(
         "Model availability coverage failed target=%s error=%s http_status=%s "
         "path=%s locations=%s reason=%s",

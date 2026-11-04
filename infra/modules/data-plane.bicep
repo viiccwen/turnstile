@@ -2,6 +2,11 @@ targetScope = 'resourceGroup'
 
 param location string
 param provisionApimOutboundNetwork bool = false
+@allowed([
+  'Developer'
+  'StandardV2'
+])
+param apimSkuName string
 param postgresLocation string
 @minLength(3)
 @maxLength(12)
@@ -107,6 +112,8 @@ var managedEventHubNamespaceName = 'eh-${resourcePrefix}-${suffix}'
 var managedEventHubName = 'token-usage'
 var managedWorkspaceName = 'log-${resourcePrefix}-${suffix}'
 var managedAppInsightsName = 'appi-${resourcePrefix}-${suffix}'
+var actionGroupName = 'ag-${resourcePrefix}-${suffix}'
+var ledgerSyncAlertName = 'alert-${resourcePrefix}-ledger-sync-${suffix}'
 var managedKeyVaultName = 'kv-${resourcePrefix}-${take(suffix, 8)}'
 var planName = 'plan-${resourcePrefix}-${suffix}'
 var telemetryPlanName = 'plan-${resourcePrefix}-telemetry-${suffix}'
@@ -128,6 +135,9 @@ var effectiveWorkspaceResourceGroupName = provisionObservability ? resourceGroup
 var effectiveAppInsightsResourceGroupName = provisionObservability ? resourceGroup().name : existingApplicationInsightsResourceGroupName
 var effectiveKeyVaultResourceGroupName = provisionKeyVault ? resourceGroup().name : existingKeyVaultResourceGroupName
 var effectiveKeyVaultName = provisionKeyVault ? managedKeyVaultName : existingKeyVaultName
+// Developer has no outbound integration; classic External injection gives its gateway line of sight to the private ledger.
+var apimOutboundIntegration = provisionApimOutboundNetwork && apimSkuName == 'StandardV2'
+var apimVirtualNetworkInjection = provisionApimOutboundNetwork && apimSkuName == 'Developer'
 var logAnalyticsReaderRoleDefinitionId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   '73c42c96-874c-492b-b04d-ab87d138a893'
@@ -451,7 +461,7 @@ resource managedApiSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01'
   ]
 }
 
-resource apimOutboundSecurityGroup 'Microsoft.Network/networkSecurityGroups@2024-05-01' = if (provisionApimOutboundNetwork) {
+resource apimOutboundSecurityGroup 'Microsoft.Network/networkSecurityGroups@2024-05-01' = if (apimOutboundIntegration) {
   name: 'nsg-${resourcePrefix}-apim-outbound-${suffix}'
   location: location
   properties: {
@@ -473,7 +483,7 @@ resource apimOutboundSecurityGroup 'Microsoft.Network/networkSecurityGroups@2024
   }
 }
 
-resource apimOutboundSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = if (provisionApimOutboundNetwork) {
+resource apimOutboundSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = if (apimOutboundIntegration) {
   parent: managedVirtualNetwork
   name: 'snet-apim-outbound'
   properties: {
@@ -510,6 +520,68 @@ var effectivePrivateEndpointSubnetResourceId = provisionNetwork
 var effectiveApiSubnetResourceId = provisionNetwork
   ? managedApiSubnet!.id
   : existingApiSubnetResourceId
+
+resource apimInjectionSecurityGroup 'Microsoft.Network/networkSecurityGroups@2024-05-01' = if (apimVirtualNetworkInjection) {
+  name: 'nsg-${resourcePrefix}-apim-injection-${suffix}'
+  location: location
+  properties: {
+    securityRules: [
+      {
+        name: 'allow-gateway-https-inbound'
+        properties: {
+          priority: 100
+          direction: 'Inbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourceAddressPrefix: 'Internet'
+          sourcePortRange: '*'
+          destinationAddressPrefix: '10.42.4.0/27'
+          destinationPortRange: '443'
+        }
+      }
+      {
+        name: 'allow-apim-management-inbound'
+        properties: {
+          priority: 110
+          direction: 'Inbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourceAddressPrefix: 'ApiManagement'
+          sourcePortRange: '*'
+          destinationAddressPrefix: '10.42.4.0/27'
+          destinationPortRange: '3443'
+        }
+      }
+      {
+        name: 'allow-load-balancer-inbound'
+        properties: {
+          priority: 120
+          direction: 'Inbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourceAddressPrefix: 'AzureLoadBalancer'
+          sourcePortRange: '*'
+          destinationAddressPrefix: '10.42.4.0/27'
+          destinationPortRange: '6390'
+        }
+      }
+    ]
+  }
+}
+
+resource apimInjectionSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = if (apimVirtualNetworkInjection) {
+  parent: managedVirtualNetwork
+  name: 'snet-apim-injection'
+  properties: {
+    addressPrefix: '10.42.4.0/27'
+    networkSecurityGroup: {
+      id: apimInjectionSecurityGroup!.id
+    }
+  }
+  dependsOn: [
+    managedApiSubnet
+  ]
+}
 
 module keyVaultPrivateEndpoint 'key-vault-private-endpoint.bicep' = if (provisionKeyVault) {
   name: '${resourcePrefix}-key-vault-private-endpoint'
@@ -713,6 +785,58 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
   }
 }
 
+resource operatorActionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = {
+  name: actionGroupName
+  location: 'global'
+  properties: {
+    enabled: true
+    groupShortName: take(resourcePrefix, 12)
+    emailReceivers: [
+      {
+        name: 'owner'
+        emailAddress: bootstrapOwnerEmail
+        useCommonAlertSchema: true
+      }
+    ]
+  }
+}
+
+// The timer runs every five minutes; a window in which every run failed means the APIM ledger has stopped refreshing.
+resource ledgerSyncAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = {
+  name: ledgerSyncAlertName
+  location: location
+  properties: {
+    displayName: 'Turnstile budget ledger sync is failing'
+    description: 'Every sync_budget_ledger run in the last 30 minutes failed. Model access and budgets in the APIM ledger are not being refreshed.'
+    severity: 1
+    enabled: true
+    scopes: [
+      effectiveAppInsightsId
+    ]
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT30M'
+    criteria: {
+      allOf: [
+        {
+          query: 'requests | where name == "sync_budget_ledger" | summarize failed = countif(success == false), succeeded = countif(success == true) | where failed > 0 and succeeded == 0'
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: [
+        operatorActionGroup.id
+      ]
+    }
+  }
+}
+
 resource functionVnetIntegration 'Microsoft.Web/sites/networkConfig@2024-11-01' = {
   parent: functionApp
   name: 'virtualNetwork'
@@ -818,7 +942,7 @@ resource apiResourceGroupApimContributor 'Microsoft.Authorization/roleAssignment
   }
 }
 
-output apimOutboundSubnetId string = provisionApimOutboundNetwork ? apimOutboundSubnet!.id : ''
+output apimOutboundSubnetId string = apimVirtualNetworkInjection ? apimInjectionSubnet!.id : apimOutboundIntegration ? apimOutboundSubnet!.id : ''
 output ledgerTableResourceId string = ledgerTableResourceId
 output routeTableResourceId string = routeTableResourceId
 output routeTableName string = 'ModelRoutes'

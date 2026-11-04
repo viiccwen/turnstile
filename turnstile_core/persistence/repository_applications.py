@@ -16,6 +16,7 @@ from ..domain.application_access import (
     application_organization,
 )
 from ..domain.ledger import validate_application_snapshot
+from .repository_support import budget_usage_cost_sql
 
 
 def _json_value(value: object) -> object:
@@ -40,7 +41,16 @@ class PostgreSqlApplicationRepositoryMixin:
         now = datetime.now(UTC)
         with self._connection() as connection, connection.transaction():
             for value in items:
-                application_id = UUID(str(value["application_id"]))
+                bound = connection.execute(
+                    """SELECT application_id FROM gateway_application_subscription
+                       WHERE gateway_profile_id = %s AND apim_subscription_id = %s""",
+                    (gateway_profile_id, value["apim_subscription_id"]),
+                ).fetchone()
+                # A subscription keeps the application it is bound to, whatever ID scheme made it.
+                application_id = (
+                    bound["application_id"] if bound is not None
+                    else UUID(str(value["application_id"]))
+                )
                 subscription_id = UUID(str(value["subscription_id"]))
                 existing = connection.execute(
                     "SELECT * FROM gateway_application WHERE id = %s FOR UPDATE",
@@ -712,6 +722,17 @@ class PostgreSqlApplicationRepositoryMixin:
             ).fetchall()
         return cast(Sequence[dict[str, Any]], rows)
 
+    def get_gateway_application_subscription(
+        self, gateway_profile_id: UUID, apim_subscription_id: str
+    ) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT * FROM gateway_application_subscription
+                   WHERE gateway_profile_id = %s AND apim_subscription_id = %s""",
+                (gateway_profile_id, apim_subscription_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def list_gateway_application_budgets(
         self, period_start: date, application_ids: Sequence[UUID]
     ) -> Sequence[dict[str, Any]]:
@@ -873,6 +894,7 @@ class PostgreSqlApplicationRepositoryMixin:
     ) -> Sequence[dict[str, Any]]:
         if not application_ids:
             return []
+        usd_cost = budget_usage_cost_sql("usage", "'application'", "attribution.application_id::text")
         with self._connection() as connection:
                  rows = connection.execute(
                   """WITH canonical_correlations AS (
@@ -887,15 +909,8 @@ class PostgreSqlApplicationRepositoryMixin:
                                                   usage.ts, usage.status_code,
                                                   usage.input_tokens, usage.cached_tokens,
                                                   usage.cache_write_tokens,
-                                                                                                    usage.output_tokens, usage.estimated_cost,
-                                                                                                    budget_usage_usd_cost(
-                                                                                                        usage.usd_cost, usage.estimated, usage.input_tokens,
-                                                                                                        usage.cached_tokens, usage.cache_write_tokens,
-                                                                                                        usage.output_tokens, usage.input_price_per_million,
-                                                                                                        usage.cached_price_per_million,
-                                                                                                        usage.cache_write_price_per_million,
-                                                                                                        usage.output_price_per_million
-                                                                                                    ) AS usd_cost
+                                                                                                    usage.output_tokens, usage.estimated_cost, """
+                  + usd_cost + """ AS usd_cost
                                          FROM token_usage_application_attribution attribution
                                          JOIN token_usage usage ON usage.id = attribution.usage_id
                                          WHERE attribution.application_id = ANY(%s)

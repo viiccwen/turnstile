@@ -9,6 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from uuid import UUID
 from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 
 from ..domain.image_profiles import ImageGenerationProfile, validate_image_profile
 from .apim_control_plane_contract import PolicyCompilationError
@@ -55,7 +56,14 @@ def validate_native_stream_policy(source: str, operation_id: str) -> str:
             return bool(children) and children[-1].tag == "otherwise" and all(
                 child.tag == "when" for child in children[:-1]
             ) and all(len(child) == 1 and immediate(child[0]) for child in children)
-        return node.tag in {"backend", "retry"} and len(node) == 1 and immediate(node[0])
+        if node.tag == "retry":
+            children = list(node)
+            return bool(children) and all(
+                child.tag == "set-header" and child.get("exists-action") == "delete"
+                and not list(child)
+                for child in children[:-1]
+            ) and immediate(children[-1])
+        return node.tag == "backend" and len(node) == 1 and immediate(node[0])
 
     if immediate(backend):
         return source
@@ -298,6 +306,40 @@ def serialize_policy(root: ET.Element) -> str:
     )
 
 
+def encode_policy_xml(root: ET.Element) -> str:
+    # APIM counts submitted XML bytes against its 512 KiB limit; escape only what XML requires.
+    def encode(node: ET.Element) -> str:
+        if (not isinstance(node.tag, str) or "{" in node.tag
+                or any("{" in key for key in node.attrib)):
+            raise PolicyCompilationError("Fixed policy contains unsupported XML namespaces")
+        parts = ["<" + node.tag]
+        for name, value in node.attrib.items():
+            escaped = xml_escape(value, {
+                "\r": "&#13;", "\n": "&#10;", "\t": "&#9;",
+            }).replace("&gt;", ">")
+            double = escaped.replace('"', "&quot;")
+            single = escaped.replace("'", "&apos;")
+            quoted = '"' + double + '"' if len(double) <= len(single) else "'" + single + "'"
+            parts.append(" " + name + "=" + quoted)
+        if len(node) == 0 and not node.text:
+            parts.append("/>")
+        else:
+            text = node.text or ""
+            encoded_text = xml_escape(text, {"\r": "&#13;"})
+            if "]]>" not in text and "\r" not in text and len(text) + 12 < len(encoded_text):
+                encoded_text = "<![CDATA[" + text + "]]>"
+            parts.extend([">", encoded_text])
+            parts.extend(encode(child) for child in node)
+            parts.append("</" + node.tag + ">")
+        parts.append(xml_escape(node.tail or "", {"\r": "&#13;"}))
+        return "".join(parts)
+
+    encoded = encode(root)
+    if ET.canonicalize(encoded) != ET.canonicalize(ET.tostring(root, encoding="unicode")):
+        raise PolicyCompilationError("Fixed policy XML encoding changed its parsed values")
+    return encoded
+
+
 @lru_cache(maxsize=2048)
 def expression_token_spans(value: str) -> tuple[tuple[str, int, int], ...]:
     return tuple(
@@ -505,7 +547,9 @@ def _branch(normal: ET.Element, image: ET.Element | None) -> ET.Element:
     return choose
 
 
-def _components(reference: dict[str, ET.Element]) -> dict[str, ET.Element]:
+def _components(
+    reference: dict[str, ET.Element], image_usage: ET.Element | None = None,
+) -> dict[str, ET.Element]:
     inference = deepcopy(reference["isInferenceOperation"])
     original = inference.attrib["value"]
     inference.set(
@@ -534,7 +578,9 @@ def _components(reference: dict[str, ET.Element]) -> dict[str, ET.Element]:
             reference[name], ET.Element("set-variable", {"name": name, "value": expression})
         )
     result["request_body"] = _branch(reference["request_body"], None)
-    result["usage"] = _branch(reference["usage"], _image_usage())
+    result["usage"] = _branch(
+        reference["usage"], deepcopy(image_usage) if image_usage is not None else _image_usage(),
+    )
     return result
 
 
@@ -1072,6 +1118,9 @@ def compose_image_parent_policy(
         if not profiles:
             burst_tokens = previous_burst
     reference = legacy_components(template)
+    image_usage = template.find(
+        "./outbound/choose/otherwise/choose/when/set-variable[@name='usagePayload']",
+    )
     actual = _current_components(root) if version == 2 else legacy_components(root)
     _materialize_defaults(reference, actual)
     legacy_hashes = json.loads(Path(__file__).with_name("image_policy_v1.json").read_text())
@@ -1091,7 +1140,13 @@ def compose_image_parent_policy(
         text_usage = actual["usage"].find("otherwise/set-variable[@name='usagePayload']")
         if text_usage is not None and component_digest(text_usage) in legacy_hashes["usage"]:
             reference["usage"] = deepcopy(text_usage)
-    generated = _components(reference)
+        current_image = actual["usage"].find("when/set-variable[@name='usagePayload']")
+        # Parents installed before budget settlement covered images keep their reader valid.
+        if current_image is not None and component_digest(current_image) == component_digest(
+            _image_usage(),
+        ):
+            image_usage = current_image
+    generated = _components(reference, image_usage)
     if version != 1:
         expected = generated if version == 2 else reference
         if any(

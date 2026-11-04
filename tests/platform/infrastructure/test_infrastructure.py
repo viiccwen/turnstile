@@ -84,10 +84,17 @@ def test_data_plane_outputs_stay_within_the_arm_limit() -> None:
 
 
 def test_fresh_standard_v2_private_egress_is_bound_after_the_data_plane() -> None:
+    assert "var provisionApimOutboundNetwork = provisionApimService && provisionNetwork\n" in MAIN
+    data_plane = MAIN.split("module dataPlane ", 1)[1].split("module apimOutboundNetwork ", 1)[0]
+    assert "apimSkuName: apimSkuName" in data_plane
     assert (
-        "var provisionApimOutboundNetwork = provisionApimService && provisionNetwork && apimSkuName == 'StandardV2'"
-        in MAIN
+        "var apimOutboundIntegration = provisionApimOutboundNetwork && apimSkuName == 'StandardV2'"
+        in DATA_PLANE
     )
+    assert (
+        "output apimOutboundSubnetId string = apimVirtualNetworkInjection ? "
+        "apimInjectionSubnet!.id : apimOutboundIntegration ? apimOutboundSubnet!.id : ''"
+    ) in DATA_PLANE
     initial = MAIN.split("module apim 'modules/apim-service.bicep'", 1)[1].split(
         "var effectiveApimName", 1,
     )[0]
@@ -113,8 +120,10 @@ def test_apim_outbound_subnet_preserves_adopted_network_and_storage_ownership() 
     subnet = DATA_PLANE.split("resource apimOutboundSubnet ", 1)[1].split(
         "var effectiveVirtualNetworkResourceId ", 1,
     )[0]
-    assert "if (provisionApimOutboundNetwork)" in subnet
+    assert "if (apimOutboundIntegration)" in subnet
     assert "parent: managedVirtualNetwork" in subnet
+    assert "name: 'snet-apim-outbound'" in subnet
+    assert "addressPrefix: '10.42.3.96/27'" in subnet
     assert "serviceName: 'Microsoft.Web/serverFarms'" in subnet
     assert "id: apimOutboundSecurityGroup!.id" in subnet
     assert "managedApiSubnet" in subnet.split("dependsOn: [", 1)[1].split("]", 1)[0]
@@ -125,6 +134,10 @@ def test_apim_outbound_subnet_preserves_adopted_network_and_storage_ownership() 
     nsg = DATA_PLANE.split("resource apimOutboundSecurityGroup ", 1)[1].split(
         "resource apimOutboundSubnet ", 1,
     )[0]
+    assert "if (apimOutboundIntegration)" in nsg
+    assert nsg.count("name: '") == 2
+    assert "name: 'allow-key-vault-outbound'" in nsg
+    assert "direction: 'Outbound'" in nsg
     assert "destinationAddressPrefix: 'AzureKeyVault'" in nsg
     assert "destinationPortRange: '443'" in nsg
     assert "virtualNetworkResourceId: effectiveVirtualNetworkResourceId" in DATA_PLANE
@@ -132,6 +145,32 @@ def test_apim_outbound_subnet_preserves_adopted_network_and_storage_ownership() 
     assert "resource ledgerStorage " not in DATA_PLANE
     assert "var ledgerTableResourceId = resourceId(ledgerStorageResourceGroupName," in DATA_PLANE
     assert "provisionApimService && provisionNetwork" in MAIN
+
+
+def test_developer_injection_uses_only_the_managed_platform_network() -> None:
+    assert (
+        "var provisionApimOutboundNetwork = provisionApimService && provisionNetwork\n"
+        in MAIN
+    )
+    assert (
+        "var apimVirtualNetworkInjection = provisionApimOutboundNetwork && apimSkuName == 'Developer'"
+        in DATA_PLANE
+    )
+    subnet = DATA_PLANE.split("resource apimInjectionSubnet ", 1)[1].split(
+        "\nmodule ", 1,
+    )[0]
+    assert "if (apimVirtualNetworkInjection)" in subnet
+    assert "parent: managedVirtualNetwork" in subnet
+    assert "addressPrefix: '10.42.4.0/27'" in subnet
+    assert "id: apimInjectionSecurityGroup!.id" in subnet
+    assert "managedApiSubnet" in subnet.split("dependsOn: [", 1)[1].split("]", 1)[0]
+    assert "delegations:" not in subnet
+    nsg = DATA_PLANE.split("resource apimInjectionSecurityGroup ", 1)[1].split(
+        "resource apimInjectionSubnet ", 1,
+    )[0]
+    assert "if (apimVirtualNetworkInjection)" in nsg
+    for port in ("443", "3443", "6390"):
+        assert f"destinationPortRange: '{port}'" in nsg
 
 
 def test_credential_vault_name_fits_the_maximum_resource_prefix() -> None:
@@ -187,6 +226,49 @@ def test_observer_compute_region_does_not_move_the_registry() -> None:
     registry = OBSERVER_MAIN.split("module registry ", 1)[1].split("module app ", 1)[0]
     assert "location: registryLocation" in registry
     assert "output observerLocation string = location" in OBSERVER_MAIN
+
+
+def test_developer_apim_is_injected_into_an_undelegated_platform_subnet() -> None:
+    import re
+    from ipaddress import IPv4Network, ip_network
+
+    assert "'BasicV2'" not in MAIN
+    assert "'BasicV2'" not in APIM_SERVICE
+    assert (
+        "var apimVirtualNetworkInjection = "
+        "provisionApimOutboundNetwork && apimSkuName == 'Developer'"
+    ) in DATA_PLANE
+    nsg = DATA_PLANE.split("resource apimInjectionSecurityGroup ", 1)[1].split(
+        "resource apimInjectionSubnet ", 1,
+    )[0]
+    assert "if (apimVirtualNetworkInjection)" in nsg
+    assert re.findall(
+        r"direction: '(\w+)'\s+access: '(\w+)'\s+protocol: '(\w+)'\s+"
+        r"sourceAddressPrefix: '([^']+)'\s+sourcePortRange: '\*'\s+"
+        r"destinationAddressPrefix: '([^']+)'\s+destinationPortRange: '(\d+)'",
+        nsg,
+    ) == [
+        ("Inbound", "Allow", "Tcp", "Internet", "10.42.4.0/27", "443"),
+        ("Inbound", "Allow", "Tcp", "ApiManagement", "10.42.4.0/27", "3443"),
+        ("Inbound", "Allow", "Tcp", "AzureLoadBalancer", "10.42.4.0/27", "6390"),
+    ]
+    assert nsg.count("direction: ") == 3
+    subnet = DATA_PLANE.split("resource apimInjectionSubnet ", 1)[1].split(
+        "\nmodule ", 1,
+    )[0]
+    assert "if (apimVirtualNetworkInjection)" in subnet
+    assert "parent: managedVirtualNetwork" in subnet
+    assert "addressPrefix: '10.42.4.0/27'" in subnet
+    assert "id: apimInjectionSecurityGroup!.id" in subnet
+    assert "delegations" not in subnet
+    assert "managedApiSubnet" in subnet.split("dependsOn: [", 1)[1].split("]", 1)[0]
+    network = IPv4Network("10.42.4.0/27")
+    assert network.subnet_of(IPv4Network("10.42.0.0/16"))
+    for prefix in re.findall(r"addressPrefix: '([^']+)'", DATA_PLANE):
+        if prefix != str(network):
+            assert not network.overlaps(ip_network(prefix))
+    assert "virtualNetworkType: 'External'" in APIM_SERVICE
+    assert "publicIpAddressId" not in APIM_SERVICE
 
 
 def test_apim_exposes_the_turnstile_gateway_path() -> None:
@@ -346,6 +428,25 @@ def test_templates_create_platform_resources_without_foundry_projects_or_models(
     assert combined.count("Microsoft.Storage/storageAccounts@") == 1
     assert "Microsoft.CognitiveServices/accounts/projects" not in combined
     assert "Microsoft.CognitiveServices/accounts/deployments" not in combined
+
+
+def test_ledger_sync_failures_alert_the_owner() -> None:
+    telemetry = (ROOT / "functions/telemetry/function_app.py").read_text(encoding="utf-8")
+    head, timer_function, _ = telemetry.partition("\ndef sync_budget_ledger(")
+    timer = head.rsplit("@app.timer_trigger(", 1)[1]
+    alert = DATA_PLANE.split("resource ledgerSyncAlert", 1)[1].split("\nresource ", 1)[0]
+    group = DATA_PLANE.split("resource operatorActionGroup", 1)[1].split("\nresource ", 1)[0]
+
+    assert timer_function and 'schedule="0 */5 * * * *"' in timer
+    assert (
+        "query: 'requests | where name == \"sync_budget_ledger\" | summarize failed = "
+        "countif(success == false), succeeded = countif(success == true) | where failed > 0 "
+        "and succeeded == 0'"
+    ) in alert
+    assert "windowSize: 'PT30M'" in alert
+    assert "scopes: [\n      effectiveAppInsightsId\n    ]" in alert
+    assert "actionGroups: [\n        operatorActionGroup.id\n      ]" in alert
+    assert "emailAddress: bootstrapOwnerEmail" in group
 
 
 def test_api_python_path_contains_package_root_and_prebuilt_dependencies() -> None:

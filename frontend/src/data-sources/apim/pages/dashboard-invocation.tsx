@@ -18,16 +18,16 @@ import {
   SelectValue,
 } from "../../../components/ui/select"
 import { dataSource } from "../api"
-import { finopsQueries, invalidateFinOps } from "../queries"
+import { ApiError } from "../../../api/client"
+import { finopsKeys, finopsQueries, invalidateFinOps } from "../queries"
 import { useAuth } from "../../../providers/auth-provider"
-import { gatewayInvocationChoices, resolveInvocationModel, type GatewaySelection } from "../../../lib/gateway-topology"
+import { gatewayInvocationChoices, personMayInvoke, resolveInvocationModel, type GatewaySelection } from "../../../lib/gateway-topology"
 import { modelInventoryFamily } from "../../../lib/model-inventory-filters"
 import { clientSampleFor, type ClientSampleOperation, type ClientSampleRequest } from "../../../lib/application-client-samples"
 import type { DecisionInvocationRequest, DecisionInvocationResponse, EnterpriseEntityCatalog, ImageGenerationOptions, ImageInvocationResponse, ManagedModel, ModelInvocationResponse, ModelRuntime } from "../types"
 import { ImageGenerationResult, ImageOptions } from "./image-generation-result"
 import {
   compact,
-  currency,
   EmptyState,
   ErrorState,
   FilterSelect,
@@ -50,6 +50,15 @@ const DECISION_STATE_JSON_SAMPLE = JSON.stringify({
   impact: "Customers cannot complete purchases in any region",
 }, null, 2)
 
+type InvocationDraft = { owner: string; mode: "chat" | "image" | "decision"; prompt: string; stateFormat: "text" | "json"; questions: string }
+let invocationDraft: InvocationDraft | null = null
+
+const INVOCATION_DENIALS = new Map([
+  ["model_not_assigned", "你尚未获得该模型的使用权限，请联系管理员分配。"],
+  ["budget_exceeded", "本月预算已用完，调用已被拦截。"],
+  ["image_budget_insufficient", "剩余预算不足以预留本次图像生成所需额度。"],
+])
+
 function InvocationModelLogo({ model, runtime }: { model: ManagedModel; runtime?: ModelRuntime }) {
   if (model.capabilities.includes("decision")) return <MicrosoftLogo size={16} />
   if (runtime?.runtime_kind === "foundry" && model.upstream_model_id === "model-router") return <FoundryLogo size={16} />
@@ -63,6 +72,7 @@ function InvocationModelLogo({ model, runtime }: { model: ManagedModel; runtime?
 export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalog }) {
   const queryClient = useQueryClient();
   const { user: sessionUser } = useAuth();
+  const [draft] = useState(() => sessionUser && invocationDraft?.owner === sessionUser.email ? invocationDraft : null);
   const registry = useQuery(finopsQueries.registry());
   const [departmentId, setDepartmentId] = useState(
     entities.departments[0]?.id ?? "",
@@ -96,7 +106,7 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
     if (users.some((person) => person.id === userId)) return;
     setUserId(sessionUser?.email ?? users[0]?.id ?? "");
   }, [sessionUser?.email, userId, users]);
-  const [mode, setMode] = useState<"chat" | "image" | "decision">("chat");
+  const [mode, setMode] = useState<"chat" | "image" | "decision">(draft?.mode ?? "chat");
   const imageMode = mode === "image";
   const decisionMode = mode === "decision";
   const assignedRouters = useQuery({ ...finopsQueries.assignedModelRouters(userId), enabled: mode === "chat" && Boolean(userId) });
@@ -118,8 +128,17 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
   ) === true;
   const gatewayReady = !explicitGateway || (explicitGatewayAvailable && !topology.isLoading && !topology.error && Boolean(selectedGateway?.selectable));
   const [imageOptions, setImageOptions] = useState<ImageGenerationOptions | null>(null);
+  const policyPeriod = new Date().toISOString().slice(0, 7);
+  const modelPolicies = useQuery({
+    queryKey: [...finopsKeys.budgets(policyPeriod), "allocation-preview"],
+    queryFn: () => dataSource.budgets(policyPeriod, true),
+    enabled: Boolean(userId),
+  });
+  const invocationPerson = modelPolicies.data?.items.find((item) => item.scope_type === "user" && item.scope_id === userId);
+  const assignedModelIds = invocationPerson?.model_policy_configured ? new Set(invocationPerson.allowed_model_ids) : null;
+  const invocableModels = (registry.data?.models ?? []).filter((model) => personMayInvoke(model, assignedModelIds));
   const invocationModel = resolveInvocationModel(
-    registry.data?.models ?? [],
+    invocableModels,
     invocationTarget === DEFAULT_MODEL_OPTION ? null : selectedDirectModelId,
     imageMode,
     decisionMode,
@@ -130,15 +149,18 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
     : null;
   const effectiveImageOptions = imageProfile ? imageOptions ?? {} : null;
   const [imageResult, setImageResult] = useState<ImageInvocationResponse | null>(null);
-  const [prompt, setPrompt] = useState(CHAT_PROMPT_SAMPLE);
-  const [stateFormat, setStateFormat] = useState<"text" | "json">("text");
-  const [questions, setQuestions] = useState(JSON.stringify({
+  const [prompt, setPrompt] = useState(draft?.prompt ?? CHAT_PROMPT_SAMPLE);
+  const [stateFormat, setStateFormat] = useState<"text" | "json">(draft?.stateFormat ?? "text");
+  const [questions, setQuestions] = useState(draft?.questions ?? JSON.stringify({
     urgent: { type: "noul", instructions: "Does this incident need urgent attention?" },
     team: { type: "choice", instructions: "Which team should handle this incident?",
       criteria: { engineering: "Bugs, errors, and outages", support: "How-to and account questions" } },
     severity: { type: "score", instructions: "How severe is this incident?",
       criteria: ["Minor", "Major", "Critical"] },
   }, null, 2));
+  useEffect(() => {
+    if (sessionUser) invocationDraft = { owner: sessionUser.email, mode, prompt, stateFormat, questions };
+  }, [sessionUser, mode, prompt, stateFormat, questions]);
   const [outputLimit, setOutputLimit] = useState(String(INVOCATION_MAX_OUTPUT_TOKENS));
   const maxOutputTokens = Number(outputLimit);
   const validOutputLimit = Number.isSafeInteger(maxOutputTokens) && maxOutputTokens >= 1 && maxOutputTokens <= 1_000_000;
@@ -269,15 +291,15 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
       }
       void invalidateFinOps(queryClient);
     } catch (error) {
-      setInvokeError(queryError(error));
+      setInvokeError((error instanceof ApiError && error.detail ? INVOCATION_DENIALS.get(error.detail) : undefined) ?? queryError(error));
     } finally {
       setIsInvoking(false);
     }
   };
   if (registry.isLoading) return <LoadingState label="正在加载调用配置" />;
   if (registry.error) return <ErrorState error={registry.error} />;
-  const models = registry.data?.models.filter((item) => item.enabled && item.capabilities.includes("image_generation") === imageMode
-    && item.capabilities.includes("decision") === decisionMode) ?? [];
+  const models = invocableModels.filter((item) => item.enabled && item.capabilities.includes("image_generation") === imageMode
+    && item.capabilities.includes("decision") === decisionMode);
   const selectedModel = invocationTarget.startsWith(MODEL_TARGET_PREFIX)
     ? invocationModel
     : null;
@@ -407,6 +429,7 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
                     <span className="invoke-model-option">
                       <InvocationModelLogo model={model} runtime={registry.data?.runtimes.find(runtime => runtime.id === model.runtime_id)} />
                       <span>{model.display_name}</span>
+                      {models.some((other) => other.id !== model.id && other.display_name === model.display_name) && <small data-no-localize>{model.model_key}</small>}
                     </span>
                   </SelectItem>
                 ))}</SelectGroup>
@@ -549,7 +572,7 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
                 <dd>
                   {result.estimated_cost == null
                     ? "未计价"
-                    : currency.format(result.estimated_cost)}
+                    : `$${result.estimated_cost.toFixed(6)}`}
                 </dd>
               </div>
             </dl>

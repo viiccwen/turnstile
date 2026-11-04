@@ -2434,7 +2434,7 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
         if isinstance(error, str):
             return error == "model_not_assigned"
         if isinstance(error, dict):
-            return error.get("type") == "model_not_assigned"
+            return "model_not_assigned" in (error.get("code"), error.get("type"))
         return False
 
     def promote_revision(self, revision: str, release_name: str) -> None:
@@ -2746,6 +2746,10 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
                 "/namedValues/" + quote(name, safe=""), values, connection, checkpoint,
                 api_version=self._API_VERSION, allow_create=created < 4,
             )
+            observed = (raw.get("keyVault") or {}).get("secretIdentifier")
+            if raw.get("secret") is not True and (wrote or observed == secret_id):
+                # APIM marks a Key Vault reference secret only when its asynchronous creation ends.
+                raise RetryablePublicationError("APIM credential resource is not yet ready")
             self._validate_named_value(NamedValueResource(name, secret_id), raw)
             created += int(wrote)
         for member in pool.members:

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
@@ -19,10 +20,12 @@ from uuid import UUID, uuid4
 import psycopg
 import pytest
 from fastapi import HTTPException
+from psycopg import sql
 from psycopg.conninfo import make_conninfo
 from psycopg.rows import dict_row
 from pydantic import HttpUrl
 
+from backend.services.budget_service import TokenBudgetService
 from backend.services.runtime_service import ModelRuntimeService
 from turnstile_core.config import Settings
 from turnstile_core.domain.control_plane import (
@@ -52,12 +55,30 @@ from turnstile_core.pricing.sync import plan_price_sync
 from turnstile_core.services.control_plane import GatewayControlPlaneService
 
 
+def _apply_migrations(info: str) -> None:
+    root = Path(__file__).resolve().parents[3]
+    with psycopg.connect(info, autocommit=True) as connection:
+        connection.execute((root / "migrations/001_initial_schema.up.sql").read_text())
+        connection.execute("SET search_path TO public")
+        for migration in sorted((root / "migrations").glob("*.up.sql"))[1:]:
+            connection.execute(migration.read_text())
+
+
 @pytest.fixture(scope="module")
 def pricing_postgres() -> Iterator[tuple[str, Event]]:
     initdb = shutil.which("initdb")
     postgres = shutil.which("postgres")
     if initdb is None or postgres is None:
         pytest.skip("Local initdb and postgres are required for transaction validation")
+    version = subprocess.run(
+        [postgres, "--version"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    major = re.search(r"\(PostgreSQL\) (\d+)", version)
+    if major is None or int(major.group(1)) < 15:
+        pytest.fail(
+            "The migrated schema needs PostgreSQL 15 or newer (UNIQUE NULLS NOT DISTINCT); "
+            f"the first postgres on PATH reports {version!r}"
+        )
     with TemporaryDirectory(prefix="ts-price-") as temporary:
         folder = Path(temporary)
         data = folder / "data"
@@ -94,12 +115,7 @@ def pricing_postgres() -> Iterator[tuple[str, Event]]:
             info = make_conninfo(
                 host=str(sockets), dbname="postgres", user="price_test", connect_timeout=5,
             )
-            root = Path(__file__).resolve().parents[3]
-            with psycopg.connect(info, autocommit=True) as connection:
-                connection.execute((root / "migrations/001_initial_schema.up.sql").read_text())
-                connection.execute("SET search_path TO public")
-                for migration in sorted((root / "migrations").glob("*.up.sql"))[1:]:
-                    connection.execute(migration.read_text())
+            _apply_migrations(info)
             yield info, waiting
         finally:
             if server.poll() is None:
@@ -264,6 +280,49 @@ def test_catalog_save_guard_preserves_sql_prices_and_allows_metadata_edits(
         repository.close()
 
 
+def test_registry_reports_no_discount_for_manually_priced_models(
+    pricing_postgres: tuple[str, Event],
+) -> None:
+    info, _waiting = pricing_postgres
+    provider_id, runtime_id = uuid4(), uuid4()
+    with psycopg.connect(info, autocommit=True) as connection:
+        connection.execute(
+            "INSERT INTO model_provider(id,name,provider_kind) VALUES(%s,%s,'openai_compatible')",
+            (provider_id, str(provider_id)),
+        )
+        connection.execute(
+            "INSERT INTO model_runtime(id,provider_id,name,runtime_kind) "
+            "VALUES(%s,%s,%s,'openai_compatible')",
+            (runtime_id, provider_id, str(runtime_id)),
+        )
+        connection.execute(
+            "INSERT INTO model_runtime_price(runtime_id,price_discount_percent) VALUES(%s,%s)",
+            (runtime_id, 90),
+        )
+    repository = PostgreSqlOpsDbProxy(info)
+    try:
+        common: dict[str, Any] = {
+            "provider_id": provider_id, "runtime_id": runtime_id, "capabilities": ["chat"],
+            "allowed_roles": ["owner"], "input_cost_per_million": 0.36,
+            "output_cost_per_million": 1.44,
+        }
+        manual = repository.create_registry_item("model", ManagedModelWrite(
+            **common, model_key=str(uuid4()), display_name="Manual price",
+        ).model_dump(mode="python"))
+        retail = repository.create_registry_item("model", ManagedModelWrite(
+            **common, model_key=str(uuid4()), display_name="Retail price",
+            cached_cost_per_million=0.09, price_source=PriceSource.AZURE_RETAIL,
+            price_reference="azure_retail:Azure OpenAI:gpt 4.1 mini:Global:*",
+        ).model_dump(mode="python"))
+
+        saved = {row["id"]: row for row in repository.registry()["models"]}
+
+        assert saved[manual["id"]]["effective_discount_percent"] is None
+        assert float(saved[retail["id"]]["effective_discount_percent"]) == 90
+    finally:
+        repository.close()
+
+
 def test_context_prices_persist_and_reconcile_against_original_postgres_snapshot(
     pricing_postgres: tuple[str, Event], tmp_path: Path,
 ) -> None:
@@ -384,6 +443,12 @@ def test_publication_activation_persists_catalog_pricing_in_postgres(
     pricing_postgres: tuple[str, Event], source: PriceSource,
 ) -> None:
     info, _waiting = pricing_postgres
+    # Each case publishes the gateway's first release, so it needs a gateway of its own.
+    database = f"activation_{source.value}"
+    with psycopg.connect(info, autocommit=True) as connection:
+        connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+    info = make_conninfo(info, dbname=database)
+    _apply_migrations(info)
     repository = PostgreSqlOpsDbProxy(info)
     try:
         registry = repository.registry()
@@ -465,5 +530,175 @@ def test_publication_activation_persists_catalog_pricing_in_postgres(
         assert len(rows) == 1
         assert rows[0]["price_source"] == "manual"
         assert rows[0]["input_cost_per_million"] == 7
+    finally:
+        repository.close()
+
+
+def test_budget_usage_prices_free_pre_dispatch_denials_like_the_ledger_in_postgres(
+    pricing_postgres: tuple[str, Event],
+) -> None:
+    info, _waiting = pricing_postgres
+    repository = PostgreSqlOpsDbProxy(info)
+    try:
+        processor = UsageProcessor(repository, CoefficientResolver({"default": 1.0}))
+        moment = datetime.now(UTC)
+        users = {"denied": f"denied-{uuid4()}", "unpriced": f"unpriced-{uuid4()}"}
+        outcomes = {
+            "denied": {
+                "status": "429", "status_code": 429,
+                "ingest_error": "budget_pre_dispatch_denial",
+                "budget_admission": "budget_exhausted",
+            },
+            "unpriced": {
+                "status": "success", "status_code": 200,
+                "input_tokens": 10, "cached_tokens": 0, "output_tokens": 1,
+            },
+        }
+        for kind, user_id in users.items():
+            attempt = str(uuid4())
+            assert processor.process({
+                "id": attempt, "request_id": attempt, "correlation_id": attempt,
+                "ts": moment.isoformat(), "provider": "Unit", "model": "unit-model",
+                "model_id": "unit-model", "user_id": user_id, "turn_index": 1,
+                "latency_ms": 1, "estimated": True, "ingest_source": "eventhub",
+                **outcomes[kind],
+            })
+        period = moment.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        rows = {
+            row["scope_id"]: row
+            for row in repository.token_usage_by_budget_scope(
+                period, moment + timedelta(seconds=1),
+            )
+            if row["scope_type"] == "user"
+        }
+        assert rows[users["denied"]]["unpriced_usage_count"] == 0
+        assert rows[users["denied"]]["used_usd"] == 0
+        assert rows[users["unpriced"]]["unpriced_usage_count"] == 1
+        assert repository.gateway_application_usage(
+            period.date(), (period + timedelta(days=32)).date(), [uuid4()],
+        ) == []
+    finally:
+        repository.close()
+
+
+def test_budget_overview_reports_people_model_assignments_in_postgres(
+    pricing_postgres: tuple[str, Event],
+) -> None:
+    info, _waiting = pricing_postgres
+    database = "budget_model_assignments"
+    with psycopg.connect(info, autocommit=True) as connection:
+        connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+    info = make_conninfo(info, dbname=database)
+    _apply_migrations(info)
+    provider_id, runtime_id = uuid4(), uuid4()
+    with psycopg.connect(info, autocommit=True) as connection:
+        connection.execute(
+            "INSERT INTO model_provider(id,name,provider_kind) VALUES(%s,%s,'openai_compatible')",
+            (provider_id, str(provider_id)),
+        )
+        connection.execute(
+            "INSERT INTO model_runtime(id,provider_id,name,runtime_kind) "
+            "VALUES(%s,%s,%s,'openai_compatible')",
+            (runtime_id, provider_id, str(runtime_id)),
+        )
+    repository = PostgreSqlOpsDbProxy(info)
+    try:
+        model = repository.create_registry_item("model", ManagedModelWrite(
+            provider_id=provider_id, runtime_id=runtime_id, model_key=str(uuid4()),
+            display_name="Assigned model", capabilities=["chat"], allowed_roles=["owner"],
+            input_cost_per_million=1, output_cost_per_million=4,
+        ).model_dump(mode="python"))
+        today = datetime.now(UTC).date()
+        repository.bulk_upsert_user_budgets(
+            today.replace(day=1), "department-platform", [], 80, "sql-test",
+            selected_user_ids=["test.user01@contoso.com"], model_ids=[model["id"]],
+        )
+        overview = TokenBudgetService(repository).overview(
+            today.strftime("%Y-%m"), include_users=True,
+        )
+        people = {
+            item.scope_id: (item.model_policy_configured, item.allowed_model_ids)
+            for item in overview.items if item.scope_type == "user"
+        }
+        assert people["test.user01@contoso.com"] == (True, [model["id"]])
+        assert people["test.user02@contoso.com"] == (False, [])
+    finally:
+        repository.close()
+
+
+def test_backend_recorded_person_is_matched_by_request_and_person_in_postgres(
+    pricing_postgres: tuple[str, Event],
+) -> None:
+    from tests.backend.model_platform.test_platform_invocation_trace import invocation_attempt
+
+    info, _waiting = pricing_postgres
+    repository = PostgreSqlOpsDbProxy(info)
+    try:
+        platform = invocation_attempt(f"platform-{uuid4()}")
+        repository.begin_platform_invocation(platform)
+        image_id, period = uuid4(), datetime.now(UTC).date().replace(day=1)
+        with psycopg.connect(info, autocommit=True) as connection:
+            connection.execute(
+                """INSERT INTO billable_request_attempt (
+                       id, operation_key, plan_sha256, scope_type, scope_id, period_start,
+                       model_id, model_key, reserved_tokens, attempt_index, state)
+                   VALUES (%s, %s, %s, 'person', 'alex@contoso.com', %s,
+                           'unit-model', 'unit-model', 1, 1, 'started')""",
+                (image_id, f"invocation:{image_id}", "0" * 64, period),
+            )
+        assert repository.platform_request_person_recorded(platform.request_id, "unit")
+        assert repository.platform_request_person_recorded(str(image_id), "alex@contoso.com")
+        assert not repository.platform_request_person_recorded(platform.request_id, "other")
+        assert not repository.platform_request_person_recorded(str(image_id), "unit")
+        assert not repository.platform_request_person_recorded("not-a-uuid", "unit")
+    finally:
+        repository.close()
+
+
+def test_inventory_sync_adopts_the_application_already_bound_to_a_subscription_in_postgres(
+    pricing_postgres: tuple[str, Event],
+) -> None:
+    from uuid import uuid5
+
+    from turnstile_core.domain.application_access import (
+        application_id_for,
+        application_subscription_id_for,
+    )
+
+    info, _waiting = pricing_postgres
+    repository = PostgreSqlOpsDbProxy(info)
+    gateway = UUID("10000000-0000-4000-8000-000000000001")
+    period = datetime.now(UTC).date().replace(day=1)
+    probe = f"probe-{uuid4().hex[:8]}"
+
+    def item(application_id: UUID, subscription_id: UUID) -> dict[str, Any]:
+        return {
+            "application_id": application_id, "subscription_id": subscription_id,
+            "apim_subscription_id": probe, "slug": "publisher", "display_name": "Unit publisher",
+            "application_type": "system", "system_managed": True, "state": "active",
+            "scope_type": "api", "scope_id": "finops-foundry-llm", "scope_exists": True,
+        }
+
+    try:
+        # v1.3 bootstrap keyed the system application by name, not by its subscription.
+        legacy = uuid5(gateway, "publisher")
+        repository.sync_gateway_applications(
+            gateway, [item(legacy, uuid5(gateway, probe))], "installation", period, 1, 1,
+        )
+        repository.sync_gateway_applications(gateway, [{
+            **item(application_id_for(gateway, probe),
+                   application_subscription_id_for(gateway, probe)),
+            "slug": probe, "audit_id": uuid4(), "source": "discovered",
+        }], "unit-owner", period, 1, 1)
+        with psycopg.connect(info) as connection:
+            assert connection.execute(
+                "SELECT id FROM gateway_application WHERE id = ANY(%s)",
+                ([legacy, application_id_for(gateway, probe)],),
+            ).fetchall() == [(legacy,)]
+            assert connection.execute(
+                """SELECT application_id FROM gateway_application_subscription
+                   WHERE gateway_profile_id = %s AND apim_subscription_id = %s""",
+                (gateway, probe),
+            ).fetchall() == [(legacy,)]
     finally:
         repository.close()

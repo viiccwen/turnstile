@@ -325,8 +325,9 @@ function ApplicationBudgetDialog({ application, open, writeAvailable, onOpenChan
       onOpenChange(false)
     },
   })
+  const usdValid = /^\d{1,16}(\.\d{1,2}0*)?$/.test(usdLimit) && Number(usdLimit) > 0
   const valid = (budgetMode === "usd"
-    ? /^\d{1,16}(\.\d{1,14})?$/.test(usdLimit) && Number(usdLimit) > 0
+    ? usdValid
     : Number(tokenLimit) > 0 && Number.isSafeInteger(Number(tokenLimit)))
     && Number(tokensPerMinute) > 0
     && Number.isSafeInteger(Number(tokensPerMinute))
@@ -348,6 +349,7 @@ function ApplicationBudgetDialog({ application, open, writeAvailable, onOpenChan
           }}><SelectTrigger aria-label="预算单位"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="tokens">Token</SelectItem><SelectItem value="usd">USD</SelectItem></SelectContent></Select></div>
           <div className="form-grid"><label className="registry-field"><span className="registry-field-label">{budgetMode === "usd" ? "月度金额上限（USD）" : "月度 Token 上限"}</span><Input name={budgetMode === "usd" ? "usd_limit" : "token_limit"} type={budgetMode === "usd" ? "text" : "number"} min={budgetMode === "usd" ? undefined : "1"} step={budgetMode === "usd" ? undefined : "1"} inputMode={budgetMode === "usd" ? "decimal" : "numeric"} value={budgetMode === "usd" ? usdLimit : tokenLimit} disabled={!writeAvailable || mutation.isPending} onChange={(event) => budgetMode === "usd" ? setUsdLimit(event.target.value) : setTokenLimit(event.target.value)} /></label><label className="registry-field"><span className="registry-field-label">每分钟 Token 上限</span><Input type="number" min="1" step="1" inputMode="numeric" value={tokensPerMinute} disabled={!writeAvailable || mutation.isPending} onChange={(event) => setTokensPerMinute(event.target.value)} /></label></div>
           <div className="form-grid"><label className="registry-field"><span className="registry-field-label">预警阈值（%）</span><Input type="number" min="1" max="100" step="1" inputMode="numeric" value={warningThreshold} disabled={!writeAvailable || mutation.isPending} onChange={(event) => setWarningThreshold(event.target.value)} /></label><label className="application-governance-toggle"><Checkbox checked={enforce} disabled={!writeAvailable || mutation.isPending} onCheckedChange={(checked) => setEnforce(checked === true)} /><span><b>超额时阻断</b><small>关闭后仅记录，不拒绝调用</small></span></label></div>
+          {budgetMode === "usd" && usdLimit.trim() !== "" && !usdValid && <div className="registry-error" role="alert">请输入有效的 USD 金额</div>}
           {mutation.error && <div className="registry-error">{String(mutation.error)}</div>}
         </div>
         <DialogFooter className="registry-editor-footer"><Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={mutation.isPending}>取消</Button><Button type="submit" disabled={!writeAvailable || !valid || mutation.isPending}>{mutation.isPending ? <RefreshCw className="spin" size={14} /> : null}{mutation.isPending ? "正在保存" : "保存额度"}</Button></DialogFooter>
@@ -427,6 +429,7 @@ function ApplicationOrganizationDialog({ application, onClose, onSaved }: {
               <SelectContent><SelectItem value="">未分配</SelectItem>{people.map(item => <SelectItem key={item.id} value={item.id}><span data-no-localize>{item.name}</span></SelectItem>)}</SelectContent>
             </Select>
           </div>}
+          {personSupported && application.person_id && !personId && <div className="application-governance-unavailable" role="status"><AlertTriangle size={14} /><span>保存后将移除归属人员</span><b data-no-localize>{application.person_name ?? application.person_id}</b></div>}
           {entities.isError && <div className="registry-error">{String(entities.error)}</div>}
           {mutation.error && <div className="registry-error">{String(mutation.error)}</div>}
         </div>
@@ -666,7 +669,7 @@ function ApplicationDetailView({
           <div className="application-metric-grid">
             <Metric label="总 Tokens" value={formatFullCount(application.usage.total_tokens)} />
             <Metric label="输入" value={formatCount(application.usage.input_tokens)} />
-            <Metric label="缓存读取" value={formatCount(application.usage.cached_tokens)} />
+            <Metric label="缓存读取 / 写入" value={`${formatCount(Math.max(application.usage.cached_tokens - application.usage.cache_write_tokens, 0))} / ${formatCount(application.usage.cache_write_tokens)}`} />
             <Metric label="输出" value={formatCount(application.usage.output_tokens)} />
             <Metric label="拒绝请求" value={formatFullCount(application.usage.denied_request_count)} />
             <Metric label="估算成本" value={formatCost(application.usage.estimated_cost)} />
@@ -876,7 +879,7 @@ export function ApplicationsPage() {
       </div>
     </header>
     {detail.error && !detail.data ? <div className="smh-empty application-detail-error"><KeyRound size={28} /><b>无法加载订阅详情</b><span>{String(detail.error)}</span><a className="ghost-button" href={applicationRouteHref(null)} onClick={openApplicationRoute(null)}>返回订阅</a></div>
-      : <main className="application-detail"><ApplicationDetailView application={detail.data} loading={detail.isLoading} refreshing={detail.isFetching} refreshError={detail.isRefetchError} onRefresh={() => { void detail.refetch() }} modelNames={modelNames} canEditAvatar={detail.data?.avatar_url !== undefined} canManage={user?.role === "owner"} governanceWriteAvailable={detail.data?.governance_write_available === true} models={registry.data?.models ?? []} registry={registry.data} /></main>}
+      : <section className="application-detail"><ApplicationDetailView application={detail.data} loading={detail.isLoading} refreshing={detail.isFetching} refreshError={detail.isRefetchError} onRefresh={() => { void detail.refetch() }} modelNames={modelNames} canEditAvatar={detail.data?.avatar_url !== undefined} canManage={user?.role === "owner"} governanceWriteAvailable={detail.data?.governance_write_available === true} models={registry.data?.models ?? []} registry={registry.data} /></section>}
   </div>
   }
 
@@ -904,7 +907,7 @@ export function ApplicationsPage() {
           {apimCards.map((card) => {
             return <a key={card.id ?? "all"} data-apim-id={card.id ?? "all"} className={`subscriptions-category-card ${selectedApimId === card.id ? "active" : ""}`} aria-current={selectedApimId === card.id ? "page" : undefined} href={applicationRouteHref(null, card.id)} onClick={openApplicationRoute(null, card.id)}>
               <span className="subscriptions-category-icon">{card.id ? <ApimLogo size={15} /> : <Layers3 size={15} />}</span>
-              <span className="subscriptions-category-copy"><b data-no-localize={card.id ? true : undefined} title={card.name}>{card.name}</b><small>{applications.isLoading ? "—" : `${card.items.reduce((total, item) => total + item.subscription_count, 0)} 个订阅`}</small></span>
+              <span className="subscriptions-category-copy"><b data-no-localize={card.id ? true : undefined} title={card.name}>{card.name}</b><small>{applications.isLoading ? "—" : `${card.items.length} 个订阅`}</small></span>
               <strong data-no-localize>{applications.isLoading ? "—" : card.items.length}</strong>
             </a>
           })}

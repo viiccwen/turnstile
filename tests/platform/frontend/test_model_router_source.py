@@ -571,6 +571,12 @@ def test_model_based_router_preview_and_trace_evidence_are_privacy_safe() -> Non
 
     assert 'selected.strategy_type === "model_based" && <DecisionPromptEditor' in canvas
     assert 'node.strategy_type === "model_based" && <DecisionPromptEditor' in form
+    assert (
+        'placeholder={isSystemOne\n          ? "留空使用内置判路由指令；'
+        '候选模型的名称、单价和路由用途说明会自动作为 Choice 判据"'
+    ) in editor
+    assert '<SelectTrigger aria-label="选择判路由模型"' in canvas
+    assert 'aria-label="选择 Routing Model"' not in canvas
     assert "SAMPLE_PROMPT_PRESETS" not in editor
     assert "previewModelRouterDecision" not in editor
     assert "trialModelRouterDecision" not in editor
@@ -637,6 +643,24 @@ def test_model_router_canvas_and_regular_mode_share_one_definition() -> None:
     assert "edgesFocusable={!isLocked && !isDragging}" in canvas
     assert "deleteKeyCode" in canvas
     assert "onConnect={handleConnect}" in canvas
+    # A Strategy newly fed by a candidate pool must store the candidate rows it displays.
+    assert (
+        'const feedsStrategy = sourceNode?.type === "candidate_models"\n'
+        '      && definition.nodes.find((node) => node.id === connection.target)?.type'
+        ' === "strategy"' in canvas
+    )
+    assert "onChange(feedsStrategy ? syncStrategyModelConfigs(next) : next)" in canvas
+    # A clicked edge becomes the only selection, so it can be inspected or deleted.
+    assert (
+        "onEdgeClick={(_event, edge) => { if (isLocked) return; setSelectedEdgeId(edge.id); "
+        "onSelectedNodeChange(null) }}" in canvas
+    )
+    assert "selected: edge.id === selectedEdgeId," in canvas
+    # A locked canvas presents no selected edge, so Delete cannot remove one.
+    assert "flowEdges(definition, isLocked ? null : selectedEdgeId)" in canvas
+    # Canvas branch labels and draft normalization share one Match label list.
+    assert "MATCH_BRANCH_LABELS.includes(edge.label" in canvas
+    assert '"match", "matched"' not in canvas
     assert "onDrop=" in canvas
     assert "<MiniMap" not in canvas
     assert "showMinimap" not in canvas
@@ -813,8 +837,28 @@ def test_model_router_canvas_and_regular_mode_share_one_definition() -> None:
     assert 'createRouterNode("strategy"' in definition
     assert 'createRouterEdge(candidates.id, strategy.id)' in definition
     assert 'createRouterEdge(strategy.id, output.id, "正常输出")' in definition
-    assert 'createRouterEdge(strategy.id, fallback.id, "异常策略")' in definition
-    assert 'fallbackEdge.source_handle = "branch-exception"' in definition
+    assert 'createRouterNode("fallback"' not in definition[
+        definition.index("export function createStarterDefinition") :
+        definition.index("export function inferLayoutDirection")
+    ]
+    notice = (
+        "经 APIM 网关调用的 Router 不支持 Fallback，包含 Fallback 时会返回 503；"
+        "Fallback 只在平台内调用时生效。"
+    )
+    assert f'export const ROUTER_NATIVE_FALLBACK_NOTICE = "{notice}"' in definition
+    assert (
+        '<div className="router-properties-empty">{ROUTER_NATIVE_FALLBACK_NOTICE}</div>'
+    ) in canvas
+    assert "value.definition.nodes.some((node) => node.fallback_on.length > 0)" in page
+    assert (
+        '{nativeFallback && <div className="router-validation-banner-warning">'
+        "{ROUTER_NATIVE_FALLBACK_NOTICE}</div>}"
+    ) in page
+    assert ".router-validation-banner-warning {" in styles
+    for locale in ("en", "ja", "ko"):
+        assert f'"{notice}":' in (
+            FRONTEND_SOURCE / f"locales/{locale}/phrases-core.ts"
+        ).read_text(encoding="utf-8")
     assert "const policyEdges = next.edges.filter(" in definition
     assert "for (const policyEdge of policyEdges)" in definition
     assert "strategy.timeout_ms = fallback.timeout_ms" in definition
@@ -903,3 +947,21 @@ def test_model_router_canvas_and_regular_mode_share_one_definition() -> None:
         "button.router-new-button",
     ):
         assert selector in styles
+
+
+def test_publish_stays_disabled_while_the_current_draft_fails_validation() -> None:
+    page = (FRONTEND_SOURCE / "pages/model-router-page.tsx").read_text(encoding="utf-8")
+    actions = page.split('<div className="router-editor-actions">', 1)[1].split("</div>", 1)[0]
+    publish = next(line for line in actions.splitlines() if "onClick={onPublish}" in line)
+
+    assert "disabled={busy || validation?.valid === false}" in publish
+    # Any edit clears the result, so Publish re-enables once the draft changes.
+    assert "onChange={(value) => { setDraft(value); setValidation(null) }}" in page
+
+
+def test_published_router_with_saved_changes_reads_unpublished() -> None:
+    page = (FRONTEND_SOURCE / "pages/model-router-page.tsx").read_text(encoding="utf-8")
+    unpublished = 'router.status === "published" && router.has_unpublished_changes'
+
+    assert f"{{{unpublished} && <> · <span>未发布</span></>}}" in page
+    assert f"{{!dirty && {unpublished} && <strong>未发布</strong>}}" in page

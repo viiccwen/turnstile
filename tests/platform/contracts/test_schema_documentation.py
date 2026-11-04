@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from tests.support.paths import REPOSITORY_ROOT
 
 EXPECTED_DOCUMENTS = {
@@ -63,6 +65,18 @@ def test_repository_documents_one_database_entry_point() -> None:
         assert "migration-manifest" not in text
 
 
+def test_clean_install_verification_lists_every_migration() -> None:
+    testing = (REPOSITORY_ROOT / "docs/testing.md").read_text(encoding="utf-8")
+    clean_install = next(
+        line for line in testing.splitlines() if line.startswith("For a clean installation")
+    )
+
+    assert re.findall(r"`(\d{3}_[a-z0-9_]+)`", clean_install) == sorted(
+        path.name.removesuffix(".up.sql")
+        for path in (REPOSITORY_ROOT / "migrations").glob("*.up.sql")
+    )
+
+
 def test_documentation_contains_no_original_environment_identifiers() -> None:
     documents = [
         REPOSITORY_ROOT / "README.md",
@@ -102,10 +116,11 @@ def test_image_upgrade_documents_independent_defaults_and_validation_limits() ->
     configuration = (REPOSITORY_ROOT / "docs/configuration.md").read_text()
     architecture = (REPOSITORY_ROOT / "docs/architecture.md").read_text()
     testing = (REPOSITORY_ROOT / "docs/testing.md").read_text()
-    assert (
-        "Image generation is a standard capability and requires no enablement setting"
-        in configuration
+    assert "Image generation needs no backend setting" in configuration
+    assert "`image_generation_supported` and `decision_supported` describe the backend only" in (
+        configuration
     )
+    assert "deployment.md#enable-decision-and-image-generation" in configuration
     assert "effective_at = NULL" in configuration
     assert configuration.count("## Runtime attribution") == 1
     assert architecture.count("## Ledger finalization") == 1

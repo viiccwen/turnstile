@@ -498,7 +498,7 @@ for (const status of ["failed", "queued", "verifying", "promoting", "active"]) {
 }
 
 for (const [dialog, item] of [
-  ["ModelDeleteDialog", { model: { id: "unit-model", display_name: "Unit model" } }],
+  ["ModelDeleteDialog", { model: { id: "unit-model", display_name: "Unit model" }, routerNames: [] }],
   ["PublicationArchiveDialog", { publication: { id: "unit-publication", display_name: "Unit model" } }],
 ]) {
   for (const busy of [false, true]) {
@@ -951,8 +951,41 @@ test("Decision model purpose is selectable but cannot submit through the unsuppo
     setPublishError() {},
     dataSource: { publishModel: async request => requests.push(request) },
   })
-  assert.deepEqual(errors, ["所选网关尚未启用 Decision 接口。"])
+  assert.deepEqual(errors, ["所选网关尚未启用 Decision 接口。请由部署管理员运行 scripts.deploy enable-capabilities 升级网关。"])
   assert.deepEqual(requests, [])
+})
+
+test("Text-to-image cannot submit through a gateway program without image generation", async () => {
+  const source = readFileSync(new URL("../../../frontend/src/components/model-management/model-publication-dialog.tsx", import.meta.url), "utf8")
+  assert.match(source, /const imageGatewaySupported = installedProgram\?\.supported_profiles\?\.includes\("openai-images"\) === true\s+&& installedProgram\.image_limits != null/)
+  assert.match(source, /disabled=\{\(decision && !decisionSupported\) \|\| \(imageGeneration && !imageGatewaySupported\) \|\|/)
+  const validation = source.match(/  const validate = \(\) => \{([\s\S]+?)\n  \}\n\n  const submit/)
+  const submission = source.match(/  const submit = async \(\) => \{([\s\S]+?)\n  \}\n  const status/)
+  assert.ok(validation)
+  assert.ok(submission)
+  for (const imageGatewaySupported of [false, true]) {
+    const errors = [], requests = []
+    const context = {
+      decision: false, imageGeneration: true, imageGatewaySupported, foundry: true,
+      topologyBlocked: false, selectedGateway: { id: "unit-gateway" }, programPending: false,
+      programReady: true, publishing: false, selectedRuntime: { id: "unit-runtime" },
+      selectedProvider: { id: "unit-provider" }, pricing: {}, validateModelPricing: () => null,
+      optionalNumberError: () => null, contextWindow: "", inputPrice: "5", outputPrice: "30",
+      cacheReadPrice: "1.25", cacheWritePrice: "", requiredCredentialMissing: false,
+      foundryDeployment: "gpt-image-2", registry: { image_generation_supported: true },
+      imageConfigurationSupported: true, priceValues: ["5", "30", "1.25"],
+      setFormError: value => errors.push(value), setPublishError() {},
+      dataSource: { publishModel: async request => requests.push(request) },
+    }
+    if (imageGatewaySupported) {
+      assert.equal(runInNewContext(stripTypeScriptTypes(`(() => {${validation[1]}\n})()`), context), null)
+      continue
+    }
+    const script = stripTypeScriptTypes(`const validate = () => {${validation[1]}\n}; (async () => {${submission[1]}\n})()`)
+    await runInNewContext(script, context)
+    assert.deepEqual(errors, ["所选网关未启用图像生成。请由部署管理员运行 scripts.deploy enable-capabilities 升级网关。"])
+    assert.deepEqual(requests, [])
+  }
 })
 
 test("Decision pricing uses the shared official catalog instead of hardcoded rates", () => {
@@ -1002,12 +1035,58 @@ test("Decision purpose changes reset prices for shared catalog selection", () =>
     assert.equal(draft.outputPrice, "")
     assert.equal(draft.cacheReadPrice, "")
     assert.equal(draft.cacheWritePrice, "")
-    assert.equal(draft.priceSource, "manual")
+    assert.equal(draft.priceSource, operation === "decision" ? "azure_retail" : "manual")
     assert.equal(draft.priceReference, "")
-    assert.equal(validateModelPricing(draft), null)
+    assert.equal(validateModelPricing(draft), operation === "decision" ? "price_reference" : null)
   }
   assert.doesNotMatch(source, />应用参考价<\/Button>/)
   assert.match(source, /className=\{decision \? "publication-decision-price-fields" : "form-grid"\}/)
+})
+
+test("Decision cannot be published without a price", () => {
+  const source = readFileSync(new URL("../../../frontend/src/components/model-management/model-publication-dialog.tsx", import.meta.url), "utf8")
+  const validation = source.match(/  const validate = \(\) => \{([\s\S]+?)\n  \}\n\n  const submit/)
+  assert.ok(validation)
+  const validate = stripTypeScriptTypes(`(() => {${validation[1]}\n})()`)
+  for (const [priceSource, prices, expected] of [
+    ["manual", ["", ""], "请填写 Decision 的输入和输出单价（可填 0），或从 Azure 官方价目选择。"],
+    ["manual", ["0.042", ""], "请填写 Decision 的输入和输出单价（可填 0），或从 Azure 官方价目选择。"],
+    ["manual", ["0.042", "0"], null],
+    ["azure_retail", ["", ""], null],
+  ]) {
+    const context = {
+      decision: true, decisionSupported: true, imageGeneration: false, foundry: true,
+      topologyBlocked: false, selectedGateway: { id: "unit-gateway" }, programPending: false,
+      programReady: true, selectedRuntime: { id: "unit-runtime" }, selectedProvider: { id: "unit-provider" },
+      pricing: { priceSource }, validateModelPricing: () => null, optionalNumberError: () => null,
+      contextWindow: "", inputPrice: prices[0], outputPrice: prices[1], cacheReadPrice: "",
+      cacheWritePrice: "", requiredCredentialMissing: false, foundryDeployment: "Decision-1",
+      registry: {}, imageConfigurationSupported: true, priceValues: prices,
+    }
+    assert.equal(runInNewContext(validate, context), expected)
+  }
+})
+
+test("Decision opens the Azure catalog search instead of an empty manual price", () => {
+  const dialog = readFileSync(new URL("../../../frontend/src/components/model-management/model-publication-dialog.tsx", import.meta.url), "utf8")
+  const source = readFileSync(new URL("../../../frontend/src/components/model-management/model-price-source.tsx", import.meta.url), "utf8")
+  assert.match(dialog, /initialSearch=\{decision \? "Microsoft Decision" : undefined\}/)
+  const effect = source.match(/  useEffect\(\(\) => \{\n(    if \(!initialSearch[\s\S]+?)\n    \/\/ eslint-disable-next-line/)
+  assert.ok(effect)
+  for (const [initialSearch, model, priceSource, searched] of [
+    ["Microsoft Decision", undefined, "azure_retail", ["Microsoft Decision"]],
+    ["Microsoft Decision", undefined, "manual", []],
+    ["Microsoft Decision", { id: "saved" }, "azure_retail", []],
+    [undefined, undefined, "azure_retail", []],
+  ]) {
+    const queries = [], searches = []
+    runInNewContext(`(() => {${effect[1]}\n})()`, {
+      initialSearch, model, draft: { priceSource },
+      setQuery: value => queries.push(value), search: value => searches.push(value),
+    })
+    assert.deepEqual(searches, searched)
+    assert.deepEqual(queries, searched)
+  }
 })
 
 for (const mode of ["remove", "publish", "foreign-target", "missing-model"]) {
@@ -1119,13 +1198,30 @@ test("failed publication progress does not claim a model is serving or that Azur
   assert.equal(markup.includes("当前模型继续正常服务"), false)
 })
 
+test("a missing gateway capability is a final, explained failure without Republish", () => {
+  const markup = frontendRequire("react-dom/server").renderToStaticMarkup(publicationComponents.PublicationProgress({
+    publication: { status: "failed", failure: { code: "gateway_capability_unavailable", profile: "openai-images" } },
+  }))
+  assert.match(markup, /发布未完成，当前 Revision 未受影响/)
+  assert.equal(markup.includes("生效状态未确认"), false)
+  assert.match(publicationComponents.publicationCapabilityMessage("openai-images"), /图像生成（openai-images）.*scripts\.deploy enable-capabilities/)
+  assert.match(publicationComponents.publicationCapabilityMessage("microsoft-decision"), /Decision 接口（microsoft-decision）.*scripts\.deploy enable-capabilities/)
+  const source = readFileSync(new URL("../../../frontend/src/components/model-management/model-publication-dialog.tsx", import.meta.url), "utf8")
+  assert.match(source, /const capabilityFailure = failed && publication\.data\?\.failure\?\.code === "gateway_capability_unavailable"/)
+  assert.match(source, /\{failed && !capabilityFailure && <Button type="button" onClick=\{\(\) => void retry\(\)\}/)
+  const page = readFileSync(new URL("../../../frontend/src/pages/model-management-page.tsx", import.meta.url), "utf8")
+  assert.match(page, /actionLabel: publication\.failure\?\.code === "gateway_capability_unavailable" \? "查看详情" : "重新发布"/)
+})
+
 const releaseComponents = {}
 runInNewContext(releasesModule + "\nexports.PublicationFailureNotice = PublicationFailureNotice; exports.ReleaseDetail = ReleaseDetail", {
   exports: releaseComponents,
   require: name => name === "react/jsx-runtime" || name === "lucide-react"
     ? frontendRequire(name) : name === "../providers/timezone-provider"
       ? { useTimezone: () => ({ timezone: "UTC" }) } : name === "../locales"
-        ? { getIntlLocale: () => "en-US" } : new Proxy({}, { get: (_target, key) => key }),
+        ? { getIntlLocale: () => "en-US" }
+        : name === "../components/model-management/model-publication-dialog" ? publicationComponents
+          : new Proxy({}, { get: (_target, key) => key }),
 })
 
 for (const status of ["queued", "validating", "provisioning", "building_revision", "verifying", "awaiting_authorization", "promoting", "failed", "rolling_back", "rolled_back", "active", "superseded"]) {
@@ -1162,6 +1258,8 @@ for (const [code, expected] of [
   ["publisher_authorization_failed", "Azure 拒绝了 Publisher 的 APIM 管理请求"],
   ["parent_policy_changed", "APIM 父策略与排队时的快照不一致"],
   ["credential_source_missing", "APIM 凭据资源尚未创建，请重新提供 API Key 后重试"],
+  ["credential_unreadable", "无法读取连接的 API Key，请重新提供 API Key 后重试"],
+  ["credential_vault_unavailable", "凭据 Key Vault 未配置或未获此网关程序批准"],
   ["publication_failed", "发布未完成，请使用任务 ID 查询诊断记录"],
   ["future_unknown_code", "发布未完成，请使用任务 ID 查询诊断记录"],
 ]) {
@@ -1447,6 +1545,7 @@ for (const role of ["owner", "member", null]) {
           apimTargetTopologies: () => ({ queryKey: ["topology"] }),
           gatewayPublications: () => ({ queryKey: ["publications"] }),
           gatewayPublication: id => ({ queryKey: ["publication", id], enabled: Boolean(id) }),
+          modelRouters: () => ({ queryKey: ["routers"] }),
         } } : name === "../components/brand-logos" ? { providerBrandFromIdentity: () => "generic",
           gatewayBrandFromIdentity: () => "generic" }
           : name === "react/jsx-runtime" || name === "lucide-react" ? frontendRequire(name)
@@ -1457,6 +1556,8 @@ for (const role of ["owner", "member", null]) {
     assert.equal(seen.find(options => options.queryKey[0] === "publications").enabled, role === "owner")
     assert.equal(seen.find(options => options.queryKey[0] === "publication").enabled,
       role === "owner" && Boolean(publicationId))
+    // Router references are read only once a model deletion is being confirmed.
+    assert.equal(seen.find(options => options.queryKey[0] === "routers").enabled, false)
   })
   }
 }
@@ -2627,6 +2728,42 @@ test("rolling usage query defaults retain their existing day-based cache and fre
   assert.notEqual(calls[0].searchParams.get("from"), filters.from)
   assert.equal(calls[0].searchParams.get("model_id"), filters.model_id)
   assert.equal(Date.parse(calls[0].searchParams.get("to")) - Date.parse(calls[0].searchParams.get("from")), 7 * 86400000)
+})
+
+test("current budget period window starts at the UTC month and re-anchors on every fetch", async () => {
+  const calls = []
+  const { finopsQueries, usageWindow } = inventoryHarness(async path => { calls.push(new URL(path, "https://unit.example")); return {} })
+  const now = Date.parse("2026-11-02T13:45:00.000Z")
+  const month = { ...usageWindow("month", now), model_id: "unit-model" }
+  assert.equal(month.from, "2026-11-01T00:00:00.000Z")
+  assert.equal(month.to, "2026-11-02T13:45:00.000Z")
+  const later = { ...usageWindow("month", Date.parse("2026-11-20T08:00:00.000Z")), model_id: "unit-model" }
+  const option = finopsQueries.executiveOverview(month)
+  assert.equal(JSON.stringify(option.queryKey), JSON.stringify(finopsQueries.executiveOverview(later).queryKey))
+  assert.notEqual(JSON.stringify(option.queryKey), JSON.stringify(finopsQueries.executiveOverview({ ...usageWindow(2, now), model_id: "unit-model" }).queryKey))
+  await option.queryFn()
+  const from = new Date(calls[0].searchParams.get("from"))
+  assert.equal(from.toISOString(), new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), 1)).toISOString())
+  assert.ok(Date.parse(calls[0].searchParams.get("to")) > from.getTime())
+  assert.equal(calls[0].searchParams.has("range"), false)
+  assert.equal(calls[0].searchParams.get("model_id"), "unit-model")
+})
+
+test("month-to-date overview compares with the same span of last month, capped at its end", async () => {
+  const calls = []
+  const { dataSource } = inventoryHarness(async path => { calls.push(new URL(path, "https://unit.example")); return {} })
+  const comparison = async filters => {
+    await dataSource.executiveOverview(filters)
+    return [calls.at(-1).searchParams.get("compare_from"), calls.at(-1).searchParams.get("compare_to")]
+  }
+  assert.deepEqual(await comparison({ from: "2026-11-01T00:00:00.000Z", to: "2026-11-02T13:45:00.000Z", range: "month" }),
+    ["2026-10-01T00:00:00.000Z", "2026-10-02T13:45:00.000Z"])
+  assert.deepEqual(await comparison({ from: "2027-03-01T00:00:00.000Z", to: "2027-03-31T10:00:00.000Z", range: "month" }),
+    ["2027-02-01T00:00:00.000Z", "2027-03-01T00:00:00.000Z"])
+  assert.deepEqual(await comparison({ from: "2027-01-01T00:00:00.000Z", to: "2027-01-15T00:00:00.000Z", range: "month" }),
+    ["2026-12-01T00:00:00.000Z", "2026-12-15T00:00:00.000Z"])
+  assert.deepEqual(await comparison({ from: "2026-10-03T13:45:00.000Z", to: "2026-11-02T13:45:00.000Z" }), [null, null])
+  assert.ok(calls.every(address => !address.searchParams.has("range")))
 })
 
 test("unified registry consumes stored topology in one request", async () => {

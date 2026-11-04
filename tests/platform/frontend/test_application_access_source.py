@@ -56,6 +56,65 @@ def test_ledger_display_uses_api_balances_and_preserves_unknown_values() -> None
             assert f'"{phrase}":' in phrases
 
 
+def test_usd_limit_editors_follow_the_api_decimal_contract() -> None:
+    from pydantic import ValidationError
+
+    from turnstile_core.domain.application_access import GatewayApplicationBudgetUpdate
+
+    validators = [
+        re.compile(pattern)
+        for path in ("pages/applications-page.tsx", "data-sources/apim/pages/budget-page.tsx")
+        for pattern in re.findall(
+            r"/(\^\\d\{1,16\}.*?\$)/\.test\(usdLimit\)",
+            (FRONTEND_SOURCE / path).read_text(encoding="utf-8"),
+        )
+    ]
+    assert len(validators) == 3
+    # Editors prefill stored limits, which the API returns at NUMERIC(30,14) scale.
+    for value in ("10", "0.01", "10.5", "10.00000000000000", "0.001", "1.005", "10.123"):
+        try:
+            GatewayApplicationBudgetUpdate.model_validate({
+                "budget_mode": "usd", "usd_limit": value, "tokens_per_minute": 1,
+                "enforce": True, "warning_threshold_percent": 80,
+            })
+            accepted = True
+        except ValidationError:
+            accepted = False
+        assert [bool(item.fullmatch(value)) for item in validators] == [accepted] * 3, value
+
+
+def test_subscription_dialogs_explain_usd_limits_retries_and_key_rotation() -> None:
+    page = (FRONTEND_SOURCE / "pages/applications-page.tsx").read_text(encoding="utf-8")
+    creation = (
+        FRONTEND_SOURCE / "components/applications/application-create-dialog.tsx"
+    ).read_text(encoding="utf-8")
+    card = (
+        FRONTEND_SOURCE / "components/finops/application-subscription-card.tsx"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        '!usdValid && <div className="registry-error" role="alert">'
+        "请输入有效的 USD 金额</div>"
+    ) in page
+    # A retryable readiness miss is progress; only a terminal failure is an error.
+    assert (
+        '{failed && currentOperation?.error_message && '
+        '<div className="registry-error" role="alert">'
+    ) in creation
+    assert (
+        '{!terminal && currentOperation?.error_message && '
+        '<p className="application-create-note" role="status">'
+    ) in creation
+    # Only the expected key-propagation wait hides the latest retry reason.
+    assert "const retryDetail = applicationRetryDetail(currentOperation)" in creation
+    assert (
+        '{retryDetail && <p className="application-create-note">{retryDetail}</p>}'
+    ) in creation
+    # APIM propagates a regenerated key before the old one stops authenticating.
+    assert "立即失效" not in card
+    assert "将在网关同步后失效" in card
+
+
 def test_subscriptions_are_a_model_platform_domain() -> None:
     app = (FRONTEND_SOURCE / "app.tsx").read_text(encoding="utf-8")
     source = (FRONTEND_SOURCE / "data-sources/apim/source.tsx").read_text(encoding="utf-8")
@@ -286,3 +345,50 @@ def test_application_detail_breadcrumb_reuses_inventory_header_geometry() -> Non
     )
     assert ".application-breadcrumb-trail > svg { flex-shrink: 0; }" in styles
     assert ".application-breadcrumb-trail > a:first-child { min-width: 0; flex-shrink: 1;" in styles
+
+
+def test_subscription_creation_states_the_expected_wait() -> None:
+    dialog = (
+        FRONTEND_SOURCE / "components/applications/application-create-dialog.tsx"
+    ).read_text(encoding="utf-8")
+    note = "新订阅通常需要 2–3 分钟生效，期间会自动重试，无需重复提交。"
+
+    assert (
+        '{!terminal && !failed && <p className="application-create-note" role="status">'
+        + note + "</p>}"
+    ) in dialog
+    for locale in ("en", "ja", "ko"):
+        phrases = (FRONTEND_SOURCE / f"locales/{locale}/phrases-application-create.ts").read_text(
+            encoding="utf-8"
+        )
+        assert f'"{note}":' in phrases
+
+
+def test_ownership_dialog_warns_before_the_assigned_person_is_removed() -> None:
+    # Changing department clears the person, because a person must belong to it.
+    page = (FRONTEND_SOURCE / "pages/applications-page.tsx").read_text(encoding="utf-8")
+
+    assert (
+        "{personSupported && application.person_id && !personId && "
+        '<div className="application-governance-unavailable" role="status">' in page
+    )
+    assert "<span>保存后将移除归属人员</span>" in page
+
+
+def test_application_usage_does_not_count_cache_writes_as_reads() -> None:
+    # cached_tokens includes cache writes; showing it as "cache read" doubled the reads.
+    page = (FRONTEND_SOURCE / "pages/applications-page.tsx").read_text(encoding="utf-8")
+
+    old_metric = '<Metric label="缓存读取" value={formatCount(application.usage.cached_tokens)} />'
+    assert old_metric not in page
+    assert (
+        "formatCount(Math.max(application.usage.cached_tokens - "
+        "application.usage.cache_write_tokens, 0))" in page
+    )
+
+
+def test_apim_group_label_counts_the_same_subscriptions_as_its_badge() -> None:
+    page = (FRONTEND_SOURCE / "pages/applications-page.tsx").read_text(encoding="utf-8")
+
+    assert '`${card.items.length} 个订阅`' in page
+    assert "total + item.subscription_count, 0)} 个订阅" not in page

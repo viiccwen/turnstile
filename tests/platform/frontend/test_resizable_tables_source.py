@@ -63,6 +63,18 @@ def test_resizable_table_primitive_keeps_interaction_and_accessibility_contract(
     assert "widths ?? lastVisibleWidthsRef.current" in source
     assert "new ResizeObserver(rememberVisibleWidths)" in source
     assert "return resizeAtAllWidths || enabled" in source
+    # Icon-only headers (such as Actions) name their resize handle from the header label.
+    assert 'cell.textContent?.trim() || cell.getAttribute("aria-label")?.trim()' in source
+
+
+def test_column_resize_handles_have_localizable_names() -> None:
+    source = (FRONTEND_SOURCE / "components/ui/resizable-table.tsx").read_text(encoding="utf-8")
+    handle = source[
+        source.index('className="table-column-resizer"'):source.index("onPointerDown=")
+    ]
+
+    assert "aria-label={`调整列宽：${label || index + 1}`}" in handle
+    assert "data-no-localize" not in handle
 
 
 def test_column_width_behavior_and_narrow_model_tracks() -> None:

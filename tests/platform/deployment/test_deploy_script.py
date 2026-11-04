@@ -2198,11 +2198,13 @@ def test_saved_outputs_enable_existing_core_on_rerun(tmp_path: Path) -> None:
     assert core.apim_resource_group_name == "turnstile-test"
 
 
+@pytest.mark.parametrize("sku", ["Developer", "StandardV2"])
 @pytest.mark.parametrize("installation_fails", [False, True])
 def test_initial_fixed_program_binds_compiled_policies_before_registration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     installation_fails: bool,
+    sku: str,
 ) -> None:
     from uuid import UUID
 
@@ -2264,7 +2266,7 @@ def test_initial_fixed_program_binds_compiled_policies_before_registration(
                     }
                 },
             )
-        return httpx.Response(200, json={"sku": {"name": "StandardV2"}})
+        return httpx.Response(200, json={"sku": {"name": sku}})
 
     monkeypatch.setattr(
         "scripts.deploy.httpx.Client",
@@ -2311,6 +2313,10 @@ def test_initial_fixed_program_binds_compiled_policies_before_registration(
     parameters = apply.call_args.args[3]["parameters"]
     assert "apimResourceGroupName" not in parameters
     operations = parameters["fixedOperations"]["value"]
+    # APIM rejects API policies above 512 KiB; keep a 32 KiB margin on every tier.
+    assert all(len(policy.encode()) <= 512 * 1024 - 32 * 1024 for policy in (
+        parameters["parentPolicy"]["value"], *(item["policy"] for item in operations),
+    ))
     assert operations[0]["name"] == "anthropic-models"
     assert operations[0]["method"] == "POST"
     assert {item["name"]: fixed_policy_digest(item["policy"]) for item in operations} == (
@@ -2326,6 +2332,23 @@ def test_initial_fixed_program_binds_compiled_policies_before_registration(
     assert descriptor.api_name == "control-test"
     assert descriptor.expected_server == "unit-server.postgres.database.azure.com"
     parent = parse_policy(parameters["parentPolicy"]["value"])
+    router_marker = parent.find(".//set-variable[@name='routeRouterEnabled']")
+    assert router_marker is not None and router_marker.get("value") == "@(true)"
+    assert descriptor.binding.pool_enabled is True
+    pool_marker = parent.find(".//set-variable[@name='routePoolEnabled']")
+    assert pool_marker is not None and pool_marker.get("value") == "@(true)"
+    chat = parse_policy(next(item["policy"] for item in operations
+                             if item["name"] == "chat-completions"))
+    assert chat.find("./backend/choose/when") is not None
+    from tests.backend.model_platform.test_apim_onboarding import (
+        assert_decision_and_image_program,
+    )
+
+    assert_decision_and_image_program(
+        descriptor.binding, parameters["parentPolicy"]["value"],
+        {item["name"]: item["policy"] for item in operations},
+        {item["name"]: (item["method"], item["path"]) for item in operations},
+    )
     delegation = parent.find(
         ".//validate-azure-ad-token[@header-name='x-turnstile-delegation-token']",
     )
@@ -2406,7 +2429,7 @@ def test_new_fixed_program_can_be_redeployed_without_policy_writes(
     monkeypatch.setattr(sys.modules[__name__], "runtime_release_parameters", runtime)
     with monkeypatch.context() as initialization:
         test_initial_fixed_program_binds_compiled_policies_before_registration(
-            tmp_path, initialization, False,
+            tmp_path, initialization, False, "StandardV2",
         )
         applied = cast(Mock, deploy.deploy_resource_group_template)
         inputs = applied.call_args.args[1]
@@ -2493,7 +2516,7 @@ def test_existing_program_delegation_uses_guarded_cutover(
     monkeypatch.setattr(sys.modules[__name__], "runtime_release_parameters", runtime)
     with monkeypatch.context() as initialization:
         test_initial_fixed_program_binds_compiled_policies_before_registration(
-            tmp_path, initialization, False,
+            tmp_path, initialization, False, "StandardV2",
         )
         descriptor = bootstrap.FixedInstallationDescriptor.model_validate_json(
             json.dumps(runtime.call_args.args[6]),
@@ -2553,7 +2576,12 @@ def test_existing_program_delegation_uses_guarded_cutover(
     monkeypatch.setattr(bootstrap, "AzureApimPublisherClient", Mock(return_value=management))
     register = Mock()
     monkeypatch.setattr(bootstrap, "register_verified_program_upgrade", register)
-    settings = Settings.model_construct(budget_delegation_trust={target_id: trust})
+    settings = Settings.model_construct(
+        budget_delegation_trust={target_id: trust},
+        ledger_table_endpoint=descriptor.binding.ledger_table_endpoint,
+        ledger_table_name=descriptor.binding.ledger_table_name,
+        apim_usage_observer_key_named_value=descriptor.binding.observer_key_named_value,
+    )
     if phase in {"changed_target", "checkpoint_conflict"}:
         message = ("Gateway configuration changed" if phase == "checkpoint_conflict"
                    else "approved parent changed")
@@ -2614,11 +2642,15 @@ def test_existing_program_delegation_uses_guarded_cutover(
                     assert granted is not None
                     granted.set("value", "@(false)")
                 elif tampered in {"legacy", "predecessor"}:
-                    name = (
-                        "routeLegacyProgram" if tampered == "legacy" else "routePredecessorPrograms"
-                    )
-                    history = candidate.find(f".//set-variable[@name='{name}']")
+                    history = candidate.find(".//set-variable[@name='routeLegacyProgram']")
                     assert history is not None
+                    if tampered == "predecessor":
+                        owner = next(node for node in candidate.iter() if history in list(node))
+                        index = list(owner).index(history) + 1
+                        history = owner.makeelement(
+                            "set-variable", {"name": "routePredecessorPrograms"},
+                        )
+                        owner.insert(index, history)
                     history.set("value", "f" * 64 if tampered == "legacy"
                                 else json.dumps(["f" * 64]))
                 elif tampered == "unregistered":
@@ -2661,11 +2693,16 @@ def test_existing_program_delegation_uses_guarded_cutover(
     "deployment_missing_source", "deployment_unreadable_source", "deployment_redacted_source",
     "deployment_source_descriptor", "deployment_path", "deployment_unknown", "deployment_mismatch",
     "deployment_healthy", "deployment_incomplete_target",
+    "pool_upgrade", "pool_partial", "pool_written", "pool_operation_drift", "pool_registered",
+    "router_upgrade", "router_registered",
+    "trace_upgrade", "trace_current", "trace_candidate_operation", "trace_etag", "trace_partial",
+    "trace_written",
 ])
 def test_real_delegation_cutover_xml_roundtrip_and_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_state: str,
 ) -> None:
     from contextlib import nullcontext
+    from dataclasses import replace
     from types import SimpleNamespace
     from typing import Any, cast
     from uuid import UUID
@@ -2694,16 +2731,24 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
         configuration_manifests,
         document_digest,
     )
-    from turnstile_core.integrations.apim_storage_routes import fixed_policy_digest
+    from turnstile_core.integrations.apim_control_plane_contract import PolicyCompilationError
+    from turnstile_core.integrations.apim_storage_routes import (
+        compile_fixed_route_program,
+        fixed_policy_digest,
+        fixed_program_digest,
+    )
     from turnstile_core.integrations.storage_route_projection import RouteProjectionConflict
     from turnstile_core.persistence.in_memory import InMemoryRepository
     from turnstile_core.services import storage_route_publisher as routes
 
     runtime = Mock(wraps=runtime_release_parameters)
     monkeypatch.setattr(sys.modules[__name__], "runtime_release_parameters", runtime)
+    monkeypatch.setattr(bootstrap, "_CONVERGED_REFRESH", {})
     with monkeypatch.context() as setup:
+        compiler = Mock(wraps=compile_fixed_route_program)
+        setup.setattr(deploy, "compile_fixed_route_program", compiler)
         test_initial_fixed_program_binds_compiled_policies_before_registration(
-            tmp_path, setup, False,
+            tmp_path, setup, False, "StandardV2",
         )
         parameters = cast(Mock, deploy.deploy_resource_group_template).call_args.args[3]["parameters"]
         deployment_inputs = cast(Mock, deploy.deploy_resource_group_template).call_args.args[1]
@@ -2713,6 +2758,82 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
         )
         old_parent = parameters["parentPolicy"]["value"]
         trust = runtime.call_args.args[8]
+        if native_state.startswith("trace_") and native_state != "trace_current":
+            from turnstile_core.integrations.apim_model_availability import admission_guard
+            from turnstile_core.integrations.apim_policy_components import (
+                parse_policy,
+                serialize_policy,
+            )
+
+            original = compiler._mock_wraps(*compiler.call_args.args, **compiler.call_args.kwargs)
+            parent = parse_policy(original.parent_policy)
+            owners = {child: owner for owner in parent.iter() for child in owner}
+            for marker in parent.findall(".//set-variable[@name='availabilityBindingValid']"):
+                guard = owners[owners[marker]]
+                legacy = serialize_policy(admission_guard(
+                    native_gateway_scope=original.binding.native_gateway_scope,
+                ))
+                for parameter, value in (
+                    ("__GATEWAY_PROFILE_ID__", original.binding.scope.target_id),
+                    ("__LEDGER_TABLE_ENDPOINT__", original.binding.ledger_table_endpoint),
+                    ("__LEDGER_TABLE_NAME__", original.binding.ledger_table_name),
+                ):
+                    legacy = legacy.replace(parameter, value)
+                owner = owners[guard]
+                owner[list(owner).index(guard)] = parse_policy(legacy)
+            policies = dict(original.operation_policies)
+            chat = parse_policy(policies["chat-completions"])
+            denied = next(node for node in chat.iter("when") if node.get("condition") ==
+                          '@(!(bool)context.Variables["routerNativeDocumentReady"])')
+            for node in list(denied):
+                if node.tag == "log-to-eventhub" or node.get("name") == "telemetryUsageId":
+                    denied.remove(node)
+            policies["chat-completions"] = serialize_policy(chat)
+            digest = fixed_program_digest(
+                serialize_policy(parent), policies, original.operation_contracts,
+            )
+            program_marker = parent.find(".//set-variable[@name='routeProgram']")
+            assert program_marker is not None
+            program_marker.set("value", digest)
+            previous_program = replace(
+                original, binding=original.binding.model_copy(update={"program_sha256": digest}),
+                parent_policy=serialize_policy(parent), operation_policies=tuple(policies.items()),
+            )
+            old_parent = previous_program.parent_policy
+            assert previous_program.binding.pool_enabled and previous_program.binding.router_enabled
+            parameters = {**parameters, "fixedOperations": {"value": [
+                {"name": name, "method": method, "path": path, "policy": policies[name]}
+                for name, method, path in previous_program.operation_contracts
+            ]}}
+            descriptor = descriptor.model_copy(update={
+                "binding": previous_program.binding,
+                "parent_policy_sha256": fixed_policy_digest(old_parent),
+                "operation_policies_sha256": {
+                    name: fixed_policy_digest(policy) for name, policy in policies.items()
+                },
+            })
+        if native_state.startswith(("pool_", "router_")):
+            previous_program = compiler._mock_wraps(
+                compiler.call_args.args[0],
+                compiler.call_args.args[1].model_copy(update=(
+                    {"router_enabled": False} if native_state.startswith("router_")
+                    else {"pool_enabled": False}
+                )),
+                **compiler.call_args.kwargs,
+            )
+            old_parent = previous_program.parent_policy
+            previous_policies = dict(previous_program.operation_policies)
+            parameters = {**parameters, "fixedOperations": {"value": [
+                {"name": name, "method": method, "path": path, "policy": previous_policies[name]}
+                for name, method, path in previous_program.operation_contracts
+            ]}}
+            descriptor = descriptor.model_copy(update={
+                "binding": previous_program.binding,
+                "parent_policy_sha256": fixed_policy_digest(old_parent),
+                "operation_policies_sha256": {
+                    name: fixed_policy_digest(policy) for name, policy in previous_policies.items()
+                },
+            })
     target = descriptor.registration.gateway_profile_id
     deployment = native_state.startswith("deployment_")
     arm_parameters = json.loads(json.dumps(parameters))
@@ -2744,17 +2865,55 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
         httpx.Response(200, headers={"ETag": '"old"'}), old_parent,
     )
     management.route_program_operations.return_value = operations
-    settings = Settings.model_construct(budget_delegation_trust={target: trust.model_copy(
-        update={"client_ids": (UUID(int=94),)},
-    )})
+    settings = Settings.model_construct(
+        budget_delegation_trust={target: trust if native_state.startswith("trace_") else
+                                trust.model_copy(update={"client_ids": (UUID(int=94),)})},
+        ledger_table_endpoint=descriptor.binding.ledger_table_endpoint,
+        ledger_table_name=descriptor.binding.ledger_table_name,
+        apim_usage_observer_key_named_value=descriptor.binding.observer_key_named_value,
+    )
+    prior_config: dict[str, Any] = {}
+    current_installation = previous
+    if native_state in {"pool_registered", "router_registered"}:
+        from turnstile_core.integrations.apim_budget_execution import bind_budget_delegation
+
+        prior_upgrade, old_parent = bootstrap.prepare_budget_delegation_upgrade(
+            previous, str(UUID(int=75)), bind_budget_delegation(
+                old_parent, settings.budget_delegation_trust[target], gateway_profile_id=target,
+            ), operations,
+        )
+        if native_state == "router_registered":
+            prior_config["fixed_route_program_upgrade_history"] = [
+                prior_upgrade.model_dump(mode="json"),
+            ]
+            prior_upgrade, old_parent = bootstrap.prepare_budget_delegation_upgrade(
+                prior_upgrade.installation, str(UUID(int=75)), bind_budget_delegation(
+                    old_parent, settings.budget_delegation_trust[target].model_copy(update={
+                        "client_ids": (UUID(int=95),),
+                    }), gateway_profile_id=target,
+                ), operations,
+            )
+        current_installation = prior_upgrade.installation
+        prior_config["fixed_route_program_upgrade"] = prior_upgrade.model_dump(mode="json")
+        repository.get_gateway_profiles.return_value[0]["config"] = dict(prior_config)
+        management._read_policy.return_value = (
+            httpx.Response(200, headers={"ETag": '"old"'}), old_parent,
+        )
     with monkeypatch.context() as capture:
         capture.setattr(bootstrap, "AzureApimPublisherClient", Mock(return_value=management))
         capture.setattr(bootstrap, "register_verified_program_upgrade", registration)
         capture.setattr(bootstrap, "apim_target_client_config_resolver", Mock())
         bootstrap.configure_budget_delegation(repository, settings, target)
+    if native_state == "trace_current":
+        registration.assert_not_called()
+        management.route_program_operations.assert_not_called()
+        management._request.assert_not_called()
+        return
+    if native_state.startswith("trace_"):
+        registration.assert_called_once()
     upgrade = registration.call_args.args[2]
     candidate = registration.call_args.kwargs["parent_policy"]
-    repository.get_gateway_profiles.return_value = [{"id": target, "config": {}}]
+    repository.get_gateway_profiles.return_value = [{"id": target, "config": dict(prior_config)}]
     version = str(UUID(int=76))
     _, manifest, dependencies = configuration_manifests(
         previous.program.scope, version, (), {}, 1100,
@@ -2785,7 +2944,7 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
     original_publication = source.model_dump(mode="python")
     repository.model_availability_proof_guard.side_effect = lambda *_, **__: nullcontext()
     proof = ProgramCapabilityProof(
-        proof_id=str(UUID(int=78)), identity=previous.program,
+        proof_id=str(UUID(int=78)), identity=current_installation.program,
         supported_profiles=previous.supported_profiles, issued_epoch=1050, expires_epoch=1170,
     )
     already_written = native_state in {
@@ -2806,17 +2965,32 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
                     if native_state == "proof_expired" else {}),
         })
     writes: list[str] = []
+    interrupt_pool = [native_state in {"pool_partial", "trace_partial"}]
+    operation_heads: dict[str, int] = {}
     deployment_events: list[str] = []
     cutover_inputs: list[Any] = []
     arm_history_reads: list[str] = []
     def request(method: str, path: str, **kwargs: Any) -> httpx.Response:
+        if native_state == "trace_etag" and method == "HEAD" and "/operations/" in path:
+            operation_heads[path] = operation_heads.get(path, 0) + 1
+            if operation_heads[path] > 1:
+                return httpx.Response(200, headers={"ETag": '"concurrent"'})
         if method == "PUT":
             assert kwargs["extra_headers"] == {"If-Match": current["etag"]}
-            current["parent"] = ET.tostring(ET.fromstring(
+            stored = ET.tostring(ET.fromstring(
                 kwargs["json_body"]["properties"]["value"],
             ), encoding="unicode")
-            current["etag"] = '"new"'
+            if "/operations/" in path:
+                name = path.split("/operations/", 1)[1].split("/", 1)[0]
+                method_name, template, _ = operations[name]
+                operations[name] = (method_name, template, stored)
+            else:
+                current["parent"] = stored
+                current["etag"] = '"new"'
             writes.append(path)
+            if interrupt_pool[0] and "/operations/" in path:
+                interrupt_pool[0] = False
+                raise ValueError("Injected Pool operation interruption")
         return httpx.Response(200, headers={"ETag": current["etag"]})
     management._request.side_effect = request
     management._read_policy.side_effect = lambda *_: (
@@ -2826,8 +3000,9 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
     management.revision_api_policy.side_effect = lambda *_: current["parent"]
     entry = native_state.startswith("entry_")
     registration_failure = [native_state in {"entry_proof_written", "entry_proof_expired"}]
-    reject = [native_state in {"interrupted", "deployment_write_failure"}
-              or entry and not registration_failure[0]]
+    reject = [native_state in {
+        "interrupted", "deployment_write_failure", "pool_written", "trace_written",
+    } or entry and not registration_failure[0]]
     def probe(request: httpx.Request) -> httpx.Response:
         if request.url.host == "management.azure.com":
             if request.method == "GET":
@@ -2861,7 +3036,7 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
         if reject[0] and is_new:
             reject[0] = False
             return httpx.Response(503)
-        program = upgrade.installation.program if is_new else previous.program
+        program = upgrade.installation.program if is_new else current_installation.program
         headers = {"abi": "2", "nonce": request.headers["x-turnstile-route-probe"],
                    "target": program.scope.target_id, "api": program.scope.api_id,
                    "revision": program.api_revision, "gateway": program.scope.gateway_id,
@@ -2890,7 +3065,11 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
             apim_probe_subscription_id=previous.publisher_subscription_id,
             apim_probe_subscription_key=SecretStr("unit-key"),
             ledger_table_endpoint=descriptor.binding.ledger_table_endpoint,
-            ledger_table_name=descriptor.binding.ledger_table_name),
+            ledger_table_name=descriptor.binding.ledger_table_name,
+            apim_usage_observer_key_named_value=descriptor.binding.observer_key_named_value,
+            control_plane_parent_policy_path=Path(__file__).resolve().parents[3]
+            / "infra/policies/foundry-finops-policy.xml",
+            budget_delegation_trust=settings.budget_delegation_trust),
     )
     recorded: list[Any] = []
     def record(value: Any, digest: str, **options: Any) -> None:
@@ -2906,20 +3085,48 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
     monkeypatch.setattr(httpx, "Client", lambda **kwargs: real_client(
         **kwargs, transport=httpx.MockTransport(probe),
     ))
-    entry_registration = Mock(side_effect=lambda *args, **kwargs: (
+    def register_from_entry(*args: Any, **kwargs: Any) -> None:
+        if native_state == "trace_candidate_operation":
+            from turnstile_core.integrations.apim_policy_components import (
+                parse_policy,
+                serialize_policy,
+            )
+
+            candidate_operations = dict(kwargs["operation_policies"])
+            operation = parse_policy(candidate_operations["chat-completions"])
+            inbound = operation.find("inbound")
+            assert inbound is not None
+            header = ET.Element("set-header", {"name": "x-user-id", "exists-action": "override"})
+            ET.SubElement(header, "value").text = "forged-person@example.test"
+            inbound.insert(0, header)
+            candidate_operations["chat-completions"] = serialize_policy(operation)
+            changed, changed_parent = bootstrap.prepare_budget_delegation_upgrade(
+                current_installation, str(source.id), kwargs["parent_policy"],
+                {name: (method, path, candidate_operations[name])
+                 for name, (method, path, _) in operations.items()},
+            )
+            args = (*args[:2], changed, *args[3:])
+            kwargs = {**kwargs, "parent_policy": changed_parent,
+                      "operation_policies": candidate_operations}
         routes.register_verified_program_upgrade(*args, **kwargs, clock=lambda: 1100)
-    ))
+    entry_registration = Mock(side_effect=register_from_entry)
     monkeypatch.setattr(bootstrap, "AzureApimPublisherClient", Mock(return_value=management))
     monkeypatch.setattr(bootstrap, "register_verified_program_upgrade", entry_registration)
     monkeypatch.setattr(bootstrap, "apim_target_client_config_resolver", lambda *_: configurations)
     def cutover() -> None:
-        if entry:
+        if entry or native_state.startswith(("pool_", "router_", "trace_")):
             bootstrap.configure_budget_delegation(repository, settings, target)
             return
         routes.register_verified_program_upgrade(
             repository, configurations, upgrade, document_digest({}), clock=lambda: 1100,
             parent_policy=candidate, expected_parent_etag=current["etag"],
         )
+    if native_state in {"trace_candidate_operation", "trace_etag"}:
+        with pytest.raises(PolicyCompilationError):
+            cutover()
+        assert not writes and not recorded
+        assert repository.effective_gateway_publication.return_value == original_publication
+        return
     if deployment:
         import getpass
 
@@ -3143,6 +3350,20 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
         assert "recorded_usage" not in str(repository.mock_calls)
         assert not arm_history_reads
         return
+    if native_state == "pool_operation_drift":
+        method, template, _ = operations["chat-completions"]
+        operations["chat-completions"] = (method, template, "<policies><inbound /></policies>")
+        with pytest.raises(ValueError):
+            cutover()
+        assert not writes and not recorded
+        return
+    if native_state in {"pool_partial", "pool_written", "trace_partial", "trace_written"}:
+        with pytest.raises(ValueError, match=(
+            "Pool operation interruption" if native_state.endswith("_partial")
+            else "authenticated probe"
+        )):
+            cutover()
+        assert not recorded
     if native_state == "foreign":
         with pytest.raises(ValueError):
             cutover()
@@ -3206,7 +3427,21 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
     cutover()
     assert len(recorded) == 1
     assert fixed_policy_digest(current["parent"]) == upgrade.installation.parent_policy_sha256
-    assert len(writes) == (0 if already_written else 2 if native_state == "entry_normalized" else 1)
+    assert len(writes) == (
+        len(operations) + 1 if native_state in {
+            "pool_upgrade", "pool_registered", "router_upgrade", "router_registered",
+            "trace_upgrade",
+        } else
+        len(operations) + 2 if native_state in {"pool_partial", "trace_partial"} else
+        2 * len(operations) + 1 if native_state in {"pool_written", "trace_written"} else
+        0 if already_written else 2 if native_state == "entry_normalized" else 1
+    )
+    if native_state.startswith("pool_"):
+        assert upgrade.installation.pool_enabled is True
+        assert previous.pool_enabled is False
+    if native_state.startswith("router_"):
+        assert upgrade.installation.router_enabled is True
+        assert previous.router_enabled is False
     if entry:
         assert entry_registration.call_count == 2
         first, second = entry_registration.call_args_list
@@ -3214,6 +3449,420 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
         assert first.kwargs["parent_policy"] == second.kwargs["parent_policy"] == candidate
         assert first.args[3] == second.args[3]
         assert second.kwargs["expected_parent_etag"] == recovery_etag
+    from turnstile_core.persistence.repository_support import _fixed_program_upgrade_config
+
+    profile = repository.get_gateway_profiles.return_value[0]
+    profile["config"] = _fixed_program_upgrade_config(
+        repository.effective_gateway_publication.return_value, profile["config"], recorded[0],
+        document_digest(profile["config"]),
+    )
+    calls, written = entry_registration.call_count, len(writes)
+    bootstrap.configure_budget_delegation(repository, settings, target)
+    assert entry_registration.call_count == calls and len(writes) == written
+    monkeypatch.setattr(bootstrap, "refresh_fixed_budget_execution_policy", Mock(
+        side_effect=AssertionError("converged refresh recompiled"),
+    ))
+    bootstrap.configure_budget_delegation(repository, settings, target)
+    with pytest.raises(AssertionError, match="converged refresh recompiled"):
+        bootstrap.configure_budget_delegation(repository, settings.model_copy(update={
+            "apim_usage_observer_key_named_value": "changed-observer-key",
+        }), target)
+    assert entry_registration.call_count == calls and len(writes) == written
+
+
+@pytest.mark.parametrize("scenario", [
+    "complete", "interrupt_operation", "interrupt_verification", "tampered_images",
+    "tampered_operation", "stale_program", "cli",
+])
+def test_capability_cutover_enables_decision_and_images_resumes_and_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str,
+) -> None:
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from typing import Any, cast
+    from uuid import UUID
+    from xml.etree import ElementTree as ET
+
+    from pydantic import SecretStr
+
+    from backend import bootstrap_storage_route as bootstrap
+    from scripts import deploy
+    from tests.backend.model_platform.control_plane_support import (
+        GatewayControlPlaneService,
+        bedrock_publication,
+    )
+    from turnstile_core.config import Settings
+    from turnstile_core.domain.control_plane import (
+        GatewayReleaseSpec,
+        PublicationKind,
+        PublicationStatus,
+    )
+    from turnstile_core.domain.image_profiles import DEFAULT_IMAGE_GENERATION_LIMITS
+    from turnstile_core.domain.storage_routes import (
+        ActiveRouteHead,
+        ConfigurationApproval,
+        ProgramCapabilityProof,
+        RouteSnapshot,
+        catalog_digest,
+        configuration_manifests,
+        document_digest,
+    )
+    from turnstile_core.integrations.apim_control_plane_contract import PolicyCompilationError
+    from turnstile_core.integrations.apim_policy_components import parse_policy, serialize_policy
+    from turnstile_core.integrations.apim_storage_routes import (
+        compile_fixed_route_program,
+        fixed_policy_digest,
+        prepare_budget_delegation_upgrade,
+        prepare_capability_upgrade,
+    )
+    from turnstile_core.integrations.storage_route_projection import RouteProjectionConflict
+    from turnstile_core.persistence.in_memory import InMemoryRepository
+    from turnstile_core.services import storage_route_publisher as routes
+
+    runtime = Mock(wraps=runtime_release_parameters)
+    monkeypatch.setattr(sys.modules[__name__], "runtime_release_parameters", runtime)
+    monkeypatch.setattr(bootstrap, "_CONVERGED_REFRESH", {})
+    with monkeypatch.context() as setup:
+        compiler = Mock(wraps=compile_fixed_route_program)
+        setup.setattr(deploy, "compile_fixed_route_program", compiler)
+        test_initial_fixed_program_binds_compiled_policies_before_registration(
+            tmp_path, setup, False, "StandardV2",
+        )
+        descriptor = bootstrap.FixedInstallationDescriptor.model_validate_json(
+            json.dumps(runtime.call_args.args[6]),
+        )
+        trust = runtime.call_args.args[8]
+        deployment_inputs = cast(Mock, deploy.deploy_resource_group_template).call_args.args[1]
+        api_properties = cast(Mock, deploy.deploy_resource_group_template).call_args.args[3]["parameters"][
+            "apiProperties"
+        ]["value"]
+        deployment_outputs = {**runtime.call_args.args[2], "apiUrl": "https://api.example.test"}
+        # The program a 1815c2a installation compiled: no Decision operation, images denied.
+        program = compiler._mock_wraps(
+            compiler.call_args.args[0], compiler.call_args.args[1].model_copy(update={
+                "supported_profiles": ("openai-v1", "anthropic-messages"),
+                "decision_enabled": False, "image_limits": None,
+            }), **compiler.call_args.kwargs,
+        )
+    descriptor = descriptor.model_copy(update={
+        "binding": program.binding, "parent_policy_sha256": fixed_policy_digest(
+            program.parent_policy,
+        ), "operation_policies_sha256": {
+            name: fixed_policy_digest(policy) for name, policy in program.operation_policies
+        },
+    })
+    previous = bootstrap.installation_record(descriptor, "b" * 64)
+    target = descriptor.registration.gateway_profile_id
+    policies = dict(program.operation_policies)
+    state: dict[str, Any] = {
+        "parent": program.parent_policy, "parent_etag": '"parent0"', "counter": 0,
+        "operations": {name: (method, path, policies[name])
+                       for name, method, path in program.operation_contracts},
+    }
+    state["etags"] = {name: '"operation0"' for name in state["operations"]}
+    binding = descriptor.binding
+    if scenario == "stale_program":
+        method, path, _ = state["operations"]["responses"]
+        state["operations"]["responses"] = (method, path, policies["chat-completions"])
+        with pytest.raises(PolicyCompilationError, match="not current"):
+            prepare_capability_upgrade(
+                previous, str(UUID(int=75)), state["parent"], state["operations"],
+                binding.ledger_table_endpoint, binding.ledger_table_name,
+                binding.observer_key_named_value, enable_decision=True, enable_images=True,
+            )
+        return
+    upgrade, candidate, operation_policies = prepare_capability_upgrade(
+        previous, str(UUID(int=75)), state["parent"], dict(state["operations"]),
+        binding.ledger_table_endpoint, binding.ledger_table_name,
+        binding.observer_key_named_value, enable_decision=True, enable_images=True,
+    )
+    installed = upgrade.installation
+    assert installed.supported_profiles == (
+        "openai-v1", "anthropic-messages", "openai-images", "microsoft-decision",
+    )
+    assert installed.decision_enabled and installed.image_limits == DEFAULT_IMAGE_GENERATION_LIMITS
+    assert {name for name, digest in installed.operation_policies_sha256.items()
+            if previous.operation_policies_sha256.get(name) != digest} == {
+        "images-generations", "microsoft-decision",
+    }
+    if scenario.startswith("tampered_"):
+        changed = dict(operation_policies)
+        if scenario == "tampered_images":
+            changed["images-generations"] = policies["images-generations"]
+        else:
+            chat = parse_policy(changed["chat-completions"])
+            inbound = chat.find("inbound")
+            assert inbound is not None
+            header = ET.Element("set-header", {"name": "x-user-id", "exists-action": "override"})
+            ET.SubElement(header, "value").text = "forged@example.test"
+            inbound.insert(0, header)
+            changed["chat-completions"] = serialize_policy(chat)
+        upgrade, candidate = prepare_budget_delegation_upgrade(
+            previous, str(UUID(int=75)), candidate,
+            {name: (*installed.operation_contracts[name], changed[name]) for name in changed},
+            enable_decision=True, image_limits=DEFAULT_IMAGE_GENERATION_LIMITS,
+        )
+        operation_policies = changed
+    version = str(UUID(int=76))
+    _, manifest, dependencies = configuration_manifests(
+        previous.program.scope, version, (), {}, 1100,
+    )
+    approval = ConfigurationApproval(
+        approval_id=str(UUID(int=77)), scope=previous.program.scope, route_version=version,
+        generation=1, manifest_sha256=manifest, dependency_manifest_sha256=dependencies,
+        catalog_sha256=catalog_digest(()), entry_count=0,
+        required_program_sha256=previous.program.program_sha256, required_profiles=(),
+        budget_epoch=str(descriptor.epoch), issued_epoch=1100, activate_before_epoch=1700,
+    )
+    head = ActiveRouteHead(approval=approval, activated_epoch=1100)
+    source = GatewayControlPlaneService(InMemoryRepository()).publish(bedrock_publication(), "unit")
+    source = source.model_copy(update={
+        "id": UUID(int=75), "gateway_profile_id": target, "status": PublicationStatus.ACTIVE,
+        "publication_kind": PublicationKind.ROUTE_RECONCILE, "generation": 1,
+        "base_release_id": None, "apim_revision": previous.program.api_revision,
+        "policy_sha256": previous.program.program_sha256,
+        "desired_spec": GatewayReleaseSpec(
+            gateway_profile_id=target, bindings=[], discovery_models=[],
+        ),
+        "resource_manifest": {
+            "fixed_route_program": previous.model_dump(mode="json"),
+            "fixed_route_snapshot": RouteSnapshot.prepare(approval, (), {}, 1100).model_dump(
+                mode="json",
+            ),
+            "fixed_route_head": head.model_dump(mode="json"),
+        },
+    })
+    repository = Mock()
+    repository.effective_gateway_publication.return_value = source.model_dump(mode="python")
+    repository.get_gateway_profiles.return_value = [{"id": target, "config": {}}]
+    repository.model_availability_proof_guard.side_effect = lambda *_, **__: nullcontext()
+    recorded: list[Any] = []
+
+    def record(value: Any, digest: str, **options: Any) -> None:
+        options["before_record"]()
+        recorded.append(value)
+        repository.get_gateway_profiles.return_value = [{
+            "id": target, "config": {"fixed_route_program_upgrade": value},
+        }]
+
+    repository.record_fixed_program_upgrade.side_effect = record
+    writes: list[str] = []
+
+    def write(kind: str) -> None:
+        writes.append(kind)
+        if scenario == "interrupt_operation" and len(writes) == 2:
+            raise ValueError("Injected capability interruption")
+
+    def operation_name(path: str) -> str:
+        return path.split("/operations/", 1)[1].split("/", 1)[0]
+
+    def request(method: str, path: str, **kwargs: Any) -> httpx.Response:
+        if "/operations/" not in path:
+            if method == "PUT":
+                assert kwargs["extra_headers"] == {"If-Match": state["parent_etag"]}
+                write("parent")
+                state["parent"] = ET.tostring(ET.fromstring(
+                    kwargs["json_body"]["properties"]["value"],
+                ), encoding="unicode")
+                state["counter"] += 1
+                state["parent_etag"] = f'"parent{state["counter"]}"'
+            return httpx.Response(200, headers={"ETag": state["parent_etag"]})
+        name = operation_name(path)
+        if name not in state["operations"]:
+            return httpx.Response(404)
+        if method == "PUT":
+            assert kwargs["extra_headers"] == {"If-Match": state["etags"][name]}
+            write("operation:" + name)
+            method_name, template, _ = state["operations"][name]
+            state["operations"][name] = (method_name, template, ET.tostring(ET.fromstring(
+                kwargs["json_body"]["properties"]["value"],
+            ), encoding="unicode"))
+            state["counter"] += 1
+            state["etags"][name] = f'"operation{state["counter"]}"'
+        return httpx.Response(200, headers={"ETag": state["etags"][name]})
+
+    def create_operation(revision: str, operation: Any, *, create_only: bool) -> None:
+        assert create_only and operation.id not in state["operations"]
+        write("create:" + operation.id)
+        state["operations"][operation.id] = (operation.method, operation.path, "")
+
+    def put_operation_policy(revision: str, name: str, policy: str, *, create_only: bool) -> None:
+        assert create_only and not state["operations"][name][2]
+        method_name, template, _ = state["operations"][name]
+        state["operations"][name] = (method_name, template, policy)
+        state["counter"] += 1
+        state["etags"][name] = f'"operation{state["counter"]}"'
+
+    management = Mock()
+    management._request.side_effect = request
+    management._read_policy.side_effect = lambda *_: (
+        httpx.Response(200, headers={"ETag": state["parent_etag"]}), state["parent"],
+    )
+    management._policy_response_value.side_effect = lambda _: state["parent"]
+    management.route_program_operations.side_effect = lambda *_: dict(state["operations"])
+    management.current_revision.return_value = previous.program.api_revision
+    management.revision_api_policy.side_effect = lambda *_: state["parent"]
+    management.ensure_operation.side_effect = create_operation
+    management.put_operation_policy.side_effect = put_operation_policy
+    proof = {"current": ProgramCapabilityProof(
+        proof_id=str(UUID(int=78)), identity=previous.program,
+        supported_profiles=previous.supported_profiles, issued_epoch=1050, expires_epoch=1170,
+    )}
+
+    def read_proof(identity: Any) -> Any:
+        if proof["current"].identity != identity:
+            raise RouteProjectionConflict("ROUTE_PROGRAM_PROOF_IDENTITY_CHANGED")
+        return proof["current"], 'W/"proof"'
+
+    projection = Mock()
+    projection.read_program_proof.side_effect = read_proof
+    projection.read_active.return_value = (head, 'W/"head"')
+    projection.publish_upgraded_program_proof.side_effect = lambda *args: proof.update(
+        current=args[2],
+    )
+    projection.publish_program_proof.side_effect = lambda *args: proof.update(current=args[0])
+
+    def probe(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "management.azure.com":
+            assert request.method == "HEAD"
+            if "/operations/" not in request.url.path:
+                return httpx.Response(200, headers={"ETag": state["parent_etag"]})
+            name = operation_name(request.url.path)
+            return httpx.Response(404) if name not in state["operations"] else httpx.Response(
+                200, headers={"ETag": state["etags"][name]},
+            )
+        upgraded = fixed_policy_digest(state["parent"]) == installed.parent_policy_sha256
+        if scenario == "interrupt_verification" and upgraded and not state.get("rejected"):
+            state["rejected"] = True
+            return httpx.Response(503)
+        identity = installed.program if upgraded else previous.program
+        headers = {"abi": "2", "nonce": request.headers["x-turnstile-route-probe"],
+                   "target": identity.scope.target_id, "api": identity.scope.api_id,
+                   "revision": identity.api_revision, "gateway": identity.scope.gateway_id,
+                   "instance": identity.instance_id, "program": identity.program_sha256,
+                   "trust": identity.trust_binding_sha256}
+        if request.url.path.endswith("/configuration"):
+            headers.update(version=version, generation="1", epoch=str(descriptor.epoch))
+        return httpx.Response(204, headers={"x-turnstile-route-" + key: value
+                                          for key, value in headers.items()})
+
+    settings = Settings.model_construct(
+        budget_delegation_trust={target: trust},
+        ledger_table_endpoint=binding.ledger_table_endpoint,
+        ledger_table_name=binding.ledger_table_name,
+        apim_usage_observer_key_named_value=binding.observer_key_named_value,
+    )
+    configurations = Mock()
+    configurations.resolve.return_value = SimpleNamespace(
+        gateway_profile_id=target, route_target_identity_sha256=previous.target_identity_sha256,
+        settings=SimpleNamespace(
+            apim_api_id=previous.program.scope.api_id, apim_gateway_url=previous.gateway_endpoint,
+            apim_probe_subscription_id=previous.publisher_subscription_id,
+            apim_probe_subscription_key=SecretStr("unit-key"),
+            ledger_table_endpoint=binding.ledger_table_endpoint,
+            ledger_table_name=binding.ledger_table_name,
+            apim_usage_observer_key_named_value=binding.observer_key_named_value,
+        ),
+    )
+    real_client = httpx.Client
+    monkeypatch.setattr(routes, "AzureApimPublisherClient", Mock(return_value=management))
+    monkeypatch.setattr(routes, "TableRouteProjection", Mock(return_value=projection))
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: real_client(
+        **kwargs, transport=httpx.MockTransport(probe),
+    ))
+
+    def cutover() -> None:
+        routes.register_verified_program_upgrade(
+            repository, configurations, upgrade,
+            document_digest(repository.get_gateway_profiles.return_value[0]["config"]),
+            clock=lambda: 1100, parent_policy=candidate,
+            expected_parent_etag=state["parent_etag"], operation_policies=operation_policies,
+            expected_operation_etags={
+                name: state["etags"][name] if name in state["operations"] else None
+                for name in operation_policies
+            },
+        )
+
+    if scenario.startswith("tampered_"):
+        with pytest.raises(PolicyCompilationError, match="protected operation behavior"):
+            cutover()
+        assert not writes and not recorded
+        return
+    if scenario == "cli":
+        import getpass
+
+        from fastapi import Response
+
+        from backend.http.model_platform import preview_gateway_program_upgrade
+        from scripts.apim_upgrade import AzureUpgradeBackend, GatewaySnapshot
+
+        submissions: list[Any] = []
+
+        def submit(_runner: Any, _inputs: Any, _outputs: Any, recovery: Any) -> None:
+            write_request, config_sha256 = recovery
+            submissions.append(write_request)
+            routes.register_verified_program_upgrade(
+                repository, configurations, write_request.upgrade, config_sha256,
+                clock=lambda: 1100, parent_policy=write_request.parent_policy,
+                expected_parent_etag=write_request.expected_parent_etag,
+                operation_policies=write_request.operation_policies or None,
+                expected_operation_etags=write_request.expected_operation_etags or None,
+            )
+
+        monkeypatch.setattr(deploy, "current_app_settings", lambda *_: {
+            "TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR": descriptor.model_dump_json(),
+        })
+        monkeypatch.setattr(getpass, "getpass", lambda *_: "offline-owner-password")
+        monkeypatch.setattr(deploy, "verify_initial_fixed_program", lambda *_: (
+            preview_gateway_program_upgrade(target, repository, "unit-owner", Response())
+        ))
+        monkeypatch.setattr(deploy, "deployment_budget_delegation", lambda *_: trust)
+        monkeypatch.setattr(deploy, "recover_fixed_program", submit)
+        monkeypatch.setattr(AzureUpgradeBackend, "read", lambda *_: GatewaySnapshot(
+            previous.program.api_revision, api_properties, state["parent"],
+            {name: {"method": method, "urlTemplate": path}
+             for name, (method, path, _) in state["operations"].items()},
+            {name: policy for name, (_, _, policy) in state["operations"].items()},
+        ))
+        runner = Mock(spec=CommandRunner)
+        runner.run_json.return_value = {"accessToken": "offline-token"}
+        deploy.enable_program_capabilities(
+            runner, deployment_inputs, deployment_outputs, assume_yes=True,
+        )
+        assert [item.upgrade for item in submissions] == [upgrade]
+        assert submissions[0].expected_operation_etags["microsoft-decision"] is None
+        plan = json.loads((deployment_inputs.state_path.with_suffix(".upgrades")
+                           / "capabilities-v1" / "plan.json").read_text())
+        assert plan["upgrade"] == recorded[0]
+        written = len(writes)
+        deploy.enable_program_capabilities(
+            runner, deployment_inputs, deployment_outputs, assume_yes=True,
+        )
+        assert len(submissions) == len(recorded) == 1 and len(writes) == written
+    if scenario.startswith("interrupt_"):
+        with pytest.raises(ValueError, match="capability interruption|authenticated probe"):
+            cutover()
+        assert not recorded and writes[0] == "parent"
+        assert fixed_policy_digest(state["parent"]) == installed.parent_policy_sha256
+        assert ("microsoft-decision" in state["operations"]) == (
+            scenario == "interrupt_verification"
+        )
+    if scenario != "cli":
+        cutover()
+    assert len(recorded) == 1 and recorded[0] == upgrade.model_dump(mode="json")
+    assert fixed_policy_digest(state["parent"]) == installed.parent_policy_sha256
+    assert {name: fixed_policy_digest(policy) for name, (_, _, policy)
+            in state["operations"].items()} == installed.operation_policies_sha256
+    assert state["operations"]["microsoft-decision"][:2] == (
+        "POST", "/providers/microsoft/v1/systemone",
+    )
+    written = len(writes)
+    registration = Mock()
+    monkeypatch.setattr(bootstrap, "AzureApimPublisherClient", Mock(return_value=management))
+    monkeypatch.setattr(bootstrap, "register_verified_program_upgrade", registration)
+    bootstrap.configure_budget_delegation(repository, settings, target)
+    registration.assert_not_called()
+    assert len(writes) == written
 
 
 @pytest.mark.parametrize("phase", ["complete", "failed", "running", "changed_target"])
@@ -3227,7 +3876,7 @@ def test_partial_fixed_installation_reuses_bound_checkpoint_without_policy_write
     monkeypatch.setattr(sys.modules[__name__], "runtime_release_parameters", runtime)
     with monkeypatch.context() as initialization:
         test_initial_fixed_program_binds_compiled_policies_before_registration(
-            tmp_path, initialization, False,
+            tmp_path, initialization, False, "StandardV2",
         )
         from typing import cast
 
@@ -3248,6 +3897,15 @@ def test_partial_fixed_installation_reuses_bound_checkpoint_without_policy_write
         current = initial_snapshot
     if phase == "changed_target":
         saved["pendingFixedProgramParameters"]["parameters"]["apimName"]["value"] = "other-apim"
+    if phase == "failed":
+        from xml.etree import ElementTree as ET
+
+        retained = saved["pendingFixedProgramParameters"]["parameters"]
+        retained["parentPolicy"]["value"] = ET.tostring(
+            ET.fromstring(values["parentPolicy"]), encoding="unicode",
+        )
+        for item in retained["fixedOperations"]["value"]:
+            item["policy"] = ET.tostring(ET.fromstring(item["policy"]), encoding="unicode")
     original_saved = json.dumps(saved, sort_keys=True)
     monkeypatch.setattr(AzureUpgradeBackend, "read", Mock(return_value=current))
     writes = Mock()
@@ -3289,6 +3947,7 @@ def test_partial_fixed_installation_reuses_bound_checkpoint_without_policy_write
         for call in writes.call_args_list:
             assert call.kwargs == {"resource_group_name": saved["apimResourceGroupName"]}
             assert "apimResourceGroupName" not in call.args[3]["parameters"]
+        assert writes.call_args.args[3]["parameters"] == parameters
 
 
 @pytest.mark.parametrize("wrong_binding", [False, True])
@@ -3640,6 +4299,142 @@ def test_resume_previews_only_available_runtime_and_preserves_release_settings(
                 f"role-assignment-{name}" for name in role_helpers
             ),
         }
+
+
+@pytest.mark.parametrize("failure", ["once", "always"])
+def test_initial_fixed_program_preview_retries_read_timeouts_within_shared_deadline(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    elapsed = [0.0]
+    calls = {"login": 0, "preview": 0, "logout": 0}
+    client_factory = httpx.Client
+
+    def advance(seconds: float) -> None:
+        elapsed[0] += seconds
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth/login"):
+            calls["login"] += 1
+            return httpx.Response(200, json={})
+        if request.url.path.endswith("/auth/logout"):
+            calls["logout"] += 1
+            return httpx.Response(204)
+        calls["preview"] += 1
+        if failure == "always" or calls["preview"] == 1:
+            timeout = request.extensions["timeout"]["read"]
+            assert 0 < timeout <= 15
+            advance(timeout)
+            raise httpx.ReadTimeout("Offline slow preview", request=request)
+        return httpx.Response(200, json={"current_installation": {
+            "program": {"program_sha256": "a" * 64, "scope": {"target_id": "unit-target"}},
+            "model_additions_enabled": True,
+        }})
+
+    monkeypatch.setattr("scripts.deploy.time.monotonic", lambda: elapsed[0])
+    monkeypatch.setattr("scripts.deploy.time.sleep", advance)
+    monkeypatch.setattr("scripts.deploy.httpx.Client", lambda **kwargs: client_factory(
+        **kwargs, transport=httpx.MockTransport(respond),
+    ))
+    descriptor = {
+        "registration": {"gateway_profile_id": "unit-target"},
+        "binding": {"program_sha256": "a" * 64},
+    }
+    arguments = ("https://offline.example.test", "owner@example.test", "offline", descriptor)
+    if failure == "always":
+        with pytest.raises(DeploymentError, match="not ready for model publication"):
+            verify_initial_fixed_program(*arguments)
+        assert elapsed[0] == 180
+        assert calls == {"login": 1, "preview": 10, "logout": 1}
+    else:
+        verify_initial_fixed_program(*arguments)
+        assert calls == {"login": 1, "preview": 2, "logout": 1}
+        assert elapsed[0] < 180
+
+
+@pytest.mark.parametrize("fault", [None, "second_upgrade", "foreign_origin", "forged_base"])
+def test_upgrade_recorded_by_a_later_publication_keeps_its_deployed_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str | None,
+) -> None:
+    from typing import Any
+    from uuid import UUID
+
+    from fastapi import Response
+
+    from backend import bootstrap_storage_route as bootstrap
+    from backend.http.model_platform import preview_gateway_program_upgrade
+    from scripts import deploy
+    from turnstile_core.domain.storage_routes import (
+        FixedProgramInstallation,
+        FixedProgramUpgrade,
+        document_digest,
+    )
+
+    runtime = Mock(wraps=runtime_release_parameters)
+    monkeypatch.setattr(sys.modules[__name__], "runtime_release_parameters", runtime)
+    with monkeypatch.context() as initialization:
+        test_initial_fixed_program_binds_compiled_policies_before_registration(
+            tmp_path, initialization, False, "StandardV2",
+        )
+    descriptor = bootstrap.FixedInstallationDescriptor.model_validate_json(
+        json.dumps(runtime.call_args.args[6]),
+    )
+    original = bootstrap.installation_record(descriptor, "a" * 64)
+
+    def upgrade(previous: FixedProgramInstallation, value: str) -> FixedProgramInstallation:
+        legacy = previous.legacy_program_sha256 or previous.program.program_sha256
+        return previous.model_copy(update={
+            "program": previous.program.model_copy(update={"program_sha256": value * 64}),
+            "parent_policy_sha256": value * 64, "model_additions_enabled": True,
+            "legacy_program_sha256": legacy,
+            "predecessor_program_sha256": tuple(item for item in (
+                *previous.predecessor_program_sha256, previous.program.program_sha256,
+            ) if item != legacy),
+        })
+
+    installation_id, configuration_id = str(UUID(int=93)), str(UUID(int=94))
+    upgraded = upgrade(original, "1")
+    first = FixedProgramUpgrade(
+        previous_publication_id=installation_id,
+        previous_installation_sha256=document_digest(
+            upgrade(original, "3") if fault == "foreign_origin" else original,
+        ),
+        installation=upgraded,
+    )
+    config: dict[str, Any] = {"fixed_route_program_upgrade": first.model_dump(mode="json")}
+    current = upgraded
+    if fault == "second_upgrade":
+        current = upgrade(upgraded, "2")
+        config = {
+            "fixed_route_program_upgrade_history": [first.model_dump(mode="json")],
+            "fixed_route_program_upgrade": FixedProgramUpgrade(
+                previous_publication_id=configuration_id,
+                previous_installation_sha256=document_digest(upgraded), installation=current,
+            ).model_dump(mode="json"),
+        }
+    target_id = descriptor.registration.gateway_profile_id
+    repository = Mock()
+    repository.effective_gateway_publication.return_value = {
+        "id": configuration_id,
+        "resource_manifest": {"fixed_route_program": upgraded.model_dump(mode="json")},
+    }
+    repository.get_gateway_profiles.return_value = [{"id": target_id, "config": config}]
+    preview = preview_gateway_program_upgrade(target_id, repository, "unit-owner", Response())
+    if fault == "forged_base":
+        preview["initial_installation"] = upgrade(original, "3").model_dump(mode="json")
+    client_factory = httpx.Client
+    monkeypatch.setattr("scripts.deploy.httpx.Client", lambda **kwargs: client_factory(
+        **kwargs, transport=httpx.MockTransport(lambda request: httpx.Response(
+            200, json=preview if request.method == "GET" else {},
+        )),
+    ))
+    arguments = ("https://offline.example.test", "owner@example.test", "offline",
+                 descriptor.model_dump(mode="json"))
+    if fault in {"foreign_origin", "forged_base"}:
+        with pytest.raises(DeploymentError, match="approval chain is invalid"):
+            deploy.verify_initial_fixed_program(*arguments)
+    else:
+        assert deploy.verify_initial_fixed_program(*arguments) == preview
+        assert deploy._approved_fixed_installation(descriptor, preview) == current
 
 
 def test_temporary_parameter_file_is_private_and_deleted(tmp_path: Path) -> None:
@@ -4357,9 +5152,10 @@ def test_pip_fallback_uses_pinned_target_platform(tmp_path: Path) -> None:
     staged.mkdir()
     (staged / "requirements.txt").write_text("fastapi==0.139.2\n", encoding="utf-8")
 
-    command = pip_linux_dependency_command(staged, "/usr/bin/pip3")
+    command = pip_linux_dependency_command(staged, sys.executable)
 
-    assert command[:2] == ["/usr/bin/pip3", "install"]
+    assert command[:5] == [sys.executable, "-I", "-m", "pip", "install"]
+    assert "--no-compile" in command
     assert "manylinux_2_28_x86_64" in command
     assert "manylinux_2_17_x86_64" in command
     assert "manylinux2014_x86_64" in command
@@ -4367,6 +5163,89 @@ def test_pip_fallback_uses_pinned_target_platform(tmp_path: Path) -> None:
     assert "--only-binary=:all:" in command
     assert "--requirement" in command
     assert command[command.index("--constraint") + 1] == str(staged / "constraints.txt")
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_pip_fallback_installs_cross_target_wheel_without_host_bytecode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fallback: bool,
+) -> None:
+    environment = {
+        key: value for key, value in os.environ.items()
+        if key not in {"PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "CONDA_PREFIX"}
+    }
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PIP_NO_INDEX"] = "1"
+    virtualenv = tmp_path / "clean-venv"
+    subprocess.run(
+        ["uv", "venv", "--offline", "--python", sys.executable,
+         str(virtualenv)],
+        env=environment, capture_output=True, text=True, check=True, timeout=30,
+    )
+    python = str(virtualenv / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
+    probe = [python, "-I", "-c", "import importlib.util; print(importlib.util.find_spec('pip'))"]
+    before = subprocess.run(probe, env=environment, capture_output=True, text=True, check=True)
+    assert before.stdout.strip() == "None"
+
+    lock_bytes = (REPOSITORY_ROOT / "uv.lock").read_bytes()
+    lock = tomllib.loads(lock_bytes.decode())
+    package = next(item for item in lock["package"] if item["name"] == "pycparser")
+    version = package["version"]
+    wheel = tmp_path / f"pycparser-{version}-py3-none-any.whl"
+    source = "def select(value):\n    match value:\n        case 1:\n            return True\n"
+    metadata = f"pycparser-{version}.dist-info"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("pycparser/__init__.py", source)
+        archive.writestr(
+            f"{metadata}/METADATA",
+            f"Metadata-Version: 2.1\nName: pycparser\nVersion: {version}\n"
+            "Requires-Python: >=3.11\n",
+        )
+        archive.writestr(
+            f"{metadata}/WHEEL",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+        archive.writestr(f"{metadata}/RECORD", "")
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    for name in ("requirements.txt", "constraints.txt"):
+        (staged / name).write_text(f"pycparser=={version}\n", encoding="utf-8")
+    commands: list[list[str]] = []
+    runner = CommandRunner()
+
+    def run(command: Sequence[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = list(command)
+        commands.append(command)
+        if command[:2] == ["uv", "export"]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if command[:3] == ["uv", "pip", "install"] and fallback:
+            raise subprocess.CalledProcessError(1, command)
+        if command[:3] == ["uv", "pip", "install"] or "pip" in command:
+            command.extend(["--no-index", "--find-links", str(tmp_path), "--no-deps"])
+        return subprocess.run(
+            command, env=environment, capture_output=True, text=True, check=True, timeout=30,
+        )
+
+    monkeypatch.setattr(runner, "run", run)
+    monkeypatch.setattr("scripts.deploy.sys.executable", python)
+    _install_linux_dependencies(runner, staged)
+    installed = staged / ".python_packages/lib/site-packages"
+    assert (installed / "pycparser/__init__.py").read_text() == source
+    assert not list(installed.rglob("*.pyc"))
+    assert not list(installed.rglob("__pycache__"))
+    assert not (installed / "pip").exists()
+    manifest = json.loads((staged / "dependency-manifest.json").read_text())
+    assert manifest["packages"] == {"pycparser": version}
+    assert manifest["lock_sha256"] == hashlib.sha256(lock_bytes).hexdigest()
+    assert any("ensurepip" in command for command in commands) is fallback
+    if fallback:
+        origin = subprocess.run(
+            [python, "-I", "-c", "import pip; print(pip.__file__)"],
+            env=environment, capture_output=True, text=True, check=True,
+        )
+        assert Path(origin.stdout.strip()).is_relative_to(virtualenv)
+    else:
+        after = subprocess.run(probe, env=environment, capture_output=True, text=True, check=True)
+        assert after.stdout.strip() == "None"
 
 
 @pytest.mark.parametrize("fallback", [False, True])
@@ -4392,10 +5271,14 @@ def test_linux_install_locks_primary_and_fallback_dependencies(
     monkeypatch.setattr(runner, "run", run)
     monkeypatch.setattr("scripts.deploy.shutil.which", lambda _: "/usr/bin/pip3")
     _install_linux_dependencies(runner, staged)
+    if fallback:
+        assert commands[-2] == [sys.executable, "-I", "-m", "ensurepip", "--upgrade"]
+        assert commands[-1][:5] == [sys.executable, "-I", "-m", "pip", "install"]
+        assert "--no-compile" in commands[-1]
     assert commands[0][:3] == ["uv", "export", "--locked"]
     assert "--no-dev" in commands[0] and "--no-emit-project" in commands[0]
     assert commands[0][-1] == str(staged / "constraints.txt")
-    for command in commands[1:]:
+    for command in (item for item in commands[1:] if "install" in item):
         assert command[command.index("--constraint") + 1] == str(staged / "constraints.txt")
     manifest = json.loads((staged / "dependency-manifest.json").read_text())
     assert manifest["packages"] == {"fastapi": "0.139.2"}
@@ -4414,7 +5297,7 @@ def test_packaged_dependencies_reject_versions_outside_the_lock(
 
 
 def test_linux_fallback_accepts_locked_pillow_and_older_binary_wheels(tmp_path: Path) -> None:
-    command = pip_linux_dependency_command(tmp_path / "staged", "/usr/bin/pip3")
+    command = pip_linux_dependency_command(tmp_path / "staged", sys.executable)
     platforms = [command[index + 1] for index, value in enumerate(command) if value == "--platform"]
     compatible = set(cpython_tags(python_version=(3, 11), abis=["cp311"], platforms=platforms))
     lock = tomllib.loads((REPOSITORY_ROOT / "uv.lock").read_text(encoding="utf-8"))
@@ -4452,6 +5335,8 @@ def test_runtime_release_recycles_updated_apps_without_stale_api_health(
         commands.append(command)
 
     monkeypatch.setattr(runner, "run", run)
+    instances = iter(["replaced-instance", "restarted-instance"])
+    monkeypatch.setattr("scripts.deploy._api_instance", lambda *_: next(instances))
 
     restart_runtime_apps(
         runner,
@@ -4459,6 +5344,7 @@ def test_runtime_release_recycles_updated_apps_without_stale_api_health(
         {
             "resourceGroupName": "turnstile-test",
             "apiName": "api-turnstile-test",
+            "apiUrl": "https://api-turnstile-test.example.test",
             "controlPlaneFunctionName": "func-turnstile-control-test",
         },
     )
@@ -4472,6 +5358,95 @@ def test_runtime_release_recycles_updated_apps_without_stale_api_health(
         "api-turnstile-test",
         "api-turnstile-test",
         "func-turnstile-control-test",
+    ]
+
+
+@pytest.mark.parametrize("scenario", [
+    "recovers", "restart_never_completes", "program_unready", "api_lost_after_restart",
+])
+def test_fixed_program_readiness_starts_after_the_restarted_api_serves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str,
+) -> None:
+    inputs = DeploymentInputs.load(
+        "subscription", _parameters(tmp_path / "parameters.json"), tmp_path / "state.json",
+    )
+    runner = CommandRunner()
+    commands: list[Sequence[str]] = []
+    elapsed = [0.0]
+    started = [-1.0]
+
+    def advance(seconds: float) -> None:
+        elapsed[0] += seconds
+
+    def serving() -> bool:
+        # The replaced instance answers for 20 seconds after start; its successor needs 200.
+        since = elapsed[0] - started[0]
+        if started[0] < 0 or since < 20:
+            return True
+        return scenario != "restart_never_completes" and since >= 200
+
+    def instance(_url: str, timeout: float) -> str:
+        if not serving():
+            advance(timeout)
+            raise TimeoutError("read timed out")
+        return "replaced-instance" if started[0] < 0 or elapsed[0] - started[0] < 20 else "new"
+
+    def run(command: Sequence[str], **_kwargs: object) -> None:
+        commands.append(command)
+        if command[:3] == ["az", "webapp", "start"]:
+            started[0] = elapsed[0]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if not serving() or scenario == "api_lost_after_restart" and request.method == "GET":
+            advance(request.extensions["timeout"]["read"])
+            raise httpx.ReadTimeout("Offline unreachable API", request=request)
+        if request.method == "POST":
+            return httpx.Response(200, json={})
+        if scenario == "program_unready":
+            advance(1)
+            return httpx.Response(409, json={"detail": "A current fixed program is required"})
+        return httpx.Response(200, json={"current_installation": {
+            "program": {"program_sha256": "a" * 64, "scope": {"target_id": "unit-target"}},
+            "model_additions_enabled": True,
+        }})
+
+    client_factory = httpx.Client
+    monkeypatch.setattr(runner, "run", run)
+    monkeypatch.setattr("scripts.deploy._api_instance", instance, raising=False)
+    monkeypatch.setattr("scripts.deploy.time.monotonic", lambda: elapsed[0])
+    monkeypatch.setattr("scripts.deploy.time.sleep", advance)
+    monkeypatch.setattr("scripts.deploy.httpx.Client", lambda **kwargs: client_factory(
+        **kwargs, transport=httpx.MockTransport(respond),
+    ))
+    outputs = {
+        "resourceGroupName": "turnstile-test", "apiName": "api-turnstile-test",
+        "apiUrl": "https://api-turnstile-test.example.test",
+        "controlPlaneFunctionName": "func-turnstile-control-test",
+    }
+    descriptor = {
+        "registration": {"gateway_profile_id": "unit-target"},
+        "binding": {"program_sha256": "a" * 64},
+    }
+    if scenario == "restart_never_completes":
+        with pytest.raises(DeploymentError, match="API restart did not complete within 1800s"):
+            restart_runtime_apps(runner, inputs, outputs)
+        assert elapsed[0] >= 1800
+        return
+    restart_runtime_apps(runner, inputs, outputs)
+    assert elapsed[0] - started[0] >= 200
+    arguments = (outputs["apiUrl"], "owner@example.test", "offline", descriptor)
+    if scenario == "recovers":
+        verify_initial_fixed_program(*arguments)
+    else:
+        with pytest.raises(DeploymentError) as failure:
+            verify_initial_fixed_program(*arguments)
+        message = str(failure.value)
+        assert message.startswith("Initial fixed program is not ready for model publication")
+        assert ("the API was unreachable (ReadTimeout)" in message) is (
+            scenario == "api_lost_after_restart"
+        )
+    assert [command[:3] for command in commands] == [
+        ["az", "webapp", "stop"], ["az", "webapp", "start"], ["az", "functionapp", "restart"],
     ]
 
 
@@ -4818,3 +5793,99 @@ def test_what_if_reads_root_level_changes_and_rejects_delete(tmp_path: Path) -> 
             {"parameters": {}},
             "test-deployment",
         )
+
+
+def test_failed_az_command_prints_its_redacted_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.deploy as deploy
+
+    failure = subprocess.CalledProcessError(
+        1, ["az", "deployment", "sub", "create"], output="",
+        stderr=(
+            "ERROR: InvalidTemplateDeployment: quota exceeded in eastus2\n"
+            "https://unit.blob.core.windows.net/c/x?sv=2024&sig=SECRETSIG&se=1 "
+            "AccountKey=SECRETKEY; Authorization: Bearer SECRETTOKEN\n"
+        ),
+    )
+
+    def fail(*_args: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(deploy, "execute", fail)
+    assert deploy.main([
+        "plan", "--subscription", "00000000-0000-0000-0000-000000000000",
+        "--parameters", "unit.json",
+    ]) == 1
+    printed = capsys.readouterr().err
+    assert "quota exceeded in eastus2" in printed
+    assert "SECRETSIG" not in printed and "SECRETKEY" not in printed
+    assert "SECRETTOKEN" not in printed
+
+
+@pytest.mark.parametrize("raw,secret,redacted", [
+    ("client_secret=abc123", "abc123", "client_secret=[redacted]"),
+    ("access_token=xyz", "xyz", "access_token=[redacted]"),
+    ("https://f.azurewebsites.net/api/x?code=FUNCKEY", "FUNCKEY",
+     "https://f.azurewebsites.net/api/x?code=[redacted]"),
+    ('"password": "P@ss"', "P@ss", '"password": "[redacted]"'),
+    ("?sv=2024&sig=SECRETSIG&se=1", "SECRETSIG", "?sv=2024&sig=[redacted]&se=1"),
+    ("AccountKey=SECRETKEY;", "SECRETKEY", "AccountKey=[redacted];"),
+    ("password=hunter2", "hunter2", "password=[redacted]"),
+    ("Authorization: Bearer SECRETTOKEN", "SECRETTOKEN", "Authorization: Bearer [redacted]"),
+])
+def test_az_stderr_redaction_covers_common_secret_shapes(
+    raw: str, secret: str, redacted: str,
+) -> None:
+    from scripts.deploy import _redacted
+
+    printed = _redacted(f"ERROR: {raw} (statusCode=400)")
+    assert secret not in printed
+    assert f"ERROR: {redacted} (statusCode=400)" == printed
+
+
+@pytest.mark.parametrize("raw,secret,redacted", [
+    ("clientSecret=abc123", "abc123", "clientSecret=[redacted]"),
+    ('"primaryKey": "PRIMARY"', "PRIMARY", '"primaryKey": "[redacted]"'),
+])
+def test_az_stderr_redaction_covers_camel_case_secret_names(
+    raw: str, secret: str, redacted: str,
+) -> None:
+    from scripts.deploy import _redacted
+
+    diagnostics = 'statusCode=400 code=InvalidTemplate "code": "InvalidTemplate" PartitionKey=p1'
+    printed = _redacted(f"ERROR: {raw} {diagnostics}")
+    assert secret not in printed
+    assert printed == f"ERROR: {redacted} {diagnostics}"
+
+
+@pytest.mark.parametrize("raw,secret,redacted", [
+    ("x-functions-key: abc123", "abc123", "x-functions-key: [redacted]"),
+    ("Ocp-Apim-Subscription-Key: PRIMARY", "PRIMARY", "Ocp-Apim-Subscription-Key: [redacted]"),
+])
+def test_az_stderr_redaction_covers_secret_headers(raw: str, secret: str, redacted: str) -> None:
+    from scripts.deploy import _redacted
+
+    printed = _redacted(f"ERROR: {raw}\nstatusCode=401 code=InvalidTemplate")
+    assert secret not in printed
+    assert printed == f"ERROR: {redacted}\nstatusCode=401 code=InvalidTemplate"
+
+
+def test_what_if_lists_each_changed_resource(capsys: pytest.CaptureFixture[str]) -> None:
+    from scripts.deploy import _what_if_counts
+
+    role = "/subscriptions/s/providers/Microsoft.Authorization/roleAssignments/r1"
+    network = "/subscriptions/s/resourceGroups/g/providers/Microsoft.Network/virtualNetworks/v"
+    counts = _what_if_counts({"changes": [
+        {"changeType": "Create", "resourceId": role},
+        {"changeType": "Modify", "resourceId": network},
+        {"changeType": "NoChange", "resourceId": "/unchanged"},
+    ]})
+
+    printed = capsys.readouterr().out.splitlines()
+    assert counts == {"Create": 1, "Modify": 1, "NoChange": 1}
+    assert printed == [
+        "What-if: Create=1, Modify=1, NoChange=1",
+        f"  Create {role}",
+        f"  Modify {network}",
+    ]
