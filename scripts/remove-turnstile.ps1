@@ -1243,7 +1243,12 @@ foreach ($spec in $outputResourceSpecs) {
     if ($adoptedResourceIds.Contains($resourceId)) {
         continue
     }
-    $resource = Invoke-AzJson @('resource', 'show', '--ids', $resourceId, '--output', 'json') -AllowFailure
+    $showArguments = @('resource', 'show', '--ids', $resourceId, '--output', 'json')
+    if ($spec.type -ieq 'Microsoft.ContainerRegistry/registries') {
+        # CLI's automatically selected API version can omit an existing registry.
+        $showArguments += @('--api-version', '2023-07-01')
+    }
+    $resource = Invoke-AzJson $showArguments -AllowFailure
     if ($null -eq $resource) {
         # Partial cleanup may already have removed this exact resource. Confirm
         # absence with a successful scoped list; do not hide authorization errors

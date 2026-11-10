@@ -249,6 +249,30 @@ def test_resume_rejects_short_owner_password_before_deployment(tmp_path: Path) -
     ]
 
 
+@pytest.mark.parametrize("outputs", [{"apiName": "existing-api"}, {}, []])
+@pytest.mark.parametrize("require_owner_password", [False, True])
+def test_missing_secret_state_for_existing_outputs_never_rotates_keys(
+    tmp_path: Path, outputs: object, require_owner_password: bool,
+) -> None:
+    inputs = DeploymentInputs.load(
+        "subscription", _parameters(tmp_path / "parameters.json"), tmp_path / "state.json",
+    )
+    outputs_path = inputs.state_path.with_suffix(".outputs.json")
+    retained_outputs = json.dumps(outputs).encode("utf-8")
+    outputs_path.write_bytes(retained_outputs)
+    password_reader = Mock(side_effect=AssertionError("Must not prompt or create replacement secrets"))
+
+    with pytest.raises(DeploymentError, match="Restore the original secret state"):
+        load_or_create_secret_material(
+            inputs, read_password=password_reader,
+            require_owner_password=require_owner_password,
+        )
+
+    password_reader.assert_not_called()
+    assert not inputs.state_path.exists()
+    assert outputs_path.read_bytes() == retained_outputs
+
+
 def test_public_parameter_file_rejects_secure_values(tmp_path: Path) -> None:
     path = _parameters(tmp_path / "parameters.json")
     document = json.loads(path.read_text(encoding="utf-8"))
@@ -1880,6 +1904,7 @@ def test_resume_reuses_saved_private_dns_link_name(tmp_path: Path) -> None:
         for failure in (None, "readiness")
     ] + [
         (False, False, "packages"), (False, False, "observer"),
+        (True, False, "packages"), (True, False, "observer"), (True, False, "plan"),
         (False, False, "plan"), ("platform", False, "plan"), ("observer", False, "plan"),
     ],
 )
@@ -1958,6 +1983,17 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
         "build_packages", "current_app_settings",
     ):
         monkeypatch.setattr(deploy, name, Mock(return_value={}))
+    retained_settings = {
+        "api-test": {"BUDGET_EXECUTION_ENABLED": "true", "BUDGET_DELEGATION_TARGETS": "{}"},
+        "control-test": {
+            "BUDGET_EXECUTION_ENABLED": "true",
+            "TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR": "retained-approved-descriptor",
+        },
+        "telemetry-test": {"BUDGET_SETTLEMENT_ENABLED": "true"},
+    }
+    monkeypatch.setattr(deploy, "current_app_settings", Mock(
+        side_effect=lambda _runner, _inputs, app: dict(retained_settings[app]),
+    ))
     upstream_deployment = Mock(side_effect=AssertionError(
         "Platform lifecycle must use resource-group deployments",
     ))
@@ -1988,6 +2024,15 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
         _document: object, name: str,
     ) -> dict[str, object]:
         stage = name.removeprefix("turnstile-")
+        if stage == "platform" and existing:
+            for parameter, app in (
+                ("currentApiSettings", "api-test"),
+                ("currentControlPlaneSettings", "control-test"),
+                ("currentTelemetrySettings", "telemetry-test"),
+            ):
+                assert cast(dict[str, Any], _document)["parameters"][parameter] == {
+                    "value": retained_settings[app],
+                }
         assert template == {
             "platform": REPOSITORY_ROOT / "infra/main.bicep",
             "observer": REPOSITORY_ROOT / "infra/envoy-cache-adapter/main.bicep",
@@ -2104,14 +2149,21 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     ]
     if failure_stage in {"packages", "observer"}:
         if failure_stage == "observer":
+            expected.append("deploy:observer")
+            if initializes_program:
+                expected.append("_write_outputs")
             expected.extend((
-                "deploy:observer", "_write_outputs", "ensure_observer_event_hub_role",
-                "_write_outputs", "build_and_start_observer",
+                "ensure_observer_event_hub_role", "_write_outputs", "build_and_start_observer",
             ))
         assert events == expected
-        assert checkpoints[-1]["pendingInstallation"] == (
-            "platform" if failure_stage == "packages" else "observer"
-        )
+        if initializes_program:
+            assert checkpoints[-1]["pendingInstallation"] == (
+                "platform" if failure_stage == "packages" else "observer"
+            )
+        else:
+            assert "pendingInstallation" not in checkpoints[-1]
+            assert all(checkpoint["apiName"] == outputs["apiName"] for checkpoint in checkpoints)
+            assert all(checkpoint["apimPrincipalId"] == outputs["apimPrincipalId"] for checkpoint in checkpoints)
         assert checkpoints[-1]["managedRoleAssignmentIds"] == sorted(
             role_ids[name] for name in (
                 role_helpers[:3] if failure_stage == "packages" else role_helpers
@@ -2140,7 +2192,9 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     expected.append("deploy:runtime-release")
     release_call = cast(Mock, deploy.runtime_release_parameters).call_args
     assert release_call.args[6] == (descriptor if initializes_program else None)
-    assert release_call.args[7] == ({} if initializes_program else None)
+    assert release_call.args[7] == (
+        retained_settings["telemetry-test"] if initializes_program else None
+    )
     if initializes_program:
         expected.append("verify_initial_fixed_program")
         owner_email = json.loads(arguments.parameters.read_text())["parameters"][
@@ -4186,6 +4240,7 @@ def test_resume_previews_only_available_runtime_and_preserves_release_settings(
         "apiName": "api-turnstile-test",
         "apiUrl": "https://api.example.test",
         "controlPlaneFunctionName": "func-turnstile-control-test",
+        "telemetryFunctionName": "func-turnstile-telemetry-test",
         "apimName": "shared-apim",
         "apimPrincipalId": "apim-principal",
         "apimGatewayUrl": "https://apim.example.test",
@@ -4306,6 +4361,9 @@ def test_resume_previews_only_available_runtime_and_preserves_release_settings(
             "EXISTING_SETTING": platform_outputs["controlPlaneFunctionName"],
         }
     assert settings_reads == [
+        platform_outputs["apiName"], platform_outputs["telemetryFunctionName"],
+        platform_outputs["controlPlaneFunctionName"],
+    ] + [
         platform_outputs["apiName"], platform_outputs["controlPlaneFunctionName"],
     ] * len(releases)
     if action == "plan":

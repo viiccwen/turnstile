@@ -1,6 +1,8 @@
 targetScope = 'resourceGroup'
 
 param location string
+@secure()
+param currentControlPlaneSettings object = {}
 param resourcePrefix string
 param suffix string
 param storageName string
@@ -104,7 +106,7 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
     }
     siteConfig: {
       minTlsVersion: '1.2'
-      appSettings: [
+      appSettings: map(items(union(currentControlPlaneSettings, toObject([
         { name: 'AzureWebJobsFeatureFlags', value: 'EnableWorkerIndexing' }
         { name: 'AzureWebJobsStorage__accountName', value: storageName }
         { name: 'AzureWebJobsStorage__blobServiceUri', value: storageBlobEndpoint }
@@ -148,7 +150,10 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
         { name: 'CONTROL_PLANE_MAX_ATTEMPTS', value: '30' }
         { name: 'CONTROL_PLANE_PARENT_POLICY_PATH', value: 'policies/foundry-finops-policy.xml' }
         { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: applicationInsightsConnectionString }
-      ]
+      ], setting => setting.name, setting => setting.value))), setting => {
+        name: setting.key
+        value: setting.value
+      })
     }
   }
 }

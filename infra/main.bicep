@@ -43,6 +43,18 @@ param telemetryDeploymentContainerName string = 'turnstile-telemetry-deploy'
 @description('Existing blob container used for the control-plane Function deployment package.')
 param controlPlaneDeploymentContainerName string = 'turnstile-control-deploy'
 
+@description('Existing API runtime settings retained during an incremental platform update.')
+@secure()
+param currentApiSettings object = {}
+
+@description('Existing telemetry runtime settings retained during an incremental platform update.')
+@secure()
+param currentTelemetrySettings object = {}
+
+@description('Existing control-plane runtime settings retained during an incremental platform update.')
+@secure()
+param currentControlPlaneSettings object = {}
+
 param location string
 param postgresLocation string = location
 
@@ -317,6 +329,8 @@ module dataPlane 'modules/data-plane.bicep' = {
   params: {
     location: location
     provisionApimOutboundNetwork: provisionApimOutboundNetwork
+    currentApiSettings: currentApiSettings
+    currentTelemetrySettings: currentTelemetrySettings
     apimSkuName: apimSkuName
     postgresLocation: postgresLocation
     managedPostgresServerName: managedPostgresServerName
@@ -467,6 +481,7 @@ module controlPlane 'modules/control-plane-function.bicep' = if (provisionContro
   name: '${resourcePrefix}-control-plane-function'
   params: {
     location: location
+    currentControlPlaneSettings: currentControlPlaneSettings
     resourcePrefix: resourcePrefix
     suffix: suffix
     storageName: sharedStorage.name

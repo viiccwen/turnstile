@@ -187,6 +187,15 @@ def test_remove_script_retries_read_only_azure_queries() -> None:
     assert "if ($exitCode -eq 0)" in invoke
 
 
+def test_registry_manifest_capture_pins_supported_resource_api_version() -> None:
+    capture = REMOVE.split("foreach ($spec in $outputResourceSpecs)", 1)[1].split(
+        "$dependencyMetadata =", 1,
+    )[0]
+    assert "$spec.type -ieq 'Microsoft.ContainerRegistry/registries'" in capture
+    assert "$showArguments += @('--api-version', '2023-07-01')" in capture
+    assert "Invoke-AzJson $showArguments -AllowFailure" in capture
+
+
 def test_remove_manifest_deletes_only_shared_storage_children() -> None:
     assert "storageResourceGroupName" in REMOVE
     assert "Manifest resource is outside the platform resource group" in REMOVE

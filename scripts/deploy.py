@@ -942,6 +942,13 @@ def load_or_create_secret_material(
                 )
         return SecretMaterial(dict(values), owner_password)
 
+    if _outputs_path(inputs).exists():
+        raise DeploymentError(
+            "Deployment outputs exist but the secret state is missing. "
+            "Restore the original secret state before updating this installation; "
+            "replacement keys can make existing credentials and data inaccessible."
+        )
+
     owner_password = _read_owner_password(read_password)
     values = {
         "postgresAdministratorPassword": secrets.token_urlsafe(32),
@@ -4522,6 +4529,20 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         resume_existing_environment=saved_outputs is not None,
         saved_outputs=saved_outputs,
     )
+    if saved_outputs is not None:
+        # A site deployment replaces appSettings, including the fixed-program descriptor
+        # and delegation trust. Preserve them in secure template parameters so an
+        # interruption before package/runtime release remains safe to retry.
+        for output_name, parameter_name in (
+            ("apiName", "currentApiSettings"),
+            ("telemetryFunctionName", "currentTelemetrySettings"),
+            ("controlPlaneFunctionName", "currentControlPlaneSettings"),
+        ):
+            base_parameters.setdefault("parameters", {})[parameter_name] = {
+                "value": current_app_settings(
+                    runner, inputs, _output_string(saved_outputs, output_name),
+                ),
+            }
     main_template = REPOSITORY_ROOT / "infra" / "main.bicep"
     release_template = REPOSITORY_ROOT / "infra" / "runtime-release.bicep"
     observer_template = REPOSITORY_ROOT / "infra" / "envoy-cache-adapter" / "main.bicep"

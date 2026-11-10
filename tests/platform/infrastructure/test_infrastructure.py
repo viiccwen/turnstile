@@ -38,6 +38,23 @@ PARAMETERS = json.loads(
 )["parameters"]
 
 
+def test_incremental_platform_preserves_runtime_settings_as_secure_parameters() -> None:
+    for parameter, module in (
+        ("currentApiSettings", DATA_PLANE),
+        ("currentTelemetrySettings", DATA_PLANE),
+        ("currentControlPlaneSettings", CONTROL_PLANE),
+    ):
+        declaration = f"@secure()\nparam {parameter} object = {{}}"
+        assert declaration in MAIN
+        assert declaration in module
+        assert f"{parameter}: {parameter}" in MAIN
+        # Existing runtime-only keys survive; template-owned keys take precedence.
+        assert f"appSettings: map(items(union({parameter}, toObject([" in module
+        assert "], setting => setting.name, setting => setting.value)))" in module
+        assert f"output {parameter}" not in MAIN
+        assert f"output {parameter}" not in module
+
+
 def test_self_hosted_access_is_opt_in_and_separates_creation_from_tokens() -> None:
     wrapper = (ROOT / "infra/self-hosted-gateway-access.bicep").read_text()
     access = (ROOT / "infra/modules/self-hosted-gateway-rbac.bicep").read_text()

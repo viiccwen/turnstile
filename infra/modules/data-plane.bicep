@@ -2,6 +2,10 @@ targetScope = 'resourceGroup'
 
 param location string
 param provisionApimOutboundNetwork bool = false
+@secure()
+param currentApiSettings object = {}
+@secure()
+param currentTelemetrySettings object = {}
 @allowed([
   'Developer'
   'StandardV2'
@@ -655,7 +659,7 @@ resource api 'Microsoft.Web/sites@2024-11-01' = {
       appCommandLine: 'python -m backend.migrate && python -m backend.bootstrap && python -m uvicorn backend.api:app --host 0.0.0.0 --port 8000'
       ftpsState: 'Disabled'
       minTlsVersion: '1.2'
-      appSettings: [
+      appSettings: map(items(union(currentApiSettings, toObject([
         { name: 'SCM_DO_BUILD_DURING_DEPLOYMENT', value: 'false' }
         { name: 'ENABLE_ORYX_BUILD', value: 'false' }
         { name: 'WEBSITE_RUN_FROM_PACKAGE', value: '1' }
@@ -694,7 +698,10 @@ resource api 'Microsoft.Web/sites@2024-11-01' = {
         { name: 'TRAFFIC_GENERATION_BUDGET_USD', value: '20' }
         { name: 'WEB_DIST_DIR', value: 'frontend/dist' }
         { name: 'MIGRATIONS_DIR', value: 'migrations' }
-      ]
+      ], setting => setting.name, setting => setting.value))), setting => {
+        name: setting.key
+        value: setting.value
+      })
     }
   }
 }
@@ -743,7 +750,7 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
     }
     siteConfig: {
       minTlsVersion: '1.2'
-      appSettings: [
+      appSettings: map(items(union(currentTelemetrySettings, toObject([
         { name: 'AzureWebJobsFeatureFlags', value: 'EnableWorkerIndexing' }
         { name: 'AzureWebJobsStorage__accountName', value: telemetryStorageName }
         { name: 'AzureWebJobsStorage__blobServiceUri', value: telemetryBlobEndpoint }
@@ -764,7 +771,10 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
         { name: 'LEDGER_TABLE_ENDPOINT', value: ledgerTableEndpoint }
         { name: 'LEDGER_TABLE_NAME', value: ledgerTableName }
         { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: effectiveAppInsightsConnectionString }
-      ]
+      ], setting => setting.name, setting => setting.value))), setting => {
+        name: setting.key
+        value: setting.value
+      })
     }
   }
 }

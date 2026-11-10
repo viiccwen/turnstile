@@ -676,28 +676,34 @@ Creating connections or models through direct API calls does not count as fronte
 
 Foundry managed-identity onboarding requires two independently authorized identities:
 
-| Identity | Purpose | Role on the Foundry account |
+| Identity | Purpose | Required role and scope |
 | --- | --- | --- |
-| Publisher / Control-plane Function (`controlPlanePrincipalId`) | Read deployment metadata before publication | `Cognitive Services Data Reader` (`b59867f0-fa02-499b-be73-45a86b5b3e1c`) |
-| APIM (`apimPrincipalId`) | Send upstream inference requests and publication probes | `Cognitive Services User` (`a97b65f3-24c7-4388-baec-2e87135dc908`) |
+| Publisher / Control-plane Function (`controlPlanePrincipalId`) | Access the Foundry project and read deployment metadata before publication | `Foundry User` (`53ca6127-db72-4b80-b1b0-d745d6d5456d`) on the intended project; account scope only when explicitly approved |
+| APIM (`apimPrincipalId`) | Send upstream inference requests and publication probes | `Cognitive Services User` (`a97b65f3-24c7-4388-baec-2e87135dc908`) on the Foundry account |
 
 The Publisher directly reads `GET <Project Endpoint>/deployments?api-version=v1` with its own
-`https://ai.azure.com` token. APIM's grant does not authorize this request. Data Reader supplies
-`Microsoft.CognitiveServices/*/read` data actions without inference or key-listing permissions;
-ARM-only `Reader` is insufficient, while `Foundry User` is unnecessarily broad.
+`https://ai.azure.com` token. APIM's grant does not authorize this request. Assign the Publisher
+`Foundry User` (formerly `Azure AI User`); use the role ID above to avoid name differences during
+the rename rollout. Read-only data access or ARM-only `Reader` must not be treated as sufficient
+Foundry project authorization. See [Foundry RBAC guidance](https://learn.microsoft.com/en-us/azure/foundry/concepts/rbac-foundry).
 
-To configure both grants during deployment, set the existing orchestrator parameter
-`foundryCognitiveServicesAccountResourceId` to the approved account's ARM resource ID.
-`scripts.deploy` (also used by `deploy-turnstile.ps1`) grants both roles at **account scope**,
-so the Publisher can read metadata across that account's projects. The operator needs
-role-assignment write permission there. These grants are outside the root Bicep What-if;
-their exact IDs are recorded in `managedRoleAssignmentIds` for cleanup. Omitting the parameter
-creates neither grant. No additional parameter or manifest field is required.
+Grant `Foundry User` to `controlPlanePrincipalId` on each intended project. Account scope grants
+broader access across projects and requires explicit customer approval. `Foundry User` is not a
+read-only role: it includes broad data access and key-related permissions, so review the role and
+scope before granting it. The API identity does not need this grant for the Publisher workflow.
 
-For project-only Publisher access, grant Data Reader manually on the intended project rather
-than using the account-scoped deployment option. Allow RBAC propagation and verify metadata
-access as the Publisher; `deployment_metadata_unavailable` 401/403 is separate from APIM
-management or inference authorization. API-key connections use their key for this read.
+The existing optional orchestrator parameter `foundryCognitiveServicesAccountResourceId`
+creates the APIM grant and a legacy Publisher role assignment at **account scope** through
+`scripts.deploy` (also used by `deploy-turnstile.ps1`). It does **not** currently assign the required
+Publisher `Foundry User` role; complete that grant separately. Do not treat successful deployment
+as proof of Foundry project access. The operator needs role-assignment write permission at the
+approved scope. The orchestrator-created assignments are outside the root Bicep What-if and are
+recorded in `managedRoleAssignmentIds` for cleanup; separately granted customer roles are not
+automatically included. Omitting the parameter creates neither orchestrator-managed grant.
+
+Allow RBAC propagation and verify metadata access as the Publisher;
+`deployment_metadata_unavailable` 401/403 is separate from APIM management or inference
+authorization. API-key connections use their key for this read.
 
 Enabling a managed identity and granting it Foundry access are separate operations. The API,
 publisher Function and APIM have different identities. APIM authenticates the upstream model
@@ -882,6 +888,23 @@ gateways onboarded in the web console by an earlier release.
 ## Reruns and recovery
 
 The command is idempotent for the same parameter and state files. Keep the state file available: generating replacement platform keys during a rerun can invalidate database credentials, encrypted provider credentials, APIM subscriptions, and observer authentication.
+
+When saved deployment outputs exist but the secret state is missing, deployment refuses to
+generate replacement keys. Restore the original state file; deleting outputs or starting with
+a new state file is not an update or a supported recovery method.
+
+Incremental platform updates read the existing API, Telemetry and Control-plane app settings
+before applying infrastructure. These are passed only as secure ARM objects, preserving
+runtime-only settings such as the approved fixed-program descriptor and delegation trust even
+if package deployment is interrupted. Template-owned settings still follow the reviewed
+template. Keep the original database and credential-encryption key, and compare application,
+model, subscription, budget and usage identities before and after an update.
+
+From v1.4.1, Adopted deployment requires four top-level `adoptedSecrets` values:
+`databaseUrl`, `credentialEncryptionKey`, `apimSubscriptionKey` and `apimProbeSubscriptionKey`.
+Existing private files may retain `managementApiKey` and `existingManagementApiKeySecretUri`;
+these retired inputs are accepted but ignored. They are not required or provisioned, and
+upgrading does not rewrite the original private parameter or state files.
 
 If a phase fails, correct the reported cause and run the same command again. Every infrastructure phase repeats what-if and still refuses Delete changes. Use `--yes` only in controlled automation after separately reviewing `scripts.deploy plan`; it never bypasses the no-delete gate.
 
