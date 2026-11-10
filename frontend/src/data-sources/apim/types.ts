@@ -152,6 +152,12 @@ export type UsageRequestSummary = {
 export type UsageRequestPage = {
   items: UsageRequestSummary[]
   page: { next_cursor: string | null }
+  counts: {
+    total_requests: number
+    success_requests: number
+    client_error_requests: number
+    server_error_requests: number
+  }
 }
 
 export type UsageRequestDetail = UsageRequestSummary & {
@@ -1202,13 +1208,14 @@ export type GatewayPublicationCreate = {
 }
 
 export type GatewayPublicationFailure = {
-  code: "publisher_permissions_missing" | "publisher_permissions_unverified" | "publisher_authorization_failed" | "parent_policy_changed" | "credential_source_missing" | "gateway_capability_unavailable" | "publication_failed" | "deployment_not_found" | "deployment_metadata_unavailable" | "upstream_request_failed" | "credential_unreadable" | "credential_vault_unavailable"
+  code: "publisher_permissions_missing" | "publisher_permissions_unverified" | "publisher_authorization_failed" | "parent_policy_changed" | "credential_source_missing" | "apim_infrastructure_upgrade_required" | "gateway_capability_unavailable" | "publication_failed" | "deployment_not_found" | "deployment_metadata_unavailable" | "upstream_request_failed" | "credential_unreadable" | "credential_vault_unavailable" | "credential_vault_access_denied" | "credential_name_conflict"
   message: string
   stage: GatewayPublicationStatus | null
   request_id: string | null
   http_status: number | null
   missing_actions: string[]
   profile?: "openai-v1" | "anthropic-messages" | "openai-images" | "microsoft-decision" | null
+  credential_recovery?: "retry_with_key" | "republish_with_key" | "administrator" | "administrator_republish" | null
 }
 
 export type GatewayPublication = {

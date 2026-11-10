@@ -1202,10 +1202,15 @@ function RequestTrace({
   const matchingRows = requestRows.filter((item) => requestTraceMatches(item, normalizedSearch, statusFilter))
   const firstMatchingId = matchingRows[0] ? requestTraceId(matchingRows[0]) : null
   const selectedMatches = matchingRows.some((item) => requestTraceId(item) === selected)
+  const keepDeepLink = initialRequestId !== null && statusFilter === "all"
+    && (normalizedSearch === initialRequestId.toLocaleLowerCase()
+      || (requestRows.length === 0 && normalizedSearch === ""))
   useEffect(() => {
-    // The detail follows the filter; a deep link outside the loaded rows stays selected.
-    if (firstMatchingId && !selectedMatches) setSelected(firstMatchingId)
-  }, [firstMatchingId, selectedMatches])
+    if (!selectedMatches) {
+      const nextSelection = keepDeepLink ? initialRequestId : firstMatchingId
+      if (selected !== nextSelection) setSelected(nextSelection)
+    }
+  }, [firstMatchingId, initialRequestId, keepDeepLink, selected, selectedMatches])
   const loadNextPage = () => {
     if (!query.hasNextPage || query.isFetchingNextPage || loadingNextPageRef.current) return
     loadingNextPageRef.current = true
@@ -1213,7 +1218,7 @@ function RequestTrace({
   }
   if (query.isLoading || overview.isLoading || volumeTrend.isLoading) return <LoadingState />;
   if (query.error || overview.error || volumeTrend.error) return <ErrorState error={query.error ?? overview.error ?? volumeTrend.error} />;
-  if (!requestRows.length)
+  if (!requestRows.length && !selected && !initialRequestId)
     return (
       <EmptyState
         title="暂无请求记录"
@@ -1236,13 +1241,14 @@ function RequestTrace({
   }
   const visibleRows = pricedRows.filter((item) => requestTraceMatches(item, normalizedSearch, statusFilter));
   const totals = overview.data?.totals;
-  const windowRequests = totals?.total_requests ?? 0;
-  const clientErrors = totals?.client_error_requests ?? 0;
-  const serverErrors = totals?.server_error_requests ?? 0;
+  const counts = query.data?.pages[0]?.counts;
+  const windowRequests = counts?.total_requests ?? 0;
+  const clientErrors = counts?.client_error_requests ?? 0;
+  const serverErrors = counts?.server_error_requests ?? 0;
   const failedRequests = clientErrors + serverErrors;
   const statusTotal = statusFilter === "all"
     ? windowRequests
-    : statusFilter === "success" ? totals?.success_requests ?? 0 : failedRequests;
+    : statusFilter === "success" ? counts?.success_requests ?? 0 : failedRequests;
   const slowRequests = totals?.latency_over_5s ?? 0;
   const slowRequestPercent = windowRequests ? (slowRequests / windowRequests) * 100 : 0;
   const volumeRows = (volumeTrend.data?.points ?? []).map((point) => ({

@@ -67,7 +67,7 @@ import { Switch } from "../../../components/ui/switch"
 import { ResizableGridTable } from "../../../components/ui/resizable-table"
 import { dataSource } from "../api"
 import { getIntlLocale, useLocale, type LocalePreference } from "../../../locales/index"
-import { finopsKeys, finopsQueries } from "../queries"
+import { finopsKeys, finopsQueries, storePeopleModelPolicy } from "../queries"
 import { useAuth } from "../../../providers/auth-provider"
 import type {
   BudgetMode,
@@ -129,6 +129,12 @@ function formatBudgetUsd(value: string | number | null | undefined, fractionDigi
   return value == null ? "--" : new Intl.NumberFormat(getIntlLocale(), {
     style: "currency", currency: "USD", minimumFractionDigits: fractionDigits, maximumFractionDigits: fractionDigits,
   }).format(Number(value))
+}
+
+function formatBudgetUsdInput(value: string | null | undefined) {
+  if (!value) return ""
+  const [whole, fraction = ""] = value.split(".")
+  return `${whole}.${fraction.replace(/0+$/, "").padEnd(2, "0")}`
 }
 
 function budgetLimit(item: TokenBudgetItem, mode: BudgetMode = item.budget_mode ?? "tokens") {
@@ -343,7 +349,7 @@ function BudgetEditor({
   const switchingUnit = item.scope_type === "organization"
     && budgetLimit(item) != null && budgetMode !== (item.budget_mode ?? "tokens")
   const [tokenLimit, setTokenLimit] = useState(String(item.token_limit ?? ""))
-  const [usdLimit, setUsdLimit] = useState(item.usd_limit ?? "")
+  const [usdLimit, setUsdLimit] = useState(() => formatBudgetUsdInput(item.usd_limit))
   const previewRequired = switchingUnit && budgetMode === "usd"
   // The page list omits people, so a department's own allocations come from the full tree.
   const departmentScope = item.scope_type === "department"
@@ -567,7 +573,7 @@ function BudgetRow({
       ? Users
       : UserRound
   const editDisabled = item.scope_type !== "organization" && !parentAllocated
-  return <div className="budget-table-row" data-depth={depth} data-status={item.status}>
+  return <div className="budget-table-row" role="row" data-depth={depth} data-status={item.status}>
     <div className="budget-scope-cell" style={{ "--budget-depth": depth } as React.CSSProperties}>
       {hasChildren
         ? <button type="button" className="budget-tree-toggle" onClick={onToggle} aria-label={expanded ? "折叠" : "展开"}>{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</button>
@@ -743,7 +749,7 @@ function BulkPeopleEditor({
     singlePerson?.token_limit == null ? "" : String(singlePerson.token_limit),
   )
   const usdMode = people.department_usd_limit != null
-  const [usdLimit, setUsdLimit] = useState(singlePerson?.usd_limit ?? "")
+  const [usdLimit, setUsdLimit] = useState(() => formatBudgetUsdInput(singlePerson?.usd_limit))
   const [threshold, setThreshold] = useState(
     String(singlePerson?.warning_threshold_percent ?? 80),
   )
@@ -932,18 +938,22 @@ function PeopleBudgetWorkspace({
     limit,
   ))
   const bulk = useMutation({
-    mutationFn: (write: TokenBudgetBulkWrite) => dataSource.bulkSavePeopleBudgets(period, write),
-    onSuccess: (result) => {
-      setBulkOpen(false)
-      setSelectedIds(new Set())
-      setAllMatching(false)
-      const changes = [
-        result.token_limit_per_user != null ? "预算" : null,
-        result.model_policy_updated_count > 0 ? "模型访问" : null,
-      ].filter(Boolean).join("和")
-      setNotice(`已为 ${result.updated_count.toLocaleString(getIntlLocale())} 人更新${changes}`)
-      void queryClient.invalidateQueries({ queryKey: ["finops", "budgets", "people", period, departmentId] })
-      void queryClient.invalidateQueries({ queryKey: finopsKeys.budgets(period) })
+    mutationFn: ({ period: submittedPeriod, write }: { period: string; write: TokenBudgetBulkWrite }) =>
+      dataSource.bulkSavePeopleBudgets(submittedPeriod, write),
+    onSuccess: async (result, { period: submittedPeriod, write }) => {
+      await storePeopleModelPolicy(queryClient, submittedPeriod, write, result)
+      if (period === submittedPeriod && departmentId === write.department_id) {
+        setBulkOpen(false)
+        setSelectedIds(new Set())
+        setAllMatching(false)
+        const changes = [
+          result.token_limit_per_user != null ? "预算" : null,
+          result.model_policy_updated_count > 0 ? "模型访问" : null,
+        ].filter(Boolean).join("和")
+        setNotice(`已为 ${result.updated_count.toLocaleString(getIntlLocale())} 人更新${changes}`)
+      }
+      void queryClient.invalidateQueries({ queryKey: ["finops", "budgets", "people", submittedPeriod, write.department_id] })
+      void queryClient.invalidateQueries({ queryKey: finopsKeys.budgets(submittedPeriod) })
     },
   })
   const removePerson = useMutation({
@@ -1039,7 +1049,7 @@ function PeopleBudgetWorkspace({
       <div><span>{`显示 ${pageStart.toLocaleString(getIntlLocale())}–${pageEnd.toLocaleString(getIntlLocale())}，共 ${total.toLocaleString(getIntlLocale())} 人`}</span>{canManage && allPageSelected && total > pageItems.length && !allMatching && <button type="button" onClick={() => { setAllMatching(true); setSelectedIds(new Set()) }}>{`选择全部 ${total.toLocaleString(getIntlLocale())} 个结果`}</button>}{canManage && allMatching && <><b>已选择全部匹配结果</b><button type="button" onClick={() => setAllMatching(false)}>清除选择</button></>}</div>
       <div><Button type="button" variant="outline" size="icon-sm" aria-label="上一页" disabled={offset === 0 || people.isFetching} onClick={() => setOffset(Math.max(0, offset - limit))}><ChevronLeft size={14} /></Button><Button type="button" variant="outline" size="icon-sm" aria-label="下一页" disabled={offset + limit >= total || people.isFetching} onClick={() => setOffset(offset + limit)}><ChevronRight size={14} /></Button></div>
     </div>}
-    {canManage && bulkOpen && people.data && <BulkPeopleEditor people={people.data} models={models} selection={allMatching ? "all_matching" : "ids"} selectedIds={[...selectedIds]} query={debouncedSearch} status={status} busy={bulk.isPending || removePerson.isPending} error={bulk.error ? peopleAllocationError(bulk.error) : removePerson.error ? queryError(removePerson.error) : null} onClose={() => { if (!bulk.isPending && !removePerson.isPending) setBulkOpen(false) }} onSave={(write) => bulk.mutate(write)} onRemove={(personId) => removePerson.mutate(personId)} />}
+    {canManage && bulkOpen && people.data && <BulkPeopleEditor people={people.data} models={models} selection={allMatching ? "all_matching" : "ids"} selectedIds={[...selectedIds]} query={debouncedSearch} status={status} busy={bulk.isPending || removePerson.isPending} error={bulk.error ? peopleAllocationError(bulk.error) : removePerson.error ? queryError(removePerson.error) : null} onClose={() => { if (!bulk.isPending && !removePerson.isPending) setBulkOpen(false) }} onSave={(write) => bulk.mutate({ period, write })} onRemove={(personId) => removePerson.mutate(personId)} />}
   </section>
 }
 

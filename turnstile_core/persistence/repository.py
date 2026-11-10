@@ -234,7 +234,7 @@ class PostgreSqlOpsDbProxy(
                                                  ), 0
                                              )::DOUBLE PRECISION,
                                              'failed_calls', COUNT(*) FILTER (
-                                                 WHERE status_code >= 400
+                                                 WHERE status_code = 0 OR status_code >= 400
                                              )::BIGINT
                                          ) AS totals
                              FROM combined
@@ -298,6 +298,16 @@ class PostgreSqlOpsDbProxy(
             if self._pool_opened:
                 self._pool.close()
                 self._pool_opened = False
+
+    def retain_failed_usage_event(
+        self, body: bytes, error_type: str, reason: str,
+    ) -> None:
+        with self._connection() as connection, connection.transaction():
+            connection.execute(
+                """INSERT INTO usage_ingestion_failure (body, error_type, reason)
+                   VALUES (%s, %s, %s) ON CONFLICT (body_sha256) DO NOTHING""",
+                (body, error_type, reason),
+            )
 
     def write_token_usage(
         self,
@@ -386,6 +396,17 @@ class PostgreSqlOpsDbProxy(
                             existing, record.input_tokens, record.cached_tokens,
                             record.output_tokens, record.cache_write_tokens,
                         ))
+            if record.estimated and record.status_code == 0:
+                connection.execute(
+                    """UPDATE token_usage SET status = %(status)s,
+                              status_code = %(status_code)s,
+                              error_message = %(error_message)s, ingest_error = %(ingest_error)s
+                       WHERE id = %(id)s AND estimated AND reconciled_at IS NULL
+                         AND status_code BETWEEN 100 AND 399
+                         AND (status_code, error_message, ingest_error) IS DISTINCT FROM
+                             (%(status_code)s, %(error_message)s, %(ingest_error)s)""",
+                    values,
+                )
             values["price_context_snapshot"] = Jsonb(snapshot) if snapshot is not None else None
             connection.execute(
                 """
@@ -637,7 +658,8 @@ class PostgreSqlOpsDbProxy(
             row = connection.execute(
                 """SELECT MIN(ts) AS oldest FROM token_usage
                                      WHERE estimated AND reconciled_at IS NULL
-                                         AND status_code < 400 AND ts >= %(since)s""",
+                                         AND status_code BETWEEN 100 AND 399
+                                         AND ts >= %(since)s""",
                 {"since": since},
             ).fetchone()
         if row is None or row["oldest"] is None:
@@ -713,7 +735,7 @@ class PostgreSqlOpsDbProxy(
                                   <= (tier->>'max_input_tokens')::bigint)
                     ) matched ON TRUE
                     WHERE stored.estimated AND stored.reconciled_at IS NULL
-                      AND stored.status_code < 400
+                      AND stored.status_code BETWEEN 100 AND 399
                 )
                 UPDATE token_usage AS u
                 SET input_tokens = v.input_tokens,
@@ -787,7 +809,7 @@ class PostgreSqlOpsDbProxy(
                 WHERE u.id = v.id
                   AND u.estimated
                   AND u.reconciled_at IS NULL
-                  AND u.status_code < 400
+                  AND u.status_code BETWEEN 100 AND 399
                 """,
                 {
                     "correlation_ids": [item.correlation_id for item in items],
@@ -1079,11 +1101,13 @@ class PostgreSqlOpsDbProxy(
                         ::DOUBLE PRECISION AS p95_latency_ms,
                     COALESCE(percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms), 0)
                         ::DOUBLE PRECISION AS p99_latency_ms,
-                    COUNT(*) FILTER (WHERE status_code < 400)::BIGINT AS success_requests,
+                    COUNT(*) FILTER (WHERE status_code BETWEEN 100 AND 399)::BIGINT AS success_requests,
                     COUNT(*) FILTER (
                         WHERE status_code >= 400 AND status_code < 500
                     )::BIGINT AS client_error_requests,
-                    COUNT(*) FILTER (WHERE status_code >= 500)::BIGINT AS server_error_requests,
+                    COUNT(*) FILTER (
+                        WHERE status_code = 0 OR status_code >= 500
+                    )::BIGINT AS server_error_requests,
                     COUNT(*) FILTER (WHERE latency_ms < 1000)::BIGINT AS latency_under_1s,
                     COUNT(*) FILTER (
                         WHERE latency_ms >= 1000 AND latency_ms < 2000
@@ -1108,7 +1132,7 @@ class PostgreSqlOpsDbProxy(
                     COALESCE(SUM(estimated_cost), 0)::DOUBLE PRECISION AS estimated_cost,
                     COALESCE(AVG(latency_ms), 0)::DOUBLE PRECISION AS average_latency_ms,
                     COALESCE(
-                        100.0 * COUNT(*) FILTER (WHERE status_code >= 400)
+                        100.0 * COUNT(*) FILTER (WHERE status_code = 0 OR status_code >= 400)
                         / NULLIF(COUNT(*), 0), 0
                     )::DOUBLE PRECISION AS error_rate,{self._QUALITY_METRICS_SQL}
                 FROM token_usage usage
@@ -1177,7 +1201,24 @@ class PostgreSqlOpsDbProxy(
         limit: int,
         split_by: str | None = None,
     ) -> Sequence[dict[str, Any]]:
-        id_field, name_field = self._DIMENSION_FIELDS[dimension]
+        def dimension_sql(value: str) -> tuple[str, str, str]:
+            identity, label = self._DIMENSION_FIELDS[value]
+            if value != "model":
+                return identity, label, label
+            identity = "COALESCE(model_id, '')"
+            snapshot = (
+                f"CASE WHEN {identity} IN ('', 'unattributed', 'unknown') "
+                f"THEN COALESCE(NULLIF(model, ''), NULLIF({identity}, ''), 'unattributed') "
+                "ELSE '' END"
+            )
+            label = (
+                "COALESCE((ARRAY_AGG(model ORDER BY ts DESC, model COLLATE \"C\" DESC) "
+                "FILTER (WHERE model <> ''))[1], "
+                f"NULLIF({identity}, ''), 'unattributed')"
+            )
+            return identity, label, snapshot
+
+        id_field, name_field, name_group = dimension_sql(dimension)
         filter_sql, filter_parameters = self._filter_sql(filters)
         with self._connection() as connection:
             rows = [
@@ -1199,14 +1240,14 @@ class PostgreSqlOpsDbProxy(
                         SUM(estimated_cost)::DOUBLE PRECISION AS estimated_cost,
                         AVG(latency_ms)::DOUBLE PRECISION AS average_latency_ms,
                         COALESCE(
-                            100.0 * COUNT(*) FILTER (WHERE status_code >= 400)
+                            100.0 * COUNT(*) FILTER (WHERE status_code = 0 OR status_code >= 400)
                             / NULLIF(COUNT(*), 0), 0
                         )::DOUBLE PRECISION AS error_rate,{self._QUALITY_METRICS_SQL},
                         CASE WHEN total.cost = 0 THEN 0 ELSE
                             ROUND(100.0 * SUM(estimated_cost) / total.cost, 2)
                         END::DOUBLE PRECISION AS share_percent
                     FROM scoped CROSS JOIN total
-                    GROUP BY {id_field}, {name_field}, total.cost
+                    GROUP BY {id_field}, {name_group}, total.cost
                     ORDER BY total_tokens DESC, name
                     LIMIT 100""",
                     [from_, to, *filter_parameters],
@@ -1230,10 +1271,15 @@ class PostgreSqlOpsDbProxy(
                 return rows
             # A second pass rather than one nested query: the parent ranking is already
             # limited, so the split only has to cover the rows that will be rendered.
-            split_id, split_name = self._DIMENSION_FIELDS[split_by]
+            split_id, split_name, split_group = dimension_sql(split_by)
+            parent_group = name_group if dimension == "model" else "''"
+            child_groups = [id_field, split_id, split_group]
+            if dimension == "model":
+                child_groups.insert(1, parent_group)
             children = connection.execute(
                 f"""SELECT
                         {id_field} AS parent_id,
+                        {parent_group} AS parent_name,
                         {split_id} AS id,
                         {split_name} AS name,
                         SUM(input_tokens + cached_tokens + output_tokens)::BIGINT AS total_tokens,
@@ -1241,17 +1287,62 @@ class PostgreSqlOpsDbProxy(
                     FROM token_usage usage
                     WHERE usage.ts >= %s AND usage.ts < %s{filter_sql}
                         AND {id_field} = ANY(%s)
-                    GROUP BY 1, 2, 3
+                    GROUP BY {', '.join(child_groups)}
                     ORDER BY total_tokens DESC""",
                 [from_, to, *filter_parameters, [str(row["id"]) for row in rows]],
             ).fetchall()
-        grouped: dict[str, list[dict[str, Any]]] = {}
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for child in children:
             entry = dict(child)
-            grouped.setdefault(str(entry.pop("parent_id")), []).append(entry)
+            parent_key = (str(entry.pop("parent_id")), str(entry.pop("parent_name")))
+            grouped.setdefault(parent_key, []).append(entry)
         for row in rows:
-            row["breakdown"] = grouped.get(str(row["id"]), [])
+            parent_name = (
+                str(row["name"])
+                if dimension == "model" and row["id"] in {"", "unattributed", "unknown"}
+                else ""
+            )
+            row["breakdown"] = grouped.get((str(row["id"]), parent_name), [])
         return rows
+
+    _REQUEST_TRACE_ROW_FILTER_SQL = """
+        AND usage.usage_domain = 'apim'
+        AND NOT EXISTS (
+            SELECT 1
+            FROM model_router_invocation logical_decision
+            CROSS JOIN LATERAL jsonb_array_elements(
+                logical_decision.attempts
+            ) logical_attempt
+            WHERE logical_decision.request_id <> usage.request_id
+              AND logical_attempt->>'request_id' = usage.request_id
+        )"""
+
+    def usage_request_counts(
+        self, from_: datetime, to: datetime, filters: UsageFilters,
+    ) -> dict[str, Any]:
+        filter_sql, filter_parameters = self._filter_sql(filters, trace=True)
+        with self._connection() as connection:
+            row = connection.execute(
+                f"""SELECT COUNT(*)::BIGINT AS total_requests,
+                    COUNT(*) FILTER (
+                        WHERE usage.status_code BETWEEN 100 AND 399
+                          AND usage.platform_outcome IS DISTINCT FROM 'failed'
+                    )::BIGINT AS success_requests,
+                    COUNT(*) FILTER (
+                        WHERE usage.status_code BETWEEN 400 AND 499
+                    )::BIGINT AS client_error_requests,
+                    COUNT(*) FILTER (
+                        WHERE usage.status_code >= 500 OR (
+                            usage.platform_outcome = 'failed'
+                            AND COALESCE(usage.status_code, 0) < 400
+                        )
+                    )::BIGINT AS server_error_requests
+                    FROM invocation_request_trace usage
+                    WHERE usage.ts >= %s AND usage.ts < %s{filter_sql}
+                    {self._REQUEST_TRACE_ROW_FILTER_SQL}""",
+                [from_, to, *filter_parameters],
+            ).fetchone()
+        return cast(dict[str, Any], row)
 
     def list_usage_requests(
         self,
@@ -1274,7 +1365,8 @@ class PostgreSqlOpsDbProxy(
                         (usage.usage_available OR COALESCE(routed.usage_available, FALSE))
                             AS usage_available,
                         usage.platform_outcome,
-                        usage.gateway_status_code, usage.upstream_request_id,
+                        NULLIF(usage.gateway_status_code, 0) AS gateway_status_code,
+                        usage.upstream_request_id,
                         usage.ts AS timestamp,
                         usage.organization_id,
                         usage.organization AS organization_name,
@@ -1303,7 +1395,7 @@ class PostgreSqlOpsDbProxy(
                         )::BIGINT AS total_tokens,
                         COALESCE(routed.latency_ms, usage.latency_ms)::BIGINT
                             AS latency_ms,
-                        usage.status_code,
+                        NULLIF(usage.status_code, 0) AS status_code,
                         COALESCE(
                             routed.estimated_cost,
                             usage.estimated_cost
@@ -1371,18 +1463,7 @@ class PostgreSqlOpsDbProxy(
                         WHERE attempt->>'request_id' IS NOT NULL
                     ) routed ON decision.request_id IS NOT NULL
                     WHERE usage.ts >= %s AND usage.ts < %s{filter_sql}{cursor_sql}
-                        AND usage.usage_domain = 'apim'
-                        AND NOT EXISTS (
-                            SELECT 1
-                            FROM model_router_invocation logical_decision
-                            CROSS JOIN LATERAL jsonb_array_elements(
-                                logical_decision.attempts
-                            ) logical_attempt
-                            WHERE logical_decision.request_id
-                                <> usage.request_id
-                              AND logical_attempt->>'request_id'
-                                = usage.request_id
-                        )
+                        {self._REQUEST_TRACE_ROW_FILTER_SQL}
                     ORDER BY usage.ts DESC, usage.trace_id DESC LIMIT %s""",
                 [from_, to, *filter_parameters, limit],
             ).fetchall()
@@ -1394,7 +1475,8 @@ class PostgreSqlOpsDbProxy(
                 """SELECT
                         usage.request_id, usage.correlation_id,
                         usage.trace_id, usage.usage_available, usage.platform_outcome,
-                        usage.gateway_status_code, usage.upstream_request_id,
+                        NULLIF(usage.gateway_status_code, 0) AS gateway_status_code,
+                        usage.upstream_request_id,
                         usage.ts AS timestamp,
                         usage.organization_id,
                         usage.organization AS organization_name,
@@ -1420,7 +1502,7 @@ class PostgreSqlOpsDbProxy(
                             usage.input_tokens + usage.cached_tokens
                             + usage.output_tokens
                         )::BIGINT AS total_tokens,
-                        usage.latency_ms, usage.status_code,
+                        usage.latency_ms, NULLIF(usage.status_code, 0) AS status_code,
                         usage.estimated_cost::DOUBLE PRECISION,
                         (usage.usage_available AND (usage.estimated_cost > 0
                          OR (usage.input_price_per_million IS NOT NULL

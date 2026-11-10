@@ -172,9 +172,17 @@ class UsageRequestSummary(StrictModel):
     selected_model_name: str | None = None
 
 
+class UsageRequestCounts(StrictModel):
+    total_requests: int = Field(ge=0)
+    success_requests: int = Field(ge=0)
+    client_error_requests: int = Field(ge=0)
+    server_error_requests: int = Field(ge=0)
+
+
 class UsageRequestListResponse(StrictModel):
     items: list[UsageRequestSummary]
     page: PageInfo
+    counts: UsageRequestCounts
 
 
 class UsageRequestDetail(UsageRequestSummary):
@@ -724,6 +732,11 @@ class UsageEvent(StrictModel):
 
     @model_validator(mode="after")
     def validate_gateway_attribution(self) -> UsageEvent:
+        if self.status_code is not None and 0 < self.status_code < 100:
+            raise ValueError("Usage status must be HTTP or zero for no response")
+        if ((self.status_code == 0 and self.status != "0")
+                or (self.status == "0" and self.status_code not in (None, 0))):
+            raise ValueError("No-response usage must preserve raw status zero")
         if (self.usd_cost is not None or self.budget_price_projection is not None) and (
             self.usd_cost is None or self.budget_price_projection is None
             or self.event_schema_version != 2 or self.usage_event_source != "apim"
@@ -858,6 +871,15 @@ class TokenUsageRecord(StrictModel):
     price_context_snapshot: dict[str, Any] | None = Field(
         default=None, exclude_if=lambda value: value is None,
     )
+
+    @model_validator(mode="after")
+    def validate_transport_status(self) -> TokenUsageRecord:
+        if self.status_code == 0 and (
+            self.status != "0" or not self.estimated
+            or not self.ingest_error or self.usd_cost is not None
+        ):
+            raise ValueError("No-response usage must retain unknown usage")
+        return self
 
 
 class PriceCatalogRuleSource(StrictModel):

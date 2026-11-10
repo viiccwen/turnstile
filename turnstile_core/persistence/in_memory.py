@@ -566,6 +566,15 @@ class InMemoryRepository(
         for index, existing in enumerate(self.usage_records):
             if existing.id != record.id:
                 continue
+            if (
+                record.estimated and record.status_code == 0 and existing.estimated
+                and existing.id not in self.reconciled_usage_ids
+                and 100 <= existing.status_code < 400
+            ):
+                self.usage_records[index] = existing.model_copy(update={
+                    field: getattr(record, field)
+                    for field in ("status", "status_code", "error_message", "ingest_error")
+                })
             if existing.estimated and not record.estimated:
                 original_price = (
                     ModelPrice.from_usage_snapshot(existing.model_dump())
@@ -670,12 +679,11 @@ class InMemoryRepository(
         return self.reconciliation_state.get(source)
 
     def oldest_unreconciled_usage(self, since: datetime) -> datetime | None:
-        # `estimated` is what this repository flips when a row is reconciled, standing in
-        # for the `reconciled_at IS NULL` half of the SQL guard.
         pending = [
             record.ts
             for record in self.usage_records
-            if record.estimated and record.status_code < 400 and record.ts >= since
+            if record.estimated and 100 <= record.status_code < 400
+            and record.id not in self.reconciled_usage_ids and record.ts >= since
         ]
         return min(pending) if pending else None
 
@@ -692,7 +700,8 @@ class InMemoryRepository(
             if (
                 item is None
                 or not record.estimated
-                or record.status_code >= 400
+                or not 100 <= record.status_code < 400
+                or record.id in self.reconciled_usage_ids
                 or (record.ingest_error == "stream_cache_usage_unavailable"
                     and record.price_context_snapshot is None)
             ):
@@ -918,23 +927,24 @@ class InMemoryRepository(
             ),
             "total_requests": count,
             "estimated_cost": round(sum(record.estimated_cost for record in records), 8),
-            "average_latency_ms": round(
-                sum(record.latency_ms for record in records) / count if count else 0, 2
+            "average_latency_ms": (
+                sum(record.latency_ms for record in records) / count if count else 0
             ),
-            "error_rate": round(
-                100 * sum(record.status_code >= 400 for record in records) / count
+            "error_rate": (
+                100 * sum(not 100 <= record.status_code < 400 for record in records) / count
                 if count
-                else 0,
-                2,
+                else 0
             ),
             "p50_latency_ms": InMemoryRepository._percentile_cont(latencies, 0.5),
             "p95_latency_ms": InMemoryRepository._percentile_cont(latencies, 0.95),
             "p99_latency_ms": InMemoryRepository._percentile_cont(latencies, 0.99),
-            "success_requests": sum(record.status_code < 400 for record in records),
+            "success_requests": sum(100 <= record.status_code < 400 for record in records),
             "client_error_requests": sum(
                 400 <= record.status_code < 500 for record in records
             ),
-            "server_error_requests": sum(record.status_code >= 500 for record in records),
+            "server_error_requests": sum(
+                record.status_code == 0 or record.status_code >= 500 for record in records
+            ),
             "latency_under_1s": in_band(0, 1000),
             "latency_1_to_2s": in_band(1000, 2000),
             "latency_2_to_5s": in_band(2000, 5000),
@@ -1003,15 +1013,39 @@ class InMemoryRepository(
             # Runtime has no separate id in telemetry, so the name is its own key.
             "runtime": ("runtime", "runtime"),
         }
+
+        def group_key(
+            record: TokenUsageRecord, identity_field: str, label_field: str
+        ) -> tuple[str, str]:
+            identity = str(getattr(record, identity_field))
+            label = str(getattr(record, label_field))
+            if identity_field == "model_id":
+                identity = record.model_id or ""
+                label = (
+                    label or identity or "unattributed"
+                    if identity in {"", "unattributed", "unknown"}
+                    else ""
+                )
+            return identity, label
+
+        def display_name(values: list[TokenUsageRecord], label_field: str) -> str:
+            if label_field != "model":
+                return str(getattr(values[0], label_field))
+            latest = max(
+                values, key=lambda record: (bool(record.model), record.ts, record.model)
+            )
+            return latest.model or latest.model_id or "unattributed"
+
         id_field, name_field = fields[dimension]
         grouped: dict[tuple[str, str], list[TokenUsageRecord]] = {}
         records = self._usage_between(from_, to, filters)
         for record in records:
-            key = (str(getattr(record, id_field)), str(getattr(record, name_field)))
+            key = group_key(record, id_field, name_field)
             grouped.setdefault(key, []).append(record)
         total_cost = sum(record.estimated_cost for record in records)
         items = []
         for (id_, name), values in grouped.items():
+            name = display_name(values, name_field)
             totals = self._executive_totals(values)
             if cache_distribution_supported(dimension, filters):
                 self._apply_metric_cache(
@@ -1023,23 +1057,20 @@ class InMemoryRepository(
                 split_id, split_name = fields[split_by]
                 children: dict[tuple[str, str], list[TokenUsageRecord]] = {}
                 for record in values:
-                    child_key = (
-                        str(getattr(record, split_id)),
-                        str(getattr(record, split_name)),
-                    )
+                    child_key = group_key(record, split_id, split_name)
                     children.setdefault(child_key, []).append(record)
                 breakdown = sorted(
                     (
                         {
                             "id": child_id,
-                            "name": child_name,
+                            "name": display_name(child_values, split_name),
                             "total_tokens": sum(
                                 item.input_tokens + item.cached_tokens + item.output_tokens
                                 for item in child_values
                             ),
                             "total_requests": len(child_values),
                         }
-                        for (child_id, child_name), child_values in children.items()
+                        for (child_id, _child_name), child_values in children.items()
                     ),
                     key=lambda entry: -int(entry["total_tokens"]),
                 )
@@ -1190,7 +1221,7 @@ class InMemoryRepository(
             else "dispatched"
             if attempt
             else None,
-            "gateway_status_code": record.status_code,
+            "gateway_status_code": record.status_code or None,
             "upstream_request_id": completion.upstream_request_id if completion else None,
             "timestamp": record.ts,
             "organization_id": record.organization_id,
@@ -1218,7 +1249,7 @@ class InMemoryRepository(
             "completion_tokens": record.output_tokens,
             "total_tokens": record.input_tokens + record.cached_tokens + record.output_tokens,
             "latency_ms": completion.latency_ms if completion else record.latency_ms,
-            "status_code": completion.status_code if completion else record.status_code,
+            "status_code": completion.status_code if completion else record.status_code or None,
             "estimated_cost": record.estimated_cost,
             "cost_available": (
                 not record.estimated
@@ -1309,6 +1340,26 @@ class InMemoryRepository(
             key=lambda row: (row["timestamp"], row["trace_id"]),
             reverse=True,
         )[:limit]
+
+    def usage_request_counts(
+        self, from_: datetime, to: datetime, filters: UsageFilters,
+    ) -> dict[str, Any]:
+        rows = self.list_usage_requests(
+            from_, to, filters, len(self.usage_records) + len(self.invocation_attempts),
+        )
+        counts = {
+            "total_requests": len(rows), "success_requests": 0,
+            "client_error_requests": 0, "server_error_requests": 0,
+        }
+        for row in rows:
+            status = row["status_code"] or 0
+            if 400 <= status < 500:
+                counts["client_error_requests"] += 1
+            elif status >= 500 or row.get("platform_outcome") == "failed":
+                counts["server_error_requests"] += 1
+            elif status >= 100:
+                counts["success_requests"] += 1
+        return counts
 
     def get_usage_request(self, request_id: str) -> dict[str, Any] | None:
         platform = self.invocation_attempts.get(request_id.removeprefix("platform:"))
@@ -1663,7 +1714,8 @@ class InMemoryRepository(
                             [float(record.latency_ms) for record in records], 0.95
                         ),
                         "failed_calls": sum(
-                            1 for record in records if record.status_code >= 400
+                            record.status_code == 0 or record.status_code >= 400
+                            for record in records
                         ),
                     },
                 }
