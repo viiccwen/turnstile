@@ -49,6 +49,7 @@ from scripts.deploy import (
     ensure_adopted_apim_prerequisite_role,
     ensure_adopted_dependency_roles,
     ensure_foundry_role,
+    ensure_observer_acr_role,
     ensure_observer_event_hub_role,
     ensure_role_assignments,
     ensure_shared_storage_resources,
@@ -887,6 +888,47 @@ def test_adopted_dependency_roles_use_exact_external_scopes(
     assert inputs.existing_event_hub is not None
     event_hub_id = inputs.existing_event_hub.resource_id
     assert sum(command[command.index("--scope") + 1] == event_hub_id for command in commands) == 3
+
+
+@pytest.mark.parametrize("existing", ["missing", "external", "owned"])
+def test_observer_acr_role_reuses_existing_grants_without_claiming_external_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: str,
+) -> None:
+    inputs = DeploymentInputs.load(
+        "00000000-0000-0000-0000-000000000001", _parameters(tmp_path / "parameters.json"),
+    )
+    scope = (
+        f"/subscriptions/{inputs.subscription}/resourceGroups/registry-rg"
+        "/providers/Microsoft.ContainerRegistry/registries/observerregistry"
+    )
+    principal = "observer-principal"
+    role = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+    owned_name = _arm_role_assignment_name(scope, principal, "envoy-cache-adapter-acr-pull")
+    expected_id = f"{scope}/providers/Microsoft.Authorization/roleAssignments/{owned_name}"
+    assignments = [] if existing == "missing" else [{
+        "id": expected_id if existing == "owned" else f"{scope}/providers/Microsoft.Authorization/roleAssignments/scheduler-owned",
+        "scope": scope, "principalId": principal, "roleDefinitionId": role,
+    }]
+    runner = CommandRunner()
+    monkeypatch.setattr(runner, "run", lambda command, **_: subprocess.CompletedProcess(
+        command, 0, stdout=json.dumps(assignments),
+    ))
+    created = Mock(return_value={"id": expected_id})
+    monkeypatch.setattr(runner, "run_json", created)
+
+    managed = ensure_observer_acr_role(runner, inputs, {
+        "acrResourceGroupName": "registry-rg", "acrName": "observerregistry",
+        "webAppPrincipalId": principal,
+    })
+
+    assert managed == (set() if existing == "external" else {expected_id})
+    if existing == "missing":
+        command = created.call_args.args[0]
+        assert command[command.index("--scope") + 1] == scope
+        assert command[command.index("--role") + 1] == role
+        assert command[command.index("--name") + 1] == owned_name
+    else:
+        created.assert_not_called()
 
 
 def test_existing_apim_event_hub_role_is_ready_before_bootstrap(
@@ -1918,7 +1960,7 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     program_ready = failure_stage != "readiness"
     role_helpers = (
         "ensure_shared_storage_roles", "ensure_foundry_role",
-        "ensure_adopted_dependency_roles", "ensure_observer_event_hub_role",
+        "ensure_adopted_dependency_roles", "ensure_observer_acr_role", "ensure_observer_event_hub_role",
     )
     role_ids = {name: f"role-assignment-{name}" for name in role_helpers}
     observer_outputs = {
@@ -2154,7 +2196,7 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
             if initializes_program:
                 expected.append("_write_outputs")
             expected.extend((
-                "ensure_observer_event_hub_role", "_write_outputs", "build_and_start_observer",
+                "ensure_observer_acr_role", "ensure_observer_event_hub_role", "_write_outputs", "build_and_start_observer",
             ))
         assert events == expected
         if initializes_program:
@@ -2184,7 +2226,7 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     expected.append("deploy:observer")
     if initializes_program:
         expected.append("_write_outputs")
-    expected.extend(("ensure_observer_event_hub_role", "_write_outputs", "build_and_start_observer"))
+    expected.extend(("ensure_observer_acr_role", "ensure_observer_event_hub_role", "_write_outputs", "build_and_start_observer"))
     if initializes_program:
         expected.append("initialize_fixed_program")
         cast(Mock, deploy.initialize_fixed_program).assert_called_once()
@@ -3356,7 +3398,7 @@ def test_real_delegation_cutover_xml_roundtrip_and_recovery(
             monkeypatch.setattr(deploy, name, Mock())
         for name in (
             "ensure_shared_storage_roles", "ensure_foundry_role",
-            "ensure_adopted_dependency_roles", "ensure_observer_event_hub_role",
+            "ensure_adopted_dependency_roles", "ensure_observer_acr_role", "ensure_observer_event_hub_role",
         ):
             monkeypatch.setattr(deploy, name, Mock(return_value=set()))
         completion = Mock()
@@ -4330,7 +4372,7 @@ def test_resume_previews_only_available_runtime_and_preserves_release_settings(
         monkeypatch.setattr(deploy, name, lambda *_, **__: None)
     role_helpers = (
         "ensure_shared_storage_roles", "ensure_foundry_role",
-        "ensure_adopted_dependency_roles", "ensure_observer_event_hub_role",
+        "ensure_adopted_dependency_roles", "ensure_observer_acr_role", "ensure_observer_event_hub_role",
     )
     for name in role_helpers:
         monkeypatch.setattr(deploy, name, ensure_roles(name))

@@ -24,6 +24,8 @@ param imageTag string
 param eventHubNamespaceName string
 param eventHubName string = 'token-usage'
 param manageEventHubRoleAssignment bool = true
+@description('The deployment orchestrator reuses existing scoped AcrPull grants before creating one.')
+param manageAcrRoleAssignment bool = true
 param apimName string
 param adapterKeyNamedValueName string = 'turnstile-envoy-adapter-key'
 param publisherPrincipalId string = ''
@@ -65,7 +67,7 @@ module app 'app.bicep' = {
   }
 }
 
-module acrRole 'acr-role.bicep' = {
+module acrRole 'acr-role.bicep' = if (manageAcrRoleAssignment) {
   scope: resourceGroup(acrResourceGroupName)
   name: 'observer-acr-role-${take(uniqueString(webAppName), 8)}'
   dependsOn: [

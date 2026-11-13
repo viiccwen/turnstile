@@ -2228,6 +2228,29 @@ def ensure_adopted_apim_prerequisite_role(
     )
 
 
+def ensure_observer_acr_role(
+    runner: CommandRunner,
+    inputs: DeploymentInputs,
+    observer_outputs: Mapping[str, Any],
+) -> set[str]:
+    resource_group = _output_string(observer_outputs, "acrResourceGroupName")
+    registry = _output_string(observer_outputs, "acrName")
+    scope = (
+        f"/subscriptions/{inputs.subscription}/resourceGroups/{resource_group}"
+        f"/providers/Microsoft.ContainerRegistry/registries/{registry}"
+    )
+    principal = _output_string(observer_outputs, "webAppPrincipalId")
+    role = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+    return ensure_role_assignments(
+        runner, inputs, ((principal, "AcrPull", role, scope),),
+        assignment_names={
+            (principal, role, scope): _arm_role_assignment_name(
+                scope, principal, "envoy-cache-adapter-acr-pull",
+            ),
+        },
+    )
+
+
 def ensure_observer_event_hub_role(
     runner: CommandRunner,
     inputs: DeploymentInputs,
@@ -2970,6 +2993,7 @@ def observer_parameters(
             "acrName": acr_name,
             "acrResourceGroupName": acr_resource_group_name,
             "provisionAcr": existing_observer is None,
+            "manageAcrRoleAssignment": False,
             "imageTag": version,
             "eventHubNamespaceName": _dependency_string(
                 platform_outputs,
@@ -4800,6 +4824,9 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
             **platform_outputs, **observer_outputs, "pendingInstallation": "observer",
         }
         _write_outputs(inputs, platform_outputs)
+    managed_role_assignment_ids.update(
+        ensure_observer_acr_role(runner, inputs, observer_outputs)
+    )
     managed_role_assignment_ids.update(
         ensure_observer_event_hub_role(runner, inputs, observer_outputs)
     )
