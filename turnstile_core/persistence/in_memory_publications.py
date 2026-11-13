@@ -35,6 +35,7 @@ from .repository_support import (
     _model_removal_manifest,
     _program_migration_manifest,
     _program_migration_retry,
+    _publication_idempotency_digests,
     _require_program_migration_activation,
     _route_reconcile_credential_read_denied,
     _route_reconcile_preparation_failed,
@@ -161,9 +162,12 @@ class InMemoryPublicationRepositoryMixin:
         existing = next(
             (
                 item
+                for digest in _publication_idempotency_digests(
+                    desired_spec, desired_spec_sha256, publication_kind, initial_manifest,
+                )
                 for item in reversed(self.gateway_publications)
                 if item["gateway_profile_id"] == gateway_profile_id
-                and item["desired_spec_sha256"] == desired_spec_sha256
+                and item["desired_spec_sha256"] == digest
                 and item["status"] not in {"superseded", "rolled_back"}
             ),
             None,
@@ -2206,6 +2210,7 @@ class InMemoryPublicationRepositoryMixin:
                         "cache_write_cost_per_million"
                     ),
                     "price_source": model_spec.get("price_source", "manual"),
+                    "price_source_snapshot": model_spec.get("price_source_snapshot"),
                     "price_reference": model_spec.get("price_reference"),
                     "price_discount_percent": model_spec.get("price_discount_percent"),
                     "context_price_tiers": model_spec.get("context_price_tiers") or [],

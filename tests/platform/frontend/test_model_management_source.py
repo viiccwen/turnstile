@@ -8,6 +8,31 @@ import pytest
 from tests.support.paths import FRONTEND_SOURCE, REPOSITORY_ROOT, read_frontend_styles
 
 
+def test_price_catalog_focus_and_escape_stay_in_the_model_picker() -> None:
+    source = (
+        FRONTEND_SOURCE / "components/model-management/model-price-source.tsx"
+    ).read_text(encoding="utf-8")
+    picker = source.split("function ModelStep(", 1)[1].split("function DeploymentStep(", 1)[0]
+    assert "const popupOpen = open && (searching || matches !== null || chosen !== null)" in picker
+    assert "if (popupOpen) input.current?.focus()" in picker
+    assert "open={popupOpen}" in picker
+    escape = picker.split('if (event.key === "Escape" && popupOpen)', 1)[1].split("} else if", 1)[0]
+    assert "event.preventDefault()" in escape
+    assert "event.stopPropagation()" in escape
+    assert "onOpenChange(false)" in escape
+    assert "setDraft" not in escape
+
+
+def test_mobile_model_price_edit_remains_visible_without_hover() -> None:
+    styles = read_frontend_styles()
+    assert re.search(
+        r"@media\s*\(max-width:\s*760px\)\s*\{\s*"
+        r"\.model-table\.models \.model-row-actions > button\.model-edit-action "
+        r"\{\s*display:\s*grid;\s*\}",
+        styles,
+    )
+
+
 def test_connection_metadata_actions_use_the_owner_connection_endpoint() -> None:
     source = (FRONTEND_SOURCE / "pages/model-management-page.tsx").read_text(encoding="utf-8")
     update = source.split("const updateRuntime =", 1)[1].split("const updateGateway =", 1)[0]
@@ -907,7 +932,7 @@ def test_publication_targets_remain_visible_across_mobile_columns() -> None:
     assert '...(activeTab === "models" ? ["目标网关"] : [])' in page
     assert "等待 Registry 激活" not in row
     assert ".model-table.models .model-list-row > :nth-child(3) { display: grid; }" in styles
-    assert "models: [160, 120, 120, 160, 80, 125]" in page
+    assert "models: [160, 120, 120, 160, 80, 85]" in page
     assert "const MODEL_COMPACT_COLUMN_MIN_WIDTHS = [160, 120, 120, 160, 80, 63]" in page
     assert "<ModelTargetGatewayCell target={target} />" in page
     assert "当前模型继续正常服务" not in dialog
@@ -956,7 +981,8 @@ def test_apim_native_routes_have_one_dedicated_qualified_surface() -> None:
     ).read_text(encoding="utf-8")
     styles = read_frontend_styles()
 
-    assert '{ label: "模型负载均衡", icon: Network, page: "apim-native-routes" }' in app
+    assert '{ label: "负载均衡", icon: Network, page: "apim-native-routes" }' in app
+    assert '{ label: "模型路由", icon: Workflow, page: "model-router" }' in app
     assert 'page === "apim-native-routes" && <ApimNativeRoutesPage routeDrawerOpen=' in app
     assert 'aria-label="打开模型负载均衡列表"' in app
     assert 'className="settings-mobile-topbar-end-action"' in app

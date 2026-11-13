@@ -6,6 +6,7 @@ import json
 import re
 import secrets
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -198,8 +199,21 @@ _MANUAL_PRICE_FIELDS = (
 )
 
 
+def _publication_price_snapshot(snapshot: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if snapshot is None:
+        return None
+    return {key: value for key, value in snapshot.items() if key in {
+        "source", "reference", "label", "entry_digest", "url",
+        "provider_id", "model_id", "canonical_model_id",
+    }}
+
+
 def _stored_model_target(row: Mapping[str, Any]) -> ModelTarget:
     values = {key: row[key] for key in ModelTarget.model_fields if key in row}
+    if "price_source_snapshot" in values:
+        values["price_source_snapshot"] = _publication_price_snapshot(
+            values["price_source_snapshot"]
+        )
     # Stored rows keep the tier schedule but not the selection and rule it was built from.
     if values.get("context_price_tiers"):
         tiers = [StoredContextPriceTier.model_validate(tier)
@@ -3846,6 +3860,7 @@ class GatewayControlPlaneService:
                 "price_source": canonical.price_source,
                 "price_reference": canonical.price_reference,
                 "price_discount_percent": canonical.price_discount_percent,
+                "price_source_snapshot": deepcopy(canonical.price_source_snapshot),
                 "context_price_references": list(canonical.context_price_references),
                 "context_price_rule": canonical.context_price_rule,
                 "context_price_tiers": [
@@ -5011,6 +5026,7 @@ class GatewayControlPlaneService:
                 context_price_references=model.context_price_references,
                 context_price_rule=model.context_price_rule,
                 allowed_roles=["owner", "admin", "member"],
+                price_entry_digest=model.price_entry_digest,
                 assignment_required=True,
                 image_profile=profile,
             )
@@ -5387,8 +5403,14 @@ class GatewayControlPlaneService:
             raise ControlPlaneConflictError(
                 "Select the complete context price schedule, not one tier"
             )
+        if model.price_entry_digest is not None and entry.digest != model.price_entry_digest:
+            raise ControlPlaneConflictError("Catalog quote changed; select and confirm it again")
+        if entry.text_to_image != (model.image_profile is not None):
+            raise ControlPlaneConflictError("Catalog quote operation does not match the model")
         charged = entry.discounted(percent)
         return model.model_copy(update={
+            "price_entry_digest": None,
+            "price_source_snapshot": _publication_price_snapshot(entry.provenance),
             "input_cost_per_million": charged.input_per_million,
             "output_cost_per_million": charged.output_per_million,
             "cached_cost_per_million": charged.cached_per_million,

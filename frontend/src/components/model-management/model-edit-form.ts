@@ -1,5 +1,69 @@
 import contextRules from "../../../../turnstile_core/pricing/context-rules.json" with { type: "json" }
-import type { ContextPriceRule, ManagedModel, PriceCatalogContextTier, PriceCatalogModel, PriceCatalogOption, PriceCatalogOptionsResponse, PriceSource } from "../../data-sources/apim/types"
+import type { ContextPriceRule, ManagedModel, PriceCatalogContextTier, PriceCatalogModel, PriceCatalogOption, PriceCatalogOptionsResponse, PriceSource, PriceSyncDetail } from "../../data-sources/apim/types"
+
+export function priceSyncDetailForDisplay(detail: PriceSyncDetail, model?: Pick<ManagedModel, "effective_discount_percent">): PriceSyncDetail {
+  if (detail.change_reasons !== undefined || detail.catalog_price_changed !== undefined) {
+    const reasons = (detail.change_reasons ?? []).filter(reason => reason !== "discount_pending")
+    return { ...detail, change_reasons: reasons,
+      outcome: detail.catalog_price_changed === false && !reasons.length && detail.outcome === "updated" ? "unchanged" : detail.outcome }
+  }
+  const rows = priceSyncContextRows(detail)
+  if (!rows.length || detail.proposed_context_price_tiers == null) return detail
+  const buckets = [
+    ["input", "input_price_per_million"], ["output", "output_price_per_million"],
+    ["cached", "cached_price_per_million"], ["cache_write", "cache_write_price_per_million"],
+  ] as const
+  const baselineKnown = rows.every(({ current, proposed }) => current && proposed
+    && current.list_prices?.input != null && current.list_prices?.output != null)
+  if (!baselineKnown) return detail
+  const catalogChanged = rows.some(({ current, proposed }) =>
+    buckets.some(([bucket]) => current!.list_prices[bucket] !== proposed!.list_prices[bucket]))
+  const rulesChanged = rows.some(({ current, proposed }) =>
+    current!.reference !== proposed!.reference
+    || current!.min_input_tokens !== proposed!.min_input_tokens
+    || current!.max_input_tokens !== proposed!.max_input_tokens
+    || current!.input_range_source?.origin !== proposed!.input_range_source?.origin)
+  const reasons: NonNullable<PriceSyncDetail["change_reasons"]> = []
+  if (catalogChanged) reasons.push("catalog_price_changed")
+  if (rulesChanged) reasons.push("pricing_rule_changed")
+  return { ...detail, change_reasons: reasons, catalog_price_changed: catalogChanged,
+    outcome: detail.outcome === "updated" && !reasons.length ? "unchanged" : detail.outcome }
+}
+
+export function priceSyncChangeLabels(detail: PriceSyncDetail, model?: Pick<ManagedModel, "price_source" | "effective_discount_percent">, applied = false): string[] {
+  detail = priceSyncDetailForDisplay(detail, model)
+  const catalog = model?.price_source === "azure_retail" || model?.price_source === "anthropic" ? "官方价格" : "目录价"
+  const labels: string[] = []
+  if (detail.catalog_price_changed === null && (detail.proposed_prices != null || detail.proposed_context_price_tiers != null)) labels.push("目录基准未知")
+  for (const reason of detail.change_reasons ?? []) {
+    if (reason === "catalog_price_changed") labels.push(`${catalog}变化`)
+    if (reason === "pricing_rule_changed") labels.push("计价规则变化")
+  }
+  return labels
+}
+
+export function priceSyncChangeCounts(details: PriceSyncDetail[], models: Pick<ManagedModel, "id" | "effective_discount_percent">[] = []) {
+  details = details.map(detail => priceSyncDetailForDisplay(detail, models.find(model => model.id === detail.model_id)))
+  return {
+    catalog: details.filter(detail => detail.change_reasons?.includes("catalog_price_changed")).length,
+    rules: details.filter(detail => detail.change_reasons?.includes("pricing_rule_changed")).length,
+    unchanged: details.filter(detail => detail.outcome === "unchanged").length,
+    unknown: details.filter(detail => detail.catalog_price_changed === null
+      && (detail.proposed_prices != null || detail.proposed_context_price_tiers != null)).length,
+  }
+}
+
+export function priceSyncContextRows(detail: PriceSyncDetail) {
+  const current = new Map((detail.current_context_price_tiers ?? []).map(tier => [tier.key, tier]))
+  const proposed = new Map((detail.proposed_context_price_tiers ?? []).map(tier => [tier.key, tier]))
+  return [...new Set([...current.keys(), ...proposed.keys()])].map(key => ({
+    key, current: current.get(key), proposed: proposed.get(key),
+  })).sort((left, right) => {
+    const leftMinimum = (left.current ?? left.proposed)!.min_input_tokens
+    const rightMinimum = (right.current ?? right.proposed)!.min_input_tokens
+    return leftMinimum - rightMinimum || left.key.localeCompare(right.key)
+  })
+}
 
 export function resolveContextPriceRule(
   model: PriceCatalogModel,
@@ -213,6 +277,7 @@ export type ModelPriceDraft = {
   // "manual" keeps the four fields above exactly as they have always behaved. The other sources
   // derive them from a published list price, so the fields become read-out rather than input.
   priceSource: PriceSource
+  priceEntryDigest?: string
   priceReference: string
   // Blank inherits the connection's discount. Kept as a string so an empty box stays empty
   // instead of becoming a zero.
@@ -227,6 +292,8 @@ export type ModelPriceDraft = {
   contextThreshold?: string
   contextRuleNote?: string
   contextRuleUrl?: string
+  contextWindow?: string
+  contextWindowEdited?: boolean
 }
 
 export type ModelEditDraft = ModelPriceDraft & {
@@ -251,7 +318,8 @@ export type ModelEditError =
 export function createModelPriceDraft(contextPricingSupported = false, contextPriceRulesSupported = false): ModelPriceDraft {
   return {
     inputPrice: "", outputPrice: "", cacheReadPrice: "", cacheWritePrice: "",
-    priceSource: "manual", priceReference: "", discountPercent: "",
+    priceSource: "azure_retail", priceReference: "", discountPercent: "",
+    contextWindow: "", contextWindowEdited: false,
     contextPricingPreview: false,
     contextPricingSupported, contextPriceReferences: [], contextPriceTiers: [], contextPriceRefresh: false,
     contextPriceRulesSupported, contextRuleMode: "catalog", contextThreshold: "", contextRuleNote: "", contextRuleUrl: "",
@@ -263,6 +331,7 @@ export function createModelEditDraft(model: ManagedModel, contextPricingSupporte
   return {
     displayName: model.display_name,
     contextWindow: model.context_window?.toString() ?? "",
+    contextWindowEdited: model.context_window != null,
     inputPrice: model.input_cost_per_million?.toString() ?? "",
     outputPrice: model.output_cost_per_million?.toString() ?? "",
     cacheReadPrice: model.cached_cost_per_million?.toString() ?? "",
@@ -374,9 +443,12 @@ export function applyCatalogOption<Draft extends ModelPriceDraft>(
   }
   const rate = (value: number | null) =>
     value === null ? "" : discountedRate(value, effectiveDiscountPercent).toString()
+  const context = option.source_metadata?.context_window
+  const fillContext = source === "models_dev" && !draft.contextWindowEdited
   return {
     ...resetContextPriceRule(draft),
     priceSource: source,
+    priceEntryDigest: option.entry_digest ?? undefined,
     priceReference: option.reference,
     contextPricingPreview: false,
     contextPriceReferences: [], contextPriceTiers: [], contextPriceRefresh: false,
@@ -384,6 +456,10 @@ export function applyCatalogOption<Draft extends ModelPriceDraft>(
     outputPrice: rate(option.output_per_million),
     cacheReadPrice: rate(option.cached_per_million),
     cacheWritePrice: rate(option.cache_write_per_million),
+    ...(fillContext ? {
+      contextWindow: typeof context === "number" && Number.isSafeInteger(context) && context > 0
+        ? String(context) : "",
+    } : {}),
   }
 }
 
@@ -393,6 +469,7 @@ export function applyCatalogOption<Draft extends ModelPriceDraft>(
  * `<source>:<product>:<model>:<deployment>:<region-or-*>`; the first three parts are the key.
  */
 export function modelKeyFromReference(reference: string): string | null {
+  if (reference.startsWith("models_dev:")) return reference
   const parts = reference.split(":")
   return parts.length === 5 ? parts.slice(0, 3).join(":") : null
 }
@@ -498,6 +575,8 @@ export function modelEditPayload(model: ManagedModel, draft: ModelEditDraft) {
     allowed_roles: [...draft.allowedRoles],
     is_default: draft.isDefault,
     price_source: draft.priceSource,
+    ...(draft.priceSource !== "manual" && !draft.contextPricingPreview && draft.priceEntryDigest
+      ? { price_entry_digest: draft.priceEntryDigest } : {}),
     price_reference: draft.priceSource === "manual" || draft.contextPricingPreview ? null : draft.priceReference.trim(),
     price_discount_percent: optionalNumber(draft.discountPercent),
     ...(draft.contextPricingPreview ? {

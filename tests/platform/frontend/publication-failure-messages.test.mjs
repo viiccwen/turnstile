@@ -21,6 +21,8 @@ async function compile(path, additions = "") {
 }
 
 const dialogCode = await compile("../../../frontend/src/components/model-management/model-publication-dialog.tsx")
+const priceSourceCode = await compile("../../../frontend/src/components/model-management/model-price-source.tsx",
+  "\nexports.PriceArithmetic = PriceArithmetic;\nexports.ModelPriceText = ModelPriceText;\nexports.RegionStep = RegionStep;\n")
 const releaseCode = await compile("../../../frontend/src/pages/gateway-releases-page.tsx",
   "\nexports.failureNotice = PublicationFailureNotice;\n")
 const localeEntry = fileURLToPath(new URL("../../../frontend/src/locales/provider.tsx", import.meta.url))
@@ -43,6 +45,83 @@ function text(value) {
   if (value && typeof value === "object") return text(typeof value.type === "function" ? value.type(value.props) : value.props?.children)
   return value == null || typeof value === "boolean" ? "" : String(value)
 }
+
+test("the actual region picker submits the chosen region quote digest", () => {
+  const source = {}
+  runInNewContext(priceSourceCode, { exports: source, require: name =>
+    name === "react/jsx-runtime" ? frontendRequire(name) : primitives })
+  const east = "azure_retail:Azure OpenAI:gpt-example:Regional:eastus"
+  const west = "azure_retail:Azure OpenAI:gpt-example:Regional:westus"
+  const quote = {
+    reference: east, deployment: "Regional", regions: ["eastus", "westus"],
+    references_by_region: { eastus: east, westus: west }, region_required: true,
+    entry_digest: "e".repeat(64),
+    entry_digests_by_reference: { [east]: "e".repeat(64), [west]: "f".repeat(64) },
+    input_per_million: 2, output_per_million: 8,
+    cached_per_million: 0.2, cache_write_per_million: null,
+  }
+  const selected = []
+  const tree = source.RegionStep({ peers: [quote], selected: quote, busy: false,
+    onChoose: option => selected.push(option) })
+  const control = nodes(tree).find(node => node.props?.name === "price-region")
+  assert.ok(control)
+  control.props.onValueChange(west)
+  assert.equal(selected.length, 1)
+  const draft = pricing.applyCatalogOption(pricing.createModelPriceDraft(), "azure_retail", selected[0], null)
+  assert.equal(draft.priceReference, west)
+  assert.equal(draft.priceEntryDigest, "f".repeat(64))
+  assert.equal(quote.reference, east)
+  assert.equal(quote.entry_digest, "e".repeat(64))
+})
+
+test("model price review reasons are translated as complete messages without separator prefixes", async () => {
+  const source = {}
+  const hooks = { useState: initial => [initial, () => {}], useEffect() {}, useRef: value => ({ current: value }) }
+  runInNewContext(priceSourceCode, { exports: source, require: name => {
+    if (name === "react") return hooks
+    if (name === "react/jsx-runtime") return frontendRequire(name)
+    if (name === "../../locales/index") return { useLocale: () => ({ locale: "en" }), translateForLocale: locales.translateForLocale }
+    if (name === "./model-edit-form") return pricing
+    return primitives
+  } })
+  const message = "官方输入价较上次接受的价格变动 150%，超过 20% 复核阈值，未自动写入"
+  const tree = source.PriceArithmetic({
+    model: { price_synced_at: "2026-11-06T09:18:20Z", price_sync_status: "review_needed", price_sync_message: message },
+    draft: { inputPrice: "0.5", outputPrice: "4", cacheReadPrice: "0.05", cacheWritePrice: "" },
+    setDraft() {}, busy: false, percent: null, option: null, otherMeters: [], imageGeneration: false, decision: false,
+  })
+  const messages = nodes(tree).filter(node => node.type === source.ModelPriceText).map(node => node.props.children)
+  assert.ok(messages.includes(message), "The backend reason must reach the whole-message translator unchanged")
+  assert.ok(messages.every(value => !value.startsWith(" · ")))
+  const english = await locales.translateForLocale(message, "en")
+  assert.equal(english, "Catalog input price changed 150%, exceeding the 20% review threshold. Existing prices are preserved.")
+  assert.ok(!/[\u4e00-\u9fff]/.test(english))
+  for (const locale of ["ja", "ko"]) assert.notEqual(await locales.translateForLocale(message, locale), message)
+})
+
+test("model pricing failures translate whole sentences in every supported locale", async () => {
+  for (const [phrase, expected] of [
+    ["目录报价已变化，请重新选择并确认。", {
+      en: "The catalog quote has changed. Select it again and confirm.",
+      ja: "カタログ価格が変更されました。選択し直して確認してください。",
+      ko: "카탈로그 견적이 변경되었습니다. 다시 선택하고 확인하세요.",
+    }],
+    ["目录报价用途与模型不一致。", {
+      en: "The catalog quote does not match the model operation.",
+      ja: "カタログ価格の用途がモデルと一致しません。",
+      ko: "카탈로그 견적의 용도가 모델과 일치하지 않습니다.",
+    }],
+    ["价格或模型配置已变化，请重新预览。", {
+      en: "Prices or model configuration have changed. Preview again.",
+      ja: "価格またはモデル設定が変更されました。再度プレビューしてください。",
+      ko: "가격 또는 모델 설정이 변경되었습니다. 다시 미리 보세요.",
+    }],
+  ]) {
+    for (const locale of ["en", "ja", "ko"]) {
+      assert.equal(await locales.translateForLocale(phrase, locale), expected[locale])
+    }
+  }
+})
 
 function messages(failure, retryRequiresCredential = false, publicationKind = "model_add") {
   const publication = {

@@ -256,6 +256,7 @@ class PriceSource(StrEnum):
     MANUAL = "manual"
     AZURE_RETAIL = "azure_retail"
     ANTHROPIC = "anthropic"
+    MODELS_DEV = "models_dev"
 
 
 class PriceSyncStatus(StrEnum):
@@ -348,11 +349,14 @@ class PriceCatalogOption(StrictModel):
     # Each region's own reference. The group is how the choice is shown; what gets stored is the
     # region the person picked, so a later price split follows their region and not the first one.
     references_by_region: dict[str, str] = Field(default_factory=dict)
+    entry_digests_by_reference: dict[str, str] = Field(default_factory=dict)
     region_required: bool = False
     input_per_million: float | None = None
     output_per_million: float | None = None
     cached_per_million: float | None = None
     cache_write_per_million: float | None = None
+    entry_digest: str | None = None
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class PriceCatalogOptionsResponse(StrictModel):
@@ -368,6 +372,26 @@ class PriceCatalogOptionsResponse(StrictModel):
     # something else" rather than silence.
     other_meters: list[str] = Field(default_factory=list)
     note: str | None = None
+
+
+class PriceMatchRequest(StrictModel):
+    runtime_id: UUID
+    model_id: UUID | None = None
+    names: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(
+        min_length=1, max_length=3,
+    )
+    image_generation: bool = False
+    allow_ai: bool = False
+
+
+class PriceMatchResponse(StrictModel):
+    status: Literal["matched", "ambiguous", "unmapped", "stale"]
+    model_entry: PriceCatalogModel | None = None
+    candidates: list[PriceCatalogModel] = Field(default_factory=list)
+    method: Literal["exact", "ai"] | None = None
+    price_basis: Literal["deployment", "origin_reference"] | None = None
+    requires_ai: bool = False
+    message: str | None = None
 
 
 class GatewayProfileWrite(StrictModel):
@@ -654,6 +678,8 @@ class ManagedModelWrite(StrictModel):
 
     price_source: PriceSource = PriceSource.MANUAL
 
+    price_entry_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
     price_reference: str | None = Field(default=None, min_length=1, max_length=255)
 
     context_price_references: list[str] = Field(
@@ -718,6 +744,7 @@ class ManagedModel(ManagedModelWrite):
     pending_context_price_tiers: list[StoredContextPriceTier] | None = None
 
     effective_discount_percent: float | None = None
+    price_source_snapshot: dict[str, Any] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -735,6 +762,11 @@ class PriceSyncRequest(StrictModel):
     """Which models to sync. Omitting the list syncs everything that follows a list price."""
 
     model_ids: list[UUID] | None = None
+    dry_run: bool = False
+    confirmation_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+PriceSyncChangeReason = Literal["catalog_price_changed", "discount_pending", "pricing_rule_changed"]
 
 
 class PriceSyncDetail(StrictModel):
@@ -742,6 +774,13 @@ class PriceSyncDetail(StrictModel):
     model_key: str
     status: PriceSyncStatus
     message: str | None = None
+    outcome: str | None = None
+    change_reasons: list[PriceSyncChangeReason] = Field(default_factory=list)
+    catalog_price_changed: bool | None = None
+    current_prices: PendingListPrice | None = None
+    proposed_prices: PendingListPrice | None = None
+    current_context_price_tiers: list[StoredContextPriceTier] = Field(default_factory=list)
+    proposed_context_price_tiers: list[StoredContextPriceTier] | None = None
 
 
 class RegistryResponse(StrictModel):
@@ -790,6 +829,11 @@ class PriceSyncResponse(StrictModel):
     superseded: int = 0
     details: list[PriceSyncDetail]
     registry: RegistryResponse
+    dry_run: bool = False
+    confirmation_digest: str | None = None
+    total: int = 0
+    skipped_manual: int = 0
+    unchanged: int = 0
 
 
 class RuntimeCheckSelection(StrictModel):
